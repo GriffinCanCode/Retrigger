@@ -35,7 +35,7 @@ jobs:
     - name: Install Zig
       uses: goto-bus-stop/setup-zig@v2
       with:
-        version: 0.11.0
+        version: 0.15.1
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -82,7 +82,7 @@ jobs:
     - name: Check formatting
       run: |
         cargo fmt --all -- --check
-        cd src/bindings/nodejs && npm run format:check 2>/dev/null || echo "No format check available"
+        cd src/bindings/nodejs && npm run format:check || echo "No format check available"
 
     - name: Run clippy
       run: cargo clippy --all-targets --all-features -- -D warnings

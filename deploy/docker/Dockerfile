@@ -24,9 +24,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup component add rustfmt clippy
 
 # Install Zig
-RUN wget -O zig.tar.xz https://ziglang.org/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz \
+RUN wget -O zig.tar.xz https://ziglang.org/download/0.15.1/zig-linux-x86_64-0.15.1.tar.xz \
     && tar -xf zig.tar.xz \
-    && mv zig-linux-x86_64-0.11.0 /opt/zig \
+    && mv zig-linux-x86_64-0.15.1 /opt/zig \
     && ln -s /opt/zig/zig /usr/local/bin/zig \
     && rm zig.tar.xz
 

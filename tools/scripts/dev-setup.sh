@@ -82,11 +82,11 @@ install_zig() {
     case "$os" in
         "linux")
             if [[ "$arch" == "x86_64" ]]; then
-                local zig_url="https://ziglang.org/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz"
-                local zig_dir="zig-linux-x86_64-0.11.0"
+                local zig_url="https://ziglang.org/download/0.15.1/zig-linux-x86_64-0.15.1.tar.xz"
+                local zig_dir="zig-linux-x86_64-0.15.1"
             elif [[ "$arch" == "aarch64" ]]; then
-                local zig_url="https://ziglang.org/download/0.11.0/zig-linux-aarch64-0.11.0.tar.xz"
-                local zig_dir="zig-linux-aarch64-0.11.0"
+                local zig_url="https://ziglang.org/download/0.15.1/zig-linux-aarch64-0.15.1.tar.xz"
+                local zig_dir="zig-linux-aarch64-0.15.1"
             else
                 log_error "Unsupported Linux architecture: $arch"
                 return 1
@@ -94,11 +94,11 @@ install_zig() {
             ;;
         "macos")
             if [[ "$arch" == "x86_64" ]]; then
-                local zig_url="https://ziglang.org/download/0.11.0/zig-macos-x86_64-0.11.0.tar.xz"
-                local zig_dir="zig-macos-x86_64-0.11.0"
+                local zig_url="https://ziglang.org/download/0.15.1/zig-macos-x86_64-0.15.1.tar.xz"
+                local zig_dir="zig-macos-x86_64-0.15.1"
             elif [[ "$arch" == "arm64" ]]; then
-                local zig_url="https://ziglang.org/download/0.11.0/zig-macos-aarch64-0.11.0.tar.xz"
-                local zig_dir="zig-macos-aarch64-0.11.0"
+                local zig_url="https://ziglang.org/download/0.15.1/zig-macos-aarch64-0.15.1.tar.xz"
+                local zig_dir="zig-macos-aarch64-0.15.1"
             else
                 log_error "Unsupported macOS architecture: $arch"
                 return 1
