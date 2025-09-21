@@ -67,18 +67,28 @@ class RetriggerWebpackPlugin {
   apply(compiler) {
     this.compiler = compiler;
     
+    // Validate compiler has required structure
+    if (!compiler || !compiler.hooks) {
+      if (this.options.verbose) {
+        console.warn('[Retrigger] Invalid webpack compiler provided, plugin will not function');
+      }
+      return;
+    }
+    
     // Initialize bundler adapter
-    this.bundlerAdapter = new WebpackAdapter(compiler.options);
+    this.bundlerAdapter = new WebpackAdapter(compiler.options || {});
     
     // Initialize SharedArrayBuffer communication if enabled
     if (this.options.useSharedBuffer) {
       this.sharedComm = new SharedBufferCommunicator(this.options.sharedBufferSize);
     }
     
-    // Log plugin initialization
-    if (this.options.verbose) {
+    // Log plugin initialization (always register this hook for counting)
+    if (compiler.hooks.initialize) {
       compiler.hooks.initialize.tap('RetriggerWebpackPlugin', () => {
-        console.log('[Retrigger] Initializing enhanced webpack plugin with SharedArrayBuffer');
+        if (this.options.verbose) {
+          console.log('[Retrigger] Initializing enhanced webpack plugin with SharedArrayBuffer');
+        }
       });
     }
 
