@@ -127,6 +127,7 @@ impl ZeroCopyConsumer {
 }
 
 /// Simple convenience functions (2025 API Design: minimal and focused)
+#[allow(clippy::module_inception)]
 pub mod api {
     use super::*;
 
@@ -214,6 +215,6 @@ mod tests {
     fn test_api_connectivity_check() {
         // This will likely fail without a running daemon, which is expected
         let available = api::is_daemon_available();
-        println!("Daemon available: {}", available);
+        println!("Daemon available: {available}");
     }
 }

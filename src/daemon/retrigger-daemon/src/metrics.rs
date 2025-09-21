@@ -199,9 +199,9 @@ mod tests {
         // Record multiple events
         for i in 0..10 {
             let system_event = SystemEvent {
-                path: PathBuf::from(format!("/test/file{}.txt", i)),
+                path: PathBuf::from(format!("/test/file{i}.txt")),
                 event_type: SystemEventType::Modified,
-                timestamp: 1234567890 + i as u64,
+                timestamp: 1234567890 + i,
                 size: 1024,
                 is_directory: false,
             };

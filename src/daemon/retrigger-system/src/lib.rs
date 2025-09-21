@@ -26,7 +26,7 @@ pub struct SystemEvent {
 }
 
 /// System event types matching the Zig layer
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum SystemEventType {
     Created = 1,
     Modified = 2,

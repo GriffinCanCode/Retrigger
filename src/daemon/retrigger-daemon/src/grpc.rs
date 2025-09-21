@@ -36,6 +36,7 @@ impl RetriggerService {
 pub struct GrpcServer {
     bind_address: String,
     port: u16,
+    #[allow(dead_code)]
     service: RetriggerService,
     server_handle: Option<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
 }

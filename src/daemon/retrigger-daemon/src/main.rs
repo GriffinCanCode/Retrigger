@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use retrigger_system::{FileEventProcessor, SystemWatcher};
-use tempfile;
 use tokio::signal;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -278,7 +277,7 @@ async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     let file_creation_start = std::time::Instant::now();
 
     for i in 0..args.files {
-        let file_path = temp_dir.path().join(format!("test_file_{}.txt", i));
+        let file_path = temp_dir.path().join(format!("test_file_{i}.txt"));
         let content = vec![b'A'; args.size];
         tokio::fs::write(file_path, content).await?;
 
@@ -320,10 +319,10 @@ async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     println!("\nBenchmark Results");
     println!("=================");
     println!("Files created: {}", args.files);
-    println!("Events received: {}", events_received);
-    println!("File creation time: {:?}", file_creation_time);
-    println!("Event processing time: {:?}", event_time);
-    println!("Total time: {:?}", total_time);
+    println!("Events received: {events_received}");
+    println!("File creation time: {file_creation_time:?}");
+    println!("Event processing time: {event_time:?}");
+    println!("Total time: {total_time:?}");
     println!(
         "Events/sec: {:.2}",
         events_received as f64 / event_time.as_secs_f64()
@@ -344,7 +343,7 @@ async fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
 
     // Get watcher statistics
     let stats = watcher.get_stats().await;
-    println!("Watcher stats: {:?}", stats);
+    println!("Watcher stats: {stats:?}");
 
     Ok(())
 }
@@ -367,7 +366,7 @@ fn init_tracing(args: &StartArgs) -> Result<()> {
 /// Initialize Prometheus metrics
 async fn init_metrics(config: &DaemonConfig) -> Result<()> {
     let builder = PrometheusBuilder::new();
-    let _handle = builder
+    builder
         .with_http_listener(([0, 0, 0, 0], config.server.metrics_port))
         .install()?;
 

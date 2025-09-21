@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
 /// Main daemon configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DaemonConfig {
     pub server: ServerConfig,
     pub watcher: WatcherConfig,
@@ -102,17 +102,6 @@ pub struct PatternConfig {
     pub ignore_binary: bool,
 }
 
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            watcher: WatcherConfig::default(),
-            performance: PerformanceConfig::default(),
-            logging: LoggingConfig::default(),
-            patterns: PatternConfig::default(),
-        }
-    }
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -191,14 +180,14 @@ impl CompiledPatterns {
         let mut include_builder = GlobSetBuilder::new();
         for pattern in &config.include {
             let glob = Glob::new(pattern)
-                .with_context(|| format!("Invalid include pattern: {}", pattern))?;
+                .with_context(|| format!("Invalid include pattern: {pattern}"))?;
             include_builder.add(glob);
         }
 
         let mut exclude_builder = GlobSetBuilder::new();
         for pattern in &config.exclude {
             let glob = Glob::new(pattern)
-                .with_context(|| format!("Invalid exclude pattern: {}", pattern))?;
+                .with_context(|| format!("Invalid exclude pattern: {pattern}"))?;
             exclude_builder.add(glob);
         }
 
@@ -407,11 +396,11 @@ impl ConfigManager {
 
         // Validate patterns
         for pattern in &config.patterns.include {
-            Glob::new(pattern).with_context(|| format!("Invalid include pattern: {}", pattern))?;
+            Glob::new(pattern).with_context(|| format!("Invalid include pattern: {pattern}"))?;
         }
 
         for pattern in &config.patterns.exclude {
-            Glob::new(pattern).with_context(|| format!("Invalid exclude pattern: {}", pattern))?;
+            Glob::new(pattern).with_context(|| format!("Invalid exclude pattern: {pattern}"))?;
         }
 
         Ok(())
@@ -429,7 +418,6 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
     use std::io::Write;
-    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn test_config_load_save() {

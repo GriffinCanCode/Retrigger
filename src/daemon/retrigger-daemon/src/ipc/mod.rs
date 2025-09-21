@@ -588,7 +588,7 @@ impl Drop for ZeroCopyRing {
         self.shutdown();
 
         // Close eventfd if open
-        if let Some(fd) = self.notifications_fd {
+        if let Some(_fd) = self.notifications_fd {
             #[cfg(target_os = "linux")]
             unsafe {
                 if libc::close(fd) != 0 {
@@ -677,7 +677,7 @@ pub struct IPCStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use retrigger_system::EnhancedFileEvent;
+    use retrigger_system::{EnhancedFileEvent, SystemEvent, SystemEventType};
     use tempfile::NamedTempFile;
 
     #[test]
@@ -701,7 +701,6 @@ mod tests {
         assert_eq!(stats.utilization, 0.0);
 
         // Test event push/pop
-        use retrigger_system::{SystemEvent, SystemEventType};
         let test_event = EnhancedFileEvent {
             system_event: SystemEvent {
                 path: PathBuf::from("/test/file.txt"),
