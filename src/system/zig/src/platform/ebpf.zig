@@ -140,7 +140,7 @@ pub const EBPFManager = struct {
     fn create_perf_event_map(self: *Self) !i32 {
         _ = self;
         var map_create = linux.BPF.MapCreateAttr{
-            .map_type = linux.BPF.MAP_TYPE.PERF_EVENT_ARRAY,
+            .map_type = 4, // BPF_MAP_TYPE_PERF_EVENT_ARRAY
             .key_size = 4, // CPU number
             .value_size = 4, // perf event fd
             .max_entries = 256, // Max CPUs
@@ -176,7 +176,7 @@ pub const EBPFManager = struct {
         // Full eBPF program structure following 2025 best practices
 
         var prog_load = linux.BPF.ProgLoadAttr{
-            .prog_type = linux.BPF.PROG_TYPE.TRACEPOINT,
+            .prog_type = 5, // BPF_PROG_TYPE_TRACEPOINT
             .insn_cnt = instructions.len,
             .insns = @intFromPtr(&instructions[0]),
             .license = @intFromPtr("GPL"),

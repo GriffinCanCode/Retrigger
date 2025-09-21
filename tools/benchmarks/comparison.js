@@ -9,15 +9,69 @@ const path = require('path');
 const { performance } = require('perf_hooks');
 const { spawn, exec } = require('child_process');
 const { promisify } = require('util');
+const os = require('os');
 
 const execAsync = promisify(exec);
 
+// System resource monitoring
+class ResourceMonitor {
+    constructor() {
+        this.samples = [];
+        this.interval = null;
+    }
+    
+    start(intervalMs = 100) {
+        this.samples = [];
+        this.interval = setInterval(() => {
+            const cpuUsage = process.cpuUsage();
+            const memUsage = process.memoryUsage();
+            
+            this.samples.push({
+                timestamp: Date.now(),
+                cpu: cpuUsage,
+                memory: memUsage,
+            });
+        }, intervalMs);
+    }
+    
+    stop() {
+        if (this.interval) {
+            clearInterval(this.interval);
+            this.interval = null;
+        }
+        
+        if (this.samples.length === 0) {
+            return { 
+                avgMemoryMB: 0, 
+                peakMemoryMB: 0, 
+                samples: 0 
+            };
+        }
+        
+        // Calculate averages
+        const avgMemory = this.samples.reduce((sum, sample) => 
+            sum + (sample.memory ? sample.memory.rss : 0), 0) / this.samples.length;
+        
+        // CPU is harder to calculate meaningfully in Node.js
+        // We'll use peak memory as a proxy for resource usage
+        const peakMemory = Math.max(...this.samples.map(s => s.memory ? s.memory.rss : 0));
+        
+        return {
+            avgMemoryMB: (avgMemory || 0) / 1024 / 1024,
+            peakMemoryMB: (peakMemory || 0) / 1024 / 1024,
+            samples: this.samples.length,
+        };
+    }
+}
+
 // Configuration
 const BENCHMARK_CONFIG = {
-    testSizes: [10, 100, 1000, 5000],  // Number of files to test
-    iterations: 10,
-    timeoutMs: 30000,
+    testSizes: [10, 100, 1000],  // Start with smaller sizes for debugging
+    iterations: 3, // Reduce iterations for faster testing
+    timeoutMs: 30000, // 30 second timeout
     fileSize: 1024, // 1KB per file
+    largeFileSize: 1024 * 50, // 50KB for some tests
+    testTypes: ['modify'], // Focus on modify operations for now
 };
 
 // Colors for output
@@ -60,28 +114,28 @@ async function cleanupTestFiles(testDir) {
     }
 }
 
-// Retrigger benchmark using our Node.js bindings
-async function benchmarkRetrigger(testDir, fileCount) {
+// Parcel Watcher benchmark
+async function benchmarkParcelWatcher(testDir, fileCount) {
     try {
-        // Load our bindings (if built)
-        const { createRetrigger } = require('../bindings/nodejs');
+        const watcher = require('@parcel/watcher');
         
-        const watcher = createRetrigger();
         let eventCount = 0;
         let startTime, firstEventTime, lastEventTime;
+        let subscription;
         
         // Setup event handler
-        watcher.on('file-changed', (event) => {
+        const eventHandler = () => {
             if (eventCount === 0) {
                 firstEventTime = performance.now();
             }
             eventCount++;
             lastEventTime = performance.now();
-        });
+        };
         
         // Start watching
-        await watcher.watch(testDir, { recursive: true });
-        await watcher.start();
+        subscription = await watcher.subscribe(testDir, eventHandler, {
+            ignore: []
+        });
         
         // Wait a bit for watcher to be ready
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -107,13 +161,11 @@ async function benchmarkRetrigger(testDir, fileCount) {
             await new Promise(resolve => setTimeout(resolve, 10));
         }
         
-        watcher.stop();
+        await subscription.unsubscribe();
         
         const totalTime = lastEventTime - startTime;
         const firstEventLatency = firstEventTime - startTime;
         const avgLatency = totalTime / eventCount;
-        
-        const stats = await watcher.getStats();
         
         return {
             success: true,
@@ -123,7 +175,89 @@ async function benchmarkRetrigger(testDir, fileCount) {
             firstEventLatencyMs: firstEventLatency,
             avgLatencyMs: avgLatency,
             eventsPerSecond: eventCount / (totalTime / 1000),
-            droppedEvents: parseInt(stats.dropped_events),
+        };
+        
+    } catch (error) {
+        return {
+            success: false,
+            error: error.message,
+        };
+    }
+}
+
+// Retrigger benchmark using our Node.js bindings
+async function benchmarkRetrigger(testDir, fileCount) {
+    try {
+        // Load our bindings (if built)
+        const { RetriggerWrapper } = require('../../src/bindings/nodejs');
+        
+        const watcher = new RetriggerWrapper();
+        let eventCount = 0;
+        let startTime, firstEventTime, lastEventTime;
+        let events = [];
+        
+        // Start watching the directory
+        await watcher.watchDirectory(testDir, { recursive: true });
+        await watcher.start();
+        
+        // Wait a bit for watcher to be ready
+        await new Promise(resolve => setTimeout(resolve, 200));
+        
+        // Start modifying files
+        startTime = performance.now();
+        
+        const modifyPromises = [];
+        for (let i = 0; i < fileCount; i++) {
+            const filePath = path.join(testDir, `test_${i.toString().padStart(6, '0')}.txt`);
+            modifyPromises.push(
+                fs.promises.appendFile(filePath, `_modified_${Date.now()}`)
+            );
+        }
+        
+        await Promise.all(modifyPromises);
+        
+        // Poll for events
+        const timeout = 10000; // 10 seconds
+        const endTime = Date.now() + timeout;
+        
+        while (eventCount < fileCount && Date.now() < endTime) {
+            try {
+                const eventResult = await watcher.pollEvent();
+                if (eventResult && eventResult.path) {
+                    if (eventCount === 0) {
+                        firstEventTime = performance.now();
+                    }
+                    eventCount++;
+                    lastEventTime = performance.now();
+                    events.push(eventResult);
+                }
+            } catch (e) {
+                // No event available, continue polling
+                await new Promise(resolve => setTimeout(resolve, 1));
+            }
+        }
+        
+        const totalTime = lastEventTime - startTime;
+        const firstEventLatency = firstEventTime - startTime;
+        const avgLatency = totalTime / eventCount;
+        
+        let stats = {};
+        try {
+            const statsResult = await watcher.getStats();
+            stats = statsResult || {};
+        } catch (e) {
+            stats = { dropped_events: '0' };
+        }
+        
+        return {
+            success: true,
+            eventsReceived: eventCount,
+            expectedEvents: fileCount,
+            totalTimeMs: totalTime,
+            firstEventLatencyMs: firstEventLatency,
+            avgLatencyMs: avgLatency,
+            eventsPerSecond: eventCount / (totalTime / 1000),
+            droppedEvents: stats.droppedEvents ? parseInt(stats.droppedEvents) : 0,
             simdLevel: watcher.getSimdLevel(),
         };
         
@@ -282,13 +416,21 @@ async function runSingleBenchmark(name, benchmarkFn, testDir, fileCount, iterati
     console.log(`  ${colorize('cyan', name)} (iteration ${iteration + 1})...`);
     
     try {
+        // Start resource monitoring
+        const resourceMonitor = new ResourceMonitor();
+        resourceMonitor.start(50); // Sample every 50ms
+        
         const result = await benchmarkFn(testDir, fileCount);
+        
+        // Stop resource monitoring
+        const resources = resourceMonitor.stop();
         
         if (result.success) {
             const completeness = (result.eventsReceived / result.expectedEvents * 100).toFixed(1);
             console.log(`    Events: ${result.eventsReceived}/${result.expectedEvents} (${completeness}%)`);
             console.log(`    Latency: ${result.firstEventLatencyMs.toFixed(2)}ms (first), ${result.avgLatencyMs.toFixed(2)}ms (avg)`);
             console.log(`    Throughput: ${result.eventsPerSecond.toFixed(0)} events/sec`);
+            console.log(`    Memory: ${resources.avgMemoryMB.toFixed(1)}MB avg, ${resources.peakMemoryMB.toFixed(1)}MB peak`);
             
             if (result.simdLevel) {
                 console.log(`    SIMD: ${result.simdLevel}`);
@@ -296,6 +438,10 @@ async function runSingleBenchmark(name, benchmarkFn, testDir, fileCount, iterati
             if (result.droppedEvents > 0) {
                 console.log(`    ${colorize('yellow', 'Dropped:')} ${result.droppedEvents} events`);
             }
+            
+            // Add resource info to result
+            result.avgMemoryMB = resources.avgMemoryMB;
+            result.peakMemoryMB = resources.peakMemoryMB;
         } else {
             console.log(`    ${colorize('red', 'Failed:')} ${result.error}`);
         }
@@ -319,6 +465,8 @@ function calculateStats(results) {
     const latencies = successful.map(r => r.avgLatencyMs);
     const throughputs = successful.map(r => r.eventsPerSecond);
     const firstLatencies = successful.map(r => r.firstEventLatencyMs);
+    const avgMemories = successful.filter(r => r.avgMemoryMB).map(r => r.avgMemoryMB);
+    const peakMemories = successful.filter(r => r.peakMemoryMB).map(r => r.peakMemoryMB);
     
     return {
         success: true,
@@ -329,6 +477,8 @@ function calculateStats(results) {
         avgThroughput: throughputs.reduce((a, b) => a + b, 0) / throughputs.length,
         maxThroughput: Math.max(...throughputs),
         avgFirstLatency: firstLatencies.reduce((a, b) => a + b, 0) / firstLatencies.length,
+        avgMemoryMB: avgMemories.length > 0 ? avgMemories.reduce((a, b) => a + b, 0) / avgMemories.length : 0,
+        peakMemoryMB: peakMemories.length > 0 ? Math.max(...peakMemories) : 0,
         completeness: (successful.reduce((sum, r) => sum + r.eventsReceived, 0) / 
                       successful.reduce((sum, r) => sum + r.expectedEvents, 0)) * 100,
     };
@@ -343,8 +493,8 @@ function displayComparison(results) {
     const fileCounts = Object.keys(results[watchers[0]]);
     
     // Header
-    console.log(`${'Watcher'.padEnd(15)} | ${'Files'.padEnd(8)} | ${'Latency'.padEnd(12)} | ${'Throughput'.padEnd(12)} | ${'Complete'.padEnd(10)}`);
-    console.log('-'.repeat(80));
+    console.log(`${'Watcher'.padEnd(15)} | ${'Files'.padEnd(8)} | ${'Latency'.padEnd(12)} | ${'Throughput'.padEnd(12)} | ${'Memory'.padEnd(12)} | ${'Complete'.padEnd(10)}`);
+    console.log('-'.repeat(95));
     
     // Results for each file count
     fileCounts.forEach(fileCount => {
@@ -359,6 +509,7 @@ function displayComparison(results) {
             if (stats.success) {
                 const latencyStr = `${stats.avgLatency.toFixed(1)}ms`;
                 const throughputStr = `${stats.avgThroughput.toFixed(0)} ev/s`;
+                const memoryStr = stats.avgMemoryMB > 0 ? `${stats.avgMemoryMB.toFixed(1)}MB` : 'N/A';
                 const completenessStr = `${stats.completeness.toFixed(1)}%`;
                 
                 if (stats.avgThroughput > bestThroughput) {
@@ -366,7 +517,7 @@ function displayComparison(results) {
                     bestWatcher = watcher;
                 }
                 
-                console.log(`  ${watcher.padEnd(13)} | ${fileCount.padEnd(8)} | ${latencyStr.padEnd(12)} | ${throughputStr.padEnd(12)} | ${completenessStr.padEnd(10)}`);
+                console.log(`  ${watcher.padEnd(13)} | ${fileCount.padEnd(8)} | ${latencyStr.padEnd(12)} | ${throughputStr.padEnd(12)} | ${memoryStr.padEnd(12)} | ${completenessStr.padEnd(10)}`);
             } else {
                 console.log(`  ${watcher.padEnd(13)} | ${fileCount.padEnd(8)} | ${colorize('red', 'FAILED')} `);
             }
@@ -397,7 +548,13 @@ function displayComparison(results) {
                         const speedup = otherStats.avgLatency / retriggerStats.avgLatency;
                         const throughputImprovement = retriggerStats.avgThroughput / otherStats.avgThroughput;
                         
-                        console.log(`  vs ${watcher}: ${colorize('green', `${speedup.toFixed(1)}x`)} faster latency, ${colorize('green', `${throughputImprovement.toFixed(1)}x`)} higher throughput`);
+                        let memoryComparison = '';
+                        if (retriggerStats.avgMemoryMB > 0 && otherStats.avgMemoryMB > 0) {
+                            const memoryImprovement = otherStats.avgMemoryMB / retriggerStats.avgMemoryMB;
+                            memoryComparison = `, ${colorize('green', `${memoryImprovement.toFixed(1)}x`)} less memory`;
+                        }
+                        
+                        console.log(`  vs ${watcher}: ${colorize('green', `${speedup.toFixed(1)}x`)} faster latency, ${colorize('green', `${throughputImprovement.toFixed(1)}x`)} higher throughput${memoryComparison}`);
                     }
                 });
             }
@@ -413,6 +570,7 @@ async function runBenchmarks() {
     const watchers = {
         retrigger: benchmarkRetrigger,
         chokidar: benchmarkChokidar,
+        'parcel-watcher': benchmarkParcelWatcher,
         'node-fs-watch': benchmarkNodeWatch,
     };
     
@@ -474,10 +632,10 @@ async function checkDependencies() {
     
     // Check if our bindings exist
     try {
-        require('../bindings/nodejs');
+        require('../../src/bindings/nodejs');
         dependencies.push({ name: 'retrigger', available: true });
     } catch (error) {
-        dependencies.push({ name: 'retrigger', available: false, error: error.message });
+        dependencies.push({ name: 'retrigger', available: false, error: 'Build retrigger bindings first' });
     }
     
     // Check chokidar
@@ -486,6 +644,14 @@ async function checkDependencies() {
         dependencies.push({ name: 'chokidar', available: true });
     } catch (error) {
         dependencies.push({ name: 'chokidar', available: false, error: 'npm install chokidar' });
+    }
+    
+    // Check parcel watcher
+    try {
+        require('@parcel/watcher');
+        dependencies.push({ name: 'parcel-watcher', available: true });
+    } catch (error) {
+        dependencies.push({ name: 'parcel-watcher', available: false, error: 'npm install @parcel/watcher' });
     }
     
     console.log('Dependency Check:');

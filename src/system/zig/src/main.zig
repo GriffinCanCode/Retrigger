@@ -130,7 +130,7 @@ pub const FileWatcher = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Self {
         const event_buffer = try EventRingBuffer.init(allocator);
-        const error_handler = error_handling.create_default_error_handler(allocator) catch |err| blk: {
+        var error_handler = error_handling.create_default_error_handler(allocator) catch |err| blk: {
             std.log.warn("Failed to create error handler: {any}. Using fallback error handler.", .{err});
             break :blk error_handling.ErrorHandler.init(allocator);
         };

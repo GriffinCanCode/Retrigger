@@ -255,7 +255,8 @@ pub const PerformanceOptimizer = struct {
 
         var param: linux.sched_param = std.mem.zeroes(linux.sched_param);
         param.priority = 50; // High RT priority
-        if (linux.sched_setscheduler(0, 1, &param) != 0) { // SCHED_FIFO = 1
+        const sched_fifo: linux.SCHED = @bitCast(@as(i32, 1)); // SCHED_FIFO = 1
+        if (linux.sched_setscheduler(0, sched_fifo, &param) != 0) {
             return error.SetSchedulerFailed;
         }
 
