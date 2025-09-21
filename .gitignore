@@ -10,6 +10,7 @@ bin/
 obj/
 out/
 dist/
+*/node_modules/*
 
 # Executables and binaries
 *.exe

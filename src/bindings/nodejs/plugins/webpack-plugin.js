@@ -10,9 +10,19 @@
  */
 
 const path = require('path');
-const { createRetrigger } = require('../index');
-const { SharedBufferCommunicator } = require('../src-js/shared-buffer');
-const { WebpackAdapter, BundlerFactory } = require('../src-js/bundler-adapters');
+
+// Lazy load to avoid circular dependencies
+function getCreateRetrigger() {
+  return require('../index').createRetrigger;
+}
+
+function getSharedBufferCommunicator() {
+  return require('../src-js/shared-buffer').SharedBufferCommunicator;
+}
+
+function getWebpackAdapter() {
+  return require('../src-js/bundler-adapters').WebpackAdapter;
+}
 
 class RetriggerWebpackPlugin {
   constructor(options = {}) {
@@ -41,6 +51,7 @@ class RetriggerWebpackPlugin {
       sharedBufferSize: options.sharedBufferSize || 2 * 1024 * 1024, // 2MB
       maxEventBatch: options.maxEventBatch || 200,
       enableAdvancedInvalidation: options.enableAdvancedInvalidation !== false,
+      enableNativeWatching: options.enableNativeWatching !== false,
     };
     
     this.watcher = null;
@@ -75,11 +86,12 @@ class RetriggerWebpackPlugin {
       return;
     }
     
-    // Initialize bundler adapter
-    this.bundlerAdapter = new WebpackAdapter(compiler.options || {});
+    // Skip bundler adapter when running inside webpack (prevents circular dependency)
+    this.bundlerAdapter = null;
     
     // Initialize SharedArrayBuffer communication if enabled
     if (this.options.useSharedBuffer) {
+      const SharedBufferCommunicator = getSharedBufferCommunicator();
       this.sharedComm = new SharedBufferCommunicator(this.options.sharedBufferSize);
     }
     
@@ -115,8 +127,7 @@ class RetriggerWebpackPlugin {
       this.options
     );
 
-    // Initialize bundler adapter
-    this.bundlerAdapter.initialize();
+    // Bundler adapter intentionally disabled to prevent circular dependencies when running inside webpack
   }
 
   /**
@@ -294,7 +305,17 @@ class RetriggerWebpackPlugin {
   async startWatching(compilation) {
     if (this.isWatching) return;
 
+    // Skip native watching if disabled
+    if (!this.options.enableNativeWatching) {
+      if (this.options.verbose) {
+        console.log('[Retrigger] Native watching disabled, using webpack default watching');
+      }
+      this.isWatching = true;
+      return;
+    }
+
     try {
+      const createRetrigger = getCreateRetrigger();
       this.watcher = createRetrigger();
       this.isWatching = true;
 

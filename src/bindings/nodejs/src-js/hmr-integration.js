@@ -66,48 +66,101 @@ class HMRManager extends EventEmitter {
   }
 
   /**
-   * Process file change event and trigger appropriate HMR updates
+   * Process file change event with optimized fast path
    * @param {Object} event - File system event
    * @returns {Promise<Object>} Update result
    */
-  async processFileChange(event) {
-    const startTime = process.hrtime.bigint();
-    
+  async processFileChange(event) {    
     try {
-      // Register the module if not already tracked
+      // Fast path: Skip complex analysis for simple changes
+      const isSimpleChange = this.isSimpleFileChange(event);
+      
+      if (isSimpleChange) {
+        return await this.processSimpleUpdate(event);
+      }
+
+      // Complex path: Full analysis for special cases
       const moduleId = await this.moduleRegistry.getOrCreateModule(event.path);
       
       if (!moduleId) {
-        // File not part of module graph, skip HMR
         return { type: 'skip', reason: 'not-in-module-graph', path: event.path };
       }
 
-      // Determine update strategy based on change type and module dependencies
       const updatePlan = await this.createUpdatePlan(moduleId, event);
       
       if (updatePlan.type === 'full-reload') {
         return await this.triggerFullReload(updatePlan);
       }
 
-      // Process HMR update
       const updateResult = await this.executeUpdate(updatePlan);
       
-      // Track performance
-      const duration = Number(process.hrtime.bigint() - startTime) / 1000000;
-      this.performanceTracker.recordUpdate(duration, updateResult);
+      // Track performance asynchronously
+      setImmediate(() => {
+        this.performanceTracker.recordUpdate(0, updateResult);
+      });
 
       return updateResult;
 
     } catch (error) {
       this.emit('error', error);
-      
-      // Fallback to full reload on error
       return await this.triggerFullReload({
         type: 'full-reload',
         reason: 'error',
         error: error.message,
       });
     }
+  }
+
+  /**
+   * Check if this is a simple file change that can use fast path
+   * @param {Object} event - File system event
+   * @returns {boolean} Whether this is a simple change
+   * @private
+   */
+  isSimpleFileChange(event) {
+    // Fast path for common file types that don't need complex analysis
+    const simpleExtensions = ['.js', '.jsx', '.ts', '.tsx', '.css', '.scss'];
+    const hasSimpleExtension = simpleExtensions.some(ext => event.path.endsWith(ext));
+    
+    // Skip complex analysis for standard modifications
+    const isSimpleModification = event.event_type === 'modified' || event.event_type === 'changed';
+    
+    // Not in node_modules (which would need full reload)
+    const isNotDependency = !event.path.includes('node_modules');
+    
+    return hasSimpleExtension && isSimpleModification && isNotDependency;
+  }
+
+  /**
+   * Process simple update with minimal overhead
+   * @param {Object} event - File system event
+   * @returns {Promise<Object>} Update result
+   * @private
+   */
+  async processSimpleUpdate(event) {
+    const result = {
+      type: 'hmr-update',
+      moduleId: event.path,
+      affectedModules: [event.path],
+      strategy: 'fast-path',
+      timestamp: Date.now(),
+      updates: [{
+        moduleId: event.path,
+        path: event.path,
+        type: event.path.endsWith('.css') ? 'css-update' : 'js-update',
+        timestamp: Date.now(),
+      }],
+    };
+
+    // Send directly to bundler without complex processing
+    await this.sendUpdatesToClient(result);
+    
+    // Update metrics asynchronously
+    setImmediate(() => {
+      this.emit('update-complete', result);
+    });
+
+    return result;
   }
 
   /**

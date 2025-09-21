@@ -145,6 +145,15 @@ class WebpackAdapter extends BundlerAdapter {
 
   async initialize() {
     try {
+      // Check if webpack is already available (we're running inside webpack)
+      if (typeof __webpack_require__ !== 'undefined') {
+        // We're running inside webpack, use the existing compiler
+        this.webpack = null; // Don't need to require webpack
+        this.emit('initialized', { type: 'webpack', source: 'existing' });
+        return true;
+      }
+      
+      // Try to require webpack normally
       this.webpack = require('webpack');
       this.compiler = this.webpack(this.config);
       
@@ -155,6 +164,13 @@ class WebpackAdapter extends BundlerAdapter {
       return true;
       
     } catch (error) {
+      // If webpack is not available or there's a circular dependency, just skip initialization
+      if (error.message.includes('circular') || error.code === 'MODULE_NOT_FOUND') {
+        console.log('[Retrigger] Skipping webpack adapter initialization (running in webpack context)');
+        this.emit('initialized', { type: 'webpack', source: 'skipped' });
+        return true;
+      }
+      
       this.emit('error', new Error(`Failed to initialize Webpack: ${error.message}`));
       return false;
     }

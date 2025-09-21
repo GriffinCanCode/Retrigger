@@ -200,13 +200,30 @@ async function runBenchmark(testSize = 1024 * 1024) {
   };
 }
 
-// Load plugins and advanced features
-const RetriggerWebpackPlugin = require('./plugins/webpack-plugin');
-const { createRetriggerVitePlugin } = require('./plugins/vite-plugin');
-const { SharedBufferCommunicator } = require('./src-js/shared-buffer');
-const { HMRManager } = require('./src-js/hmr-integration');
-const { PerformanceMonitor } = require('./src-js/performance-monitor');
-const { BundlerFactory, WebpackAdapter, RspackAdapter, TurbopackAdapter } = require('./src-js/bundler-adapters');
+// Lazy-loaded plugin factories to avoid circular dependencies
+function getRetriggerWebpackPlugin() {
+  return require('./plugins/webpack-plugin');
+}
+
+function getCreateRetriggerVitePlugin() {
+  return require('./plugins/vite-plugin').createRetriggerVitePlugin;
+}
+
+function getSharedBufferCommunicator() {
+  return require('./src-js/shared-buffer').SharedBufferCommunicator;
+}
+
+function getHMRManager() {
+  return require('./src-js/hmr-integration').HMRManager;
+}
+
+function getPerformanceMonitor() {
+  return require('./src-js/performance-monitor').PerformanceMonitor;
+}
+
+function getBundlerAdapters() {
+  return require('./src-js/bundler-adapters');
+}
 
 /**
  * Enhanced Retrigger instance with advanced features
@@ -237,6 +254,7 @@ function createAdvancedRetrigger(options = {}) {
     async initializeAdvanced() {
       // Initialize performance monitoring
       if (advancedOptions.enablePerformanceMonitoring) {
+        const PerformanceMonitor = getPerformanceMonitor();
         performanceMonitor = new PerformanceMonitor(advancedOptions.performanceOptions);
         await performanceMonitor.initialize();
         
@@ -248,6 +266,7 @@ function createAdvancedRetrigger(options = {}) {
 
       // Initialize SharedArrayBuffer communication
       if (advancedOptions.enableSharedBuffer) {
+        const SharedBufferCommunicator = getSharedBufferCommunicator();
         sharedComm = new SharedBufferCommunicator(advancedOptions.sharedBufferSize);
         await sharedComm.initializeAsMain();
         
@@ -259,6 +278,7 @@ function createAdvancedRetrigger(options = {}) {
 
       // Initialize HMR manager
       if (advancedOptions.enableHMR) {
+        const HMRManager = getHMRManager();
         hmrManager = new HMRManager({
           enableSourceMaps: advancedOptions.enableSourceMaps,
           invalidationStrategy: advancedOptions.hmrInvalidationStrategy,
@@ -348,20 +368,20 @@ module.exports = {
   get_simd_support,
   benchmark_hash,
   
-  // Plugins
-  RetriggerWebpackPlugin,
-  createRetriggerVitePlugin,
+  // Plugins (lazy-loaded to avoid circular dependencies)
+  get RetriggerWebpackPlugin() { return getRetriggerWebpackPlugin(); },
+  get createRetriggerVitePlugin() { return getCreateRetriggerVitePlugin(); },
   
-  // Advanced Components
-  SharedBufferCommunicator,
-  HMRManager,
-  PerformanceMonitor,
+  // Advanced Components (lazy-loaded to avoid circular dependencies)
+  get SharedBufferCommunicator() { return getSharedBufferCommunicator(); },
+  get HMRManager() { return getHMRManager(); },
+  get PerformanceMonitor() { return getPerformanceMonitor(); },
   
-  // Bundler Adapters
-  BundlerFactory,
-  WebpackAdapter,
-  RspackAdapter,
-  TurbopackAdapter,
+  // Bundler Adapters (lazy-loaded to avoid circular dependencies)
+  get BundlerFactory() { return getBundlerAdapters().BundlerFactory; },
+  get WebpackAdapter() { return getBundlerAdapters().WebpackAdapter; },
+  get RspackAdapter() { return getBundlerAdapters().RspackAdapter; },
+  get TurbopackAdapter() { return getBundlerAdapters().TurbopackAdapter; },
   
   // Constants
   DEFAULT_WATCH_OPTIONS: {

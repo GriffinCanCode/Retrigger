@@ -129,33 +129,48 @@ class PerformanceMonitor extends EventEmitter {
   }
 
   /**
-   * Collect current performance metrics
+   * Collect current performance metrics (optimized for hot reload)
    * @private
    */
   async collectMetrics() {
     try {
-      const metrics = await this.metricsCollector.collect();
+      // Lightweight metrics collection during hot reload activity
+      const metrics = await this.metricsCollector.collectLightweight();
       
-      // Store metrics
-      this.performanceAnalyzer.addMetrics(metrics);
+      // Store metrics asynchronously
+      setImmediate(() => {
+        this.performanceAnalyzer.addMetrics(metrics);
+      });
       
-      // Check for performance issues
-      const issues = this.performanceAnalyzer.analyzeLatestMetrics(metrics);
+      // Skip heavy analysis during high-activity periods (hot reload)
+      const isHighActivity = metrics.events.events_per_second > 5;
       
-      if (issues.length > 0) {
-        this.emit('performance-issues', issues);
+      if (!isHighActivity) {
+        // Only do full analysis during low activity
+        const issues = this.performanceAnalyzer.analyzeLatestMetrics(metrics);
         
-        if (this.options.enableAlerting) {
-          this.alertSystem.handlePerformanceIssues(issues);
+        if (issues.length > 0) {
+          this.emit('performance-issues', issues);
+          
+          if (this.options.enableAlerting) {
+            setImmediate(() => {
+              this.alertSystem.handlePerformanceIssues(issues);
+            });
+          }
         }
-      }
 
-      // Trigger adaptive optimization if enabled
-      if (this.options.enableAdaptiveOptimization) {
-        const optimizations = await this.adaptiveOptimizer.suggestOptimizations(metrics);
-        
-        if (optimizations.length > 0) {
-          this.emit('optimization-suggestions', optimizations);
+        // Adaptive optimization only during low activity
+        if (this.options.enableAdaptiveOptimization) {
+          setImmediate(async () => {
+            try {
+              const optimizations = await this.adaptiveOptimizer.suggestOptimizations(metrics);
+              if (optimizations.length > 0) {
+                this.emit('optimization-suggestions', optimizations);
+              }
+            } catch (error) {
+              // Ignore optimization errors during hot reload
+            }
+          });
         }
       }
 
@@ -227,24 +242,27 @@ class PerformanceMonitor extends EventEmitter {
   }
 
   /**
-   * Record a file system event for performance analysis
+   * Record a file system event for performance analysis (optimized)
    * @param {Object} event - File system event
    */
   recordEvent(event) {
+    // Fast path: Only record critical metrics during active development
     const eventMetrics = {
       timestamp: Date.now(),
       type: event.event_type || 'unknown',
       path: event.path || 'unknown',
-      processing_time: event.processing_time || 0,
       latency: event.latency || 0,
     };
 
-    this.metricsCollector.addEventMetric(eventMetrics);
-
-    // Check for latency issues
-    if (eventMetrics.latency > this.options.eventLatencyThreshold) {
-      this.emit('high-latency-event', eventMetrics);
-    }
+    // Add to metrics asynchronously to avoid blocking hot reload
+    setImmediate(() => {
+      this.metricsCollector.addEventMetric(eventMetrics);
+      
+      // Check for latency issues only if monitoring is active
+      if (this.isMonitoring && eventMetrics.latency > this.options.eventLatencyThreshold) {
+        this.emit('high-latency-event', eventMetrics);
+      }
+    });
   }
 
   /**
@@ -479,6 +497,32 @@ class MetricsCollector {
     }
 
     return combined;
+  }
+
+  /**
+   * Lightweight metrics collection for hot reload periods
+   * @returns {Object} Lightweight metrics
+   */
+  async collectLightweight() {
+    // Only collect essential metrics during hot reload
+    const memoryUsage = process.memoryUsage();
+    const eventMetrics = this.getEventMetrics();
+    
+    const lightweight = {
+      timestamp: Date.now(),
+      system: {
+        memory: memoryUsage,
+        heap_utilization: memoryUsage.heapUsed / memoryUsage.heapTotal,
+        // Skip CPU measurement to reduce overhead
+        cpu_usage: 0,
+      },
+      events: eventMetrics,
+      // Skip process metrics during hot reload
+      process: null,
+    };
+
+    // Don't store in full history during hot reload
+    return lightweight;
   }
 
   async collectSystemMetrics() {

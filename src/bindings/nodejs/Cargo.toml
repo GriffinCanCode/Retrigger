@@ -1,18 +1,18 @@
 [workspace]
 
 [package]
-name = "retrigger-bindings"
+name = "retrigger-nodejs-bindings"  
 version = "0.1.0"
 edition = "2021"
 description = "Node.js bindings for Retrigger using napi-rs"
 
 [lib]
 crate-type = ["cdylib"]
-path = "../../../crates/retrigger-bindings/src/lib.rs"
+path = "../../daemon/retrigger-bindings/src/lib.rs"
 
 [dependencies]
-retrigger-core = { path = "../../../crates/retrigger-core" }
-retrigger-system = { path = "../../../crates/retrigger-system" }
+retrigger-core = { path = "../../daemon/retrigger-core" }
+retrigger-system = { path = "../../daemon/retrigger-system" }
 napi = { version = "2.16", features = ["napi8", "tokio_rt"] }
 napi-derive = "2.16"
 tokio = { version = "1.38", features = ["full"] }
