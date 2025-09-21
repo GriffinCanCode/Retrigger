@@ -308,7 +308,7 @@ pub const PerformanceOptimizer = struct {
         const cmd = try std.fmt.allocPrint(self.allocator, "echo {s} | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null", .{governor});
         defer self.allocator.free(cmd);
 
-        _ = std.ChildProcess.exec(.{
+        _ = std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = &[_][]const u8{ "sh", "-c", cmd },
         }) catch |err| {
@@ -323,7 +323,7 @@ pub const PerformanceOptimizer = struct {
     fn disable_numa_balancing(self: *Self) !void {
         // Write to kernel parameter
         const cmd = "echo 0 | sudo tee /proc/sys/kernel/numa_balancing > /dev/null";
-        _ = std.ChildProcess.exec(.{
+        _ = std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = &[_][]const u8{ "sh", "-c", cmd },
         }) catch return error.DisableNumaBalancingFailed;
@@ -334,7 +334,7 @@ pub const PerformanceOptimizer = struct {
     /// Enable transparent huge pages
     fn enable_transparent_hugepages(self: *Self) !void {
         const cmd = "echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null";
-        _ = std.ChildProcess.exec(.{
+        _ = std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = &[_][]const u8{ "sh", "-c", cmd },
         }) catch return error.EnableTransparentHugepagesFailed;
