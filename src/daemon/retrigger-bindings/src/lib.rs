@@ -74,8 +74,15 @@ impl Default for WatchOptions {
 pub struct RetriggerWrapper {
     system_watcher: Arc<SystemWatcher>,
     event_processor: Arc<FileEventProcessor>,
+    #[allow(dead_code)]
     hash_engine: Arc<HashEngine>,
     event_receiver: Option<broadcast::Receiver<SystemEvent>>,
+}
+
+impl Default for RetriggerWrapper {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[napi]
@@ -98,6 +105,10 @@ impl RetriggerWrapper {
     }
 
     /// Watch a directory for changes
+    /// 
+    /// # Safety
+    /// This function is marked unsafe due to napi-rs requirements for async functions.
+    /// It's safe to call from Node.js as the underlying operations are memory-safe.
     #[napi]
     pub async unsafe fn watch_directory(
         &mut self,
@@ -113,7 +124,7 @@ impl RetriggerWrapper {
             .map_err(|e| {
                 Error::new(
                     Status::GenericFailure,
-                    format!("Failed to watch directory: {}", e),
+                    format!("Failed to watch directory: {e}"),
                 )
             })?;
 
@@ -121,12 +132,16 @@ impl RetriggerWrapper {
     }
 
     /// Start the file watcher
+    /// 
+    /// # Safety
+    /// This function is marked unsafe due to napi-rs requirements for async functions.
+    /// It's safe to call from Node.js as the underlying operations are memory-safe.
     #[napi]
     pub async unsafe fn start(&mut self) -> NapiResult<()> {
         self.system_watcher.start().await.map_err(|e| {
             Error::new(
                 Status::GenericFailure,
-                format!("Failed to start watcher: {}", e),
+                format!("Failed to start watcher: {e}"),
             )
         })?;
 
@@ -137,6 +152,10 @@ impl RetriggerWrapper {
     }
 
     /// Get the next file event (non-blocking)
+    /// 
+    /// # Safety
+    /// This function is marked unsafe due to napi-rs requirements for async functions.
+    /// It's safe to call from Node.js as the underlying operations are memory-safe.
     #[napi]
     pub async unsafe fn poll_event(&mut self) -> NapiResult<Option<JsFileEvent>> {
         if let Some(ref mut receiver) = self.event_receiver {
@@ -149,7 +168,7 @@ impl RetriggerWrapper {
                             .map_err(|e| {
                                 Error::new(
                                     Status::GenericFailure,
-                                    format!("Failed to process event: {}", e),
+                                    format!("Failed to process event: {e}"),
                                 )
                             })?;
 
@@ -158,7 +177,7 @@ impl RetriggerWrapper {
                 Err(broadcast::error::TryRecvError::Empty) => Ok(None),
                 Err(e) => Err(Error::new(
                     Status::GenericFailure,
-                    format!("Event receiver error: {}", e),
+                    format!("Event receiver error: {e}"),
                 )),
             }
         } else {
@@ -167,6 +186,10 @@ impl RetriggerWrapper {
     }
 
     /// Wait for the next file event with timeout
+    /// 
+    /// # Safety
+    /// This function is marked unsafe due to napi-rs requirements for async functions.
+    /// It's safe to call from Node.js as the underlying operations are memory-safe.
     #[napi]
     pub async unsafe fn wait_event(&mut self, timeout_ms: u32) -> NapiResult<Option<JsFileEvent>> {
         if let Some(ref mut receiver) = self.event_receiver {
@@ -181,7 +204,7 @@ impl RetriggerWrapper {
                             .map_err(|e| {
                                 Error::new(
                                     Status::GenericFailure,
-                                    format!("Failed to process event: {}", e),
+                                    format!("Failed to process event: {e}"),
                                 )
                             })?;
 
@@ -189,7 +212,7 @@ impl RetriggerWrapper {
                 }
                 Ok(Err(e)) => Err(Error::new(
                     Status::GenericFailure,
-                    format!("Event receiver error: {}", e),
+                    format!("Event receiver error: {e}"),
                 )),
                 Err(_) => Ok(None), // Timeout
             }
@@ -219,7 +242,7 @@ impl RetriggerWrapper {
         let result = engine.hash_file(&path).map_err(|e| {
             Error::new(
                 Status::GenericFailure,
-                format!("Failed to hash file: {}", e),
+                format!("Failed to hash file: {e}"),
             )
         })?;
 
@@ -237,7 +260,7 @@ impl RetriggerWrapper {
         let result = engine.hash_bytes(&data).map_err(|e| {
             Error::new(
                 Status::GenericFailure,
-                format!("Failed to hash bytes: {}", e),
+                format!("Failed to hash bytes: {e}"),
             )
         })?;
 
@@ -288,7 +311,7 @@ pub fn hash_file_sync(path: String) -> NapiResult<JsHashResult> {
     let result = engine.hash_file(&path).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to hash file: {}", e),
+            format!("Failed to hash file: {e}"),
         )
     })?;
 
@@ -306,7 +329,7 @@ pub fn hash_bytes_sync(data: Buffer) -> NapiResult<JsHashResult> {
     let result = engine.hash_bytes(&data).map_err(|e| {
         Error::new(
             Status::GenericFailure,
-            format!("Failed to hash bytes: {}", e),
+            format!("Failed to hash bytes: {e}"),
         )
     })?;
 
@@ -321,7 +344,7 @@ pub fn hash_bytes_sync(data: Buffer) -> NapiResult<JsHashResult> {
 #[napi]
 pub fn get_simd_support() -> String {
     let level = HashEngine::detect_simd();
-    format!("{:?}", level)
+    format!("{level:?}")
 }
 
 /// Run performance benchmark
@@ -335,7 +358,7 @@ pub async fn benchmark_hash(test_size: u32) -> NapiResult<HashMap<String, f64>> 
     let start = std::time::Instant::now();
     let _ = engine
         .hash_bytes(&data)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Benchmark failed: {}", e)))?;
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Benchmark failed: {e}")))?;
     let elapsed = start.elapsed();
 
     let throughput_mbps = (test_size as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
