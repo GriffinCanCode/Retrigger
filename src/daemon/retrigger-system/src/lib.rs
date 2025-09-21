@@ -247,7 +247,7 @@ impl SystemWatcher {
             }
 
             // Update stats periodically
-            if total_events % 1000 == 0 {
+            if total_events.is_multiple_of(1000) {
                 let mut stats_guard = stats.write().await;
                 stats_guard.total_events = total_events;
                 // Additional stats would be retrieved from native layer
