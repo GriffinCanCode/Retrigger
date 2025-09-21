@@ -1,0 +1,58 @@
+[package]
+name = "retrigger-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Retrigger daemon - high-performance file watching service"
+
+[[bin]]
+name = "retrigger"
+path = "src/main.rs"
+
+[dependencies]
+retrigger-core = { path = "../retrigger-core" }
+retrigger-system = { path = "../retrigger-system" }
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Configuration and CLI
+clap = { version = "4.4", features = ["derive"] }
+config = "0.14"
+toml = "0.8"
+
+# gRPC and networking
+tonic = "0.11"
+prost = "0.12"
+tower = "0.4"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# File pattern matching
+globset = "0.4"
+
+# Zero-copy IPC
+iceoryx2 = "0.4"
+iceoryx2-bb-elementary = "0.4"
+iceoryx2-bb-container = "0.4"
+
+# Fallback for basic shared memory
+memmap2 = "0.9"
+crossbeam = "0.8"
+libc = "0.2"
+
+# Metrics and monitoring
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+metrics-util = "0.17"
+
+# Testing utilities  
+tempfile = "3.8"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.5"
+

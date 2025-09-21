@@ -1,0 +1,52 @@
+# Retrigger Docker Configuration
+# Optimized for containerized deployment
+
+[server]
+bind_address = "0.0.0.0"
+port = 9090
+max_connections = 1000
+request_timeout_ms = 30000
+enable_metrics = true
+metrics_port = 9091
+
+[watcher]
+# No default watch paths - let clients specify
+watch_paths = []
+event_buffer_size = 65536
+hash_cache_size = 50000
+hash_cache_ttl_secs = 3600
+hash_block_size = 4096
+
+[performance]
+# Auto-detect optimal settings in container
+worker_threads = 0
+enable_simd = true
+event_batch_size = 100
+poll_interval_us = 1000
+enable_zero_copy = true
+
+[logging]
+level = "info"
+format = "json"
+structured = true
+# Log to stdout in containers
+file = ""
+
+[patterns]
+include = ["**/*"]
+exclude = [
+    "**/node_modules/**",
+    "**/.git/**", 
+    "**/target/**",
+    "**/build/**",
+    "**/dist/**",
+    "**/.vscode/**",
+    "**/.idea/**",
+    "**/coverage/**",
+    "**/*.log",
+    "**/.*",
+    "**/Dockerfile*",
+    "**/docker-compose*",
+]
+max_file_size = 104857600  # 100MB
+ignore_binary = true

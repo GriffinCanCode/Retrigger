@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "src/daemon/retrigger-daemon",
+    "src/daemon/retrigger-core",
+    "src/daemon/retrigger-bindings",
+    "src/daemon/retrigger-system",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1.38", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

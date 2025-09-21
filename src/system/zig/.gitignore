@@ -1,0 +1,69 @@
+# Zig build output
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Zig build artifacts
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.wasm
+
+# Executables
+retrigger_benchmark
+retrigger_system
+retrigger_validation
+
+# Build directories
+build/
+bin/
+lib/
+out/
+
+# Debug symbols
+*.pdb
+*.dSYM/
+
+# Test outputs
+test_output/
+test-results/
+
+# Profiling
+*.prof
+perf.data*
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+
+# Editor files
+*~
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+*.gcov
+*.gcno
+*.gcda
+kcov-output/
+
+# Benchmark results
+benchmark_results/
+*.bench
+
+# Memory dumps
+*.mdmp
+core
+core.*

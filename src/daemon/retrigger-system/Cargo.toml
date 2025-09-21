@@ -1,0 +1,19 @@
+[package]
+name = "retrigger-system"
+version = "0.1.0"
+edition = "2021"
+description = "System integration layer interfacing with Zig file watchers for Retrigger"
+
+[dependencies]
+retrigger-core = { path = "../retrigger-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+dashmap = "6.0"
+crossbeam = "0.8"
+memmap2 = "0.9"
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.0"

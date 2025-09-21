@@ -1,0 +1,88 @@
+# Alpine-based minimal Dockerfile for Retrigger
+# Produces the smallest possible runtime image
+
+# Stage 1: Build environment with musl
+FROM alpine:3.18 as builder
+
+# Install build dependencies
+RUN apk add --no-cache \
+    build-base \
+    clang \
+    llvm-dev \
+    pkgconfig \
+    curl \
+    wget \
+    git \
+    ca-certificates \
+    linux-headers \
+    musl-dev
+
+# Install Rust with musl target
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add x86_64-unknown-linux-musl
+RUN rustup component add rustfmt clippy
+
+# Install Zig
+RUN wget -O zig.tar.xz https://ziglang.org/download/0.11.0/zig-linux-x86_64-0.11.0.tar.xz \
+    && tar -xf zig.tar.xz \
+    && mv zig-linux-x86_64-0.11.0 /opt/zig \
+    && ln -s /opt/zig/zig /usr/local/bin/zig \
+    && rm zig.tar.xz
+
+# Install Node.js
+RUN apk add --no-cache nodejs npm
+
+# Stage 2: Build Retrigger
+FROM builder as build-stage
+WORKDIR /build
+
+# Copy source
+COPY . .
+
+# Build with musl target for static linking
+ENV BUILD_TYPE=release
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=clang
+ENV CC_x86_64_unknown_linux_musl=clang
+ENV AR_x86_64_unknown_linux_musl=llvm-ar
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-Clink-self-contained=yes -Clinker=rust-lld"
+
+# Build static binaries
+RUN make clean
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin retrigger
+
+# Build C core as static library
+RUN cd core && make static BUILD_TYPE=release
+
+# Stage 3: Minimal runtime
+FROM alpine:3.18 as runtime
+LABEL maintainer="Retrigger Team" 
+LABEL description="Ultra-fast file system watcher (Alpine minimal)"
+
+# Add minimal runtime user
+RUN addgroup -g 1000 retrigger \
+    && adduser -D -s /bin/sh -u 1000 -G retrigger retrigger
+
+# Copy only the static binary
+COPY --from=build-stage /build/target/x86_64-unknown-linux-musl/release/retrigger /usr/local/bin/retrigger
+
+# Create runtime directories
+RUN mkdir -p /etc/retrigger /var/lib/retrigger /var/log/retrigger \
+    && chown -R retrigger:retrigger /var/lib/retrigger /var/log/retrigger
+
+# Copy configuration
+COPY docker/retrigger.toml /etc/retrigger/retrigger.toml
+
+# Health check with minimal overhead
+HEALTHCHECK --interval=60s --timeout=5s --start-period=10s --retries=2 \
+    CMD retrigger --version > /dev/null || exit 1
+
+# Expose ports
+EXPOSE 9090 9091
+
+# Switch to non-root user
+USER retrigger
+
+# Set entrypoint
+ENTRYPOINT ["/usr/local/bin/retrigger"]
+CMD ["start", "--config", "/etc/retrigger/retrigger.toml", "--foreground"]

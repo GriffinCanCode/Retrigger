@@ -1,0 +1,79 @@
+# C build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Executables
+bench_hash
+test_hash
+retrigger_hash
+*_test
+*_bench
+*_benchmark
+
+# Debug symbols
+*.pdb
+*.dSYM/
+
+# Build directories
+build/
+bin/
+lib/
+obj/
+out/
+
+# Make generated files
+.deps/
+*.d
+
+# Temporary files
+*.tmp
+*.temp
+
+# Editor files
+*~
+*.swp
+*.swo
+
+# Compiler output
+*.i
+*.s
+*.su
+
+# Assembly files (if generated)
+*.asm
+
+# Profiling
+gmon.out
+*.prof
+
+# Valgrind
+vgcore.*
+callgrind.out.*
+massif.out.*
+
+# Core dumps
+core
+core.*
+
+# Autotools (if used)
+autom4te.cache/
+config.log
+config.status
+configure
+Makefile.in
+aclocal.m4
+
+# CMake (if used)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+
+# Static analysis
+*.sarif

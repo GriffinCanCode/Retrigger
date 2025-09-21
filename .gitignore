@@ -1,0 +1,74 @@
+# Rust
+target/
+Cargo.lock
+*.lock
+
+# Build artifacts
+build/
+lib/
+bin/
+obj/
+out/
+dist/
+
+# Executables and binaries
+*.exe
+*.o
+*.so
+*.a
+*.dylib
+*.dll
+*_benchmark
+*_test
+direct_neon_benchmark
+native_hash_benchmark
+simd_optimized_benchmark
+simple_simd_test
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Environment
+.env
+.env.local
+
+# Performance and profiling
+*.prof
+perf.data*
+flamegraph.svg
+
+# Test outputs
+test_output/
+test_results/
+
+# Cache directories  
+.cache/
+cache/
+.pytest_cache/
+
+# Backup files
+*.bak
+*.backup
+*.orig
+
+# Documentation build
+docs/_build/
+docs/build/

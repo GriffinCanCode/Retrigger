@@ -1,0 +1,21 @@
+# Docker build context artifacts
+.dockerignore.tmp
+docker-compose.override.yml
+
+# Build artifacts that might be copied during builds
+build/
+target/
+dist/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
