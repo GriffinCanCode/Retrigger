@@ -3,10 +3,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+
+// Platform-specific includes
+#ifdef _WIN32
+    #include <windows.h>
+    #include <io.h>
+    #define MAP_FAILED NULL
+#else
+    #include <fcntl.h>
+    #include <unistd.h>
+    #include <sys/mman.h>
+    #include <sys/stat.h>
+#endif
 
 // XXH3 implementation (simplified for demonstration - would use official xxHash)
 #define XXH3_SECRET_SIZE 192
@@ -93,33 +101,40 @@ rtr_hash_result_t rtr_hash_generic(const void* data, size_t len) {
     };
 }
 
-// File hashing with memory mapping for performance
+// Cross-platform file hashing
 rtr_hash_result_t rtr_hash_file_impl(const char* filepath) {
-    int fd = open(filepath, O_RDONLY);
-    if (fd == -1) {
+    FILE* file = fopen(filepath, "rb");
+    if (!file) {
         return (rtr_hash_result_t){.hash = 0, .size = 0, .is_incremental = false};
     }
     
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    if (file_size <= 0) {
+        fclose(file);
         return (rtr_hash_result_t){.hash = 0, .size = 0, .is_incremental = false};
     }
     
-    if (st.st_size == 0) {
-        close(fd);
+    // Read file into memory
+    void* buffer = malloc(file_size);
+    if (!buffer) {
+        fclose(file);
         return (rtr_hash_result_t){.hash = 0, .size = 0, .is_incremental = false};
     }
     
-    void* mapped = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
+    size_t read_size = fread(buffer, 1, file_size, file);
+    fclose(file);
     
-    if (mapped == MAP_FAILED) {
+    if (read_size != (size_t)file_size) {
+        free(buffer);
         return (rtr_hash_result_t){.hash = 0, .size = 0, .is_incremental = false};
     }
     
-    rtr_hash_result_t result = hash_impl(mapped, st.st_size);
-    munmap(mapped, st.st_size);
+    rtr_hash_result_t result = hash_impl(buffer, file_size);
+    free(buffer);
     
     return result;
 }

@@ -22,24 +22,35 @@ fn main() {
     build.include("../../core/include");
 
     // Optimization flags
-    build
-        .opt_level(3)
-        .flag("-march=native")
-        .flag("-mtune=native");
+    build.opt_level(3);
 
-    // SIMD feature detection
-    if cfg!(target_arch = "x86_64") {
-        build.flag("-mavx2");
-        if env::var("CARGO_CFG_TARGET_FEATURE")
-            .unwrap_or_default()
-            .contains("avx512f")
-        {
-            build.flag("-mavx512f");
+    // Compiler-specific optimizations
+    let target = env::var("TARGET").unwrap();
+    if target.contains("msvc") {
+        // MSVC compiler flags
+        build.flag("/O2"); // Optimize for speed
+        if cfg!(target_arch = "x86_64") {
+            // Use AVX2 if available on MSVC
+            build.flag("/arch:AVX2");
         }
-    }
-
-    if cfg!(target_arch = "aarch64") {
-        build.flag("-march=armv8-a+simd");
+    } else {
+        // GCC/Clang compiler flags  
+        build.flag("-march=native").flag("-mtune=native");
+        
+        // SIMD feature detection for GCC/Clang
+        if cfg!(target_arch = "x86_64") {
+            build.flag("-mavx2");
+            if env::var("CARGO_CFG_TARGET_FEATURE")
+                .unwrap_or_default()
+                .contains("avx512f")
+            {
+                build.flag("-mavx512f");
+            }
+        }
+        
+        if cfg!(target_arch = "aarch64") {
+            build.flag("-march=armv8-a+simd");
+        }
     }
 
     // Compile the library
