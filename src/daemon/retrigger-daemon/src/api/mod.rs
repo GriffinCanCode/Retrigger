@@ -1,5 +1,5 @@
 //! Zero-Copy API Module
-//! 
+//!
 //! Simple, elegant public APIs for zero-copy file event communication.
 //! Follows 2025 best practices: minimal surface area, maximum performance.
 
@@ -10,7 +10,7 @@ use anyhow::Result;
 use retrigger_system::EnhancedFileEvent;
 use tokio::time::timeout;
 
-use crate::ipc::{ZeroCopyConfig, ZeroCopyRing, RingStats};
+use crate::ipc::{RingStats, ZeroCopyConfig, ZeroCopyRing};
 
 /// High-level Zero-Copy Event Consumer (2025 API Design)
 /// Follows Single Responsibility: only consumes events
@@ -37,7 +37,10 @@ impl ZeroCopyConsumer {
     }
 
     /// Get next event with timeout
-    pub async fn recv_timeout(&self, timeout_duration: Duration) -> Result<Option<EnhancedFileEvent>> {
+    pub async fn recv_timeout(
+        &self,
+        timeout_duration: Duration,
+    ) -> Result<Option<EnhancedFileEvent>> {
         let result = timeout(timeout_duration, async {
             // Simple polling approach - could be enhanced with proper async notifications
             loop {
@@ -46,7 +49,8 @@ impl ZeroCopyConsumer {
                 }
                 tokio::time::sleep(Duration::from_micros(100)).await; // 0.1ms polling
             }
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(event) => Ok(event),
@@ -133,8 +137,8 @@ pub mod api {
 
     /// Get batch of events with timeout
     pub async fn get_events_batch(
-        max_events: usize, 
-        timeout_ms: u64
+        max_events: usize,
+        timeout_ms: u64,
     ) -> Result<Vec<EnhancedFileEvent>> {
         let consumer = ZeroCopyConsumer::connect()?;
         let timeout_duration = Duration::from_millis(timeout_ms);
@@ -162,7 +166,7 @@ pub mod api {
     pub fn get_system_stats() -> Result<SystemStats> {
         let consumer = ZeroCopyConsumer::connect()?;
         let ring_stats = consumer.stats();
-        
+
         Ok(SystemStats {
             ring_stats,
             is_connected: true,

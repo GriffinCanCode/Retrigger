@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use retrigger_system::{SystemWatcher, EnhancedFileEvent};
+use retrigger_system::{EnhancedFileEvent, SystemWatcher};
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -48,7 +48,7 @@ impl GrpcServer {
     ) -> Result<Self> {
         let enhanced_events = enhanced_event_sender.subscribe();
         let service = RetriggerService::new(system_watcher, enhanced_events);
-        
+
         Ok(Self {
             bind_address: bind_address.to_string(),
             port,
@@ -56,43 +56,43 @@ impl GrpcServer {
             server_handle: None,
         })
     }
-    
+
     /// Start the gRPC server
     pub async fn start(&mut self) -> Result<()> {
         let addr: SocketAddr = format!("{}:{}", self.bind_address, self.port)
             .parse()
             .with_context(|| "Invalid server address")?;
-        
+
         info!("Starting gRPC server on {}", addr);
-        
+
         // In a real implementation, this would:
         // 1. Create the tonic service
         // 2. Add middleware (auth, metrics, etc.)
         // 3. Start the server
         // 4. Handle graceful shutdown
-        
+
         // Placeholder implementation
         let handle = tokio::spawn(async move {
             // Simulate server running
             tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
             Ok(())
         });
-        
+
         self.server_handle = Some(handle);
-        
+
         info!("gRPC server started successfully");
         Ok(())
     }
-    
+
     /// Shutdown the gRPC server
     pub async fn shutdown(self) -> Result<()> {
         info!("Shutting down gRPC server");
-        
+
         if let Some(handle) = self.server_handle {
             handle.abort();
             let _ = handle.await;
         }
-        
+
         info!("gRPC server shutdown completed");
         Ok(())
     }

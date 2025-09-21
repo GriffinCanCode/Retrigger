@@ -35,4 +35,12 @@ module.exports = {
     }),
   ],
   devtool: 'inline-source-map',
+  devServer: {
+    port: 3001,
+    open: true,
+    hot: true,
+    static: {
+      directory: path.resolve(__dirname, 'dist'),
+    },
+  },
 };

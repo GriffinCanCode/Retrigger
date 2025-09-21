@@ -1,14 +1,13 @@
 //! Retrigger Core - High-performance hashing engine
-//! 
+//!
 //! This crate provides the core hashing functionality with SIMD optimizations.
 //! Follows the Single Responsibility Principle - only handles hash computation.
 
+use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::path::Path;
 use std::ptr;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use blake3;
 
 // Include generated C bindings
 #[allow(non_upper_case_globals)]
@@ -109,7 +108,9 @@ pub trait FastHash {
 
 /// Incremental hasher for streaming large files
 pub trait IncrementalHash {
-    fn new(block_size: Option<u32>) -> Result<Self, HashError> where Self: Sized;
+    fn new(block_size: Option<u32>) -> Result<Self, HashError>
+    where
+        Self: Sized;
     fn update(&mut self, data: &[u8]) -> Result<HashResult, HashError>;
     fn finalize(self) -> Result<HashResult, HashError>;
 }
@@ -119,10 +120,10 @@ pub struct HashEngine {
     interface: *const ffi::rtr_hash_interface_t,
     simd_level: SimdLevel,
     strategy: HashStrategy,
-    blake3_hasher: blake3::Hasher,
 }
 
 /// BLAKE3-specific hasher for large files
+#[derive(Default)]
 pub struct Blake3FastHash {
     hasher: blake3::Hasher,
 }
@@ -133,19 +134,18 @@ impl Blake3FastHash {
             hasher: blake3::Hasher::new(),
         }
     }
-    
+
     pub fn hash_bytes(&mut self, data: &[u8]) -> Result<HashResult, HashError> {
         self.hasher.reset();
         self.hasher.update(data);
         let hash = self.hasher.finalize();
-        
+
         // Convert BLAKE3 hash to u64 for compatibility
         let bytes = hash.as_bytes();
         let hash_u64 = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7]
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
-        
+
         Ok(HashResult {
             hash: hash_u64,
             size: data.len() as u32,
@@ -165,36 +165,35 @@ impl HashEngine {
     pub fn new() -> Self {
         Self::with_strategy(HashStrategy::Hybrid)
     }
-    
+
     /// Initialize with specific hash strategy
     pub fn with_strategy(strategy: HashStrategy) -> Self {
         let simd_level = unsafe { ffi::rtr_hash_init() };
         let interface = unsafe { ffi::rtr_hash_get_interface() };
-        
+
         HashEngine {
             interface,
             simd_level: simd_level.into(),
             strategy,
-            blake3_hasher: blake3::Hasher::new(),
         }
     }
-    
+
     /// Get current hash strategy
     pub fn strategy(&self) -> HashStrategy {
         self.strategy
     }
-    
+
     /// Get the current SIMD optimization level
     pub fn simd_level(&self) -> SimdLevel {
         self.simd_level
     }
-    
+
     /// Detect available SIMD support
     pub fn detect_simd() -> SimdLevel {
         let level = unsafe { ffi::rtr_detect_simd_support() };
         level.into()
     }
-    
+
     /// Run benchmark for performance testing
     pub fn benchmark(&self, test_size: usize) -> BenchmarkResult {
         let result = unsafe { ffi::rtr_benchmark_hash(test_size) };
@@ -211,12 +210,8 @@ impl Default for HashEngine {
 impl FastHash for HashEngine {
     fn hash_bytes(&self, data: &[u8]) -> Result<HashResult, HashError> {
         match self.strategy {
-            HashStrategy::Blake3Only => {
-                self.hash_bytes_blake3(data)
-            }
-            HashStrategy::Xxh3Only => {
-                self.hash_bytes_xxh3(data)
-            }
+            HashStrategy::Blake3Only => self.hash_bytes_blake3(data),
+            HashStrategy::Xxh3Only => self.hash_bytes_xxh3(data),
             HashStrategy::Hybrid => {
                 // Use BLAKE3 for large files, XXH3 for small files
                 if data.len() >= HYBRID_THRESHOLD {
@@ -231,20 +226,15 @@ impl FastHash for HashEngine {
             }
         }
     }
-    
+
     fn hash_file<P: AsRef<Path>>(&self, path: P) -> Result<HashResult, HashError> {
         // For files, we can check size before reading
-        let metadata = std::fs::metadata(&path).map_err(|_| {
-            HashError::InvalidPath(path.as_ref().display().to_string())
-        })?;
-        
+        let metadata = std::fs::metadata(&path)
+            .map_err(|_| HashError::InvalidPath(path.as_ref().display().to_string()))?;
+
         match self.strategy {
-            HashStrategy::Blake3Only => {
-                self.hash_file_blake3(&path)
-            }
-            HashStrategy::Xxh3Only => {
-                self.hash_file_xxh3(&path)
-            }
+            HashStrategy::Blake3Only => self.hash_file_blake3(&path),
+            HashStrategy::Xxh3Only => self.hash_file_xxh3(&path),
             HashStrategy::Hybrid => {
                 if metadata.len() >= HYBRID_THRESHOLD as u64 {
                     self.hash_file_blake3(&path)
@@ -252,9 +242,7 @@ impl FastHash for HashEngine {
                     self.hash_file_xxh3(&path)
                 }
             }
-            HashStrategy::Auto => {
-                self.hash_file_auto(&path, metadata.len())
-            }
+            HashStrategy::Auto => self.hash_file_auto(&path, metadata.len()),
         }
     }
 }
@@ -265,17 +253,16 @@ impl HashEngine {
         let hash = blake3::hash(data);
         let bytes = hash.as_bytes();
         let hash_u64 = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7]
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
-        
+
         Ok(HashResult {
             hash: hash_u64,
             size: data.len() as u32,
             is_incremental: false,
         })
     }
-    
+
     /// Hash bytes using optimized XXH3
     fn hash_bytes_xxh3(&self, data: &[u8]) -> Result<HashResult, HashError> {
         if self.interface.is_null() {
@@ -286,7 +273,7 @@ impl HashEngine {
                 return Err(HashError::ComputationFailed);
             }
         }
-        
+
         let result = unsafe {
             let hash_fn = (*self.interface).hash_buffer;
             if hash_fn.is_none() {
@@ -294,15 +281,15 @@ impl HashEngine {
             }
             hash_fn.unwrap()(data.as_ptr() as *const _, data.len())
         };
-        
+
         Ok(result.into())
     }
-    
+
     /// Auto-detect best algorithm for data
     fn hash_bytes_auto(&self, data: &[u8]) -> Result<HashResult, HashError> {
         // For auto-detection, analyze data characteristics
         let entropy = self.calculate_entropy(data);
-        
+
         // High entropy data benefits more from BLAKE3's parallelism
         // Low entropy data is better with XXH3's speed
         if entropy > 0.8 || data.len() >= HYBRID_THRESHOLD {
@@ -311,28 +298,29 @@ impl HashEngine {
             self.hash_bytes_xxh3(data)
         }
     }
-    
+
     /// Hash file using BLAKE3
     fn hash_file_blake3<P: AsRef<Path>>(&self, path: P) -> Result<HashResult, HashError> {
-        let data = std::fs::read(&path).map_err(|_| {
-            HashError::InvalidPath(path.as_ref().display().to_string())
-        })?;
-        
+        let data = std::fs::read(&path)
+            .map_err(|_| HashError::InvalidPath(path.as_ref().display().to_string()))?;
+
         self.hash_bytes_blake3(&data)
     }
-    
+
     /// Hash file using XXH3
     fn hash_file_xxh3<P: AsRef<Path>>(&self, path: P) -> Result<HashResult, HashError> {
         if self.interface.is_null() {
             return Err(HashError::ComputationFailed);
         }
-        
-        let path_str = path.as_ref().to_str()
+
+        let path_str = path
+            .as_ref()
+            .to_str()
             .ok_or_else(|| HashError::InvalidPath(path.as_ref().display().to_string()))?;
-        
-        let c_path = CString::new(path_str)
-            .map_err(|_| HashError::InvalidPath(path_str.to_string()))?;
-        
+
+        let c_path =
+            CString::new(path_str).map_err(|_| HashError::InvalidPath(path_str.to_string()))?;
+
         let result = unsafe {
             let hash_fn = (*self.interface).hash_file;
             if hash_fn.is_none() {
@@ -340,47 +328,47 @@ impl HashEngine {
             }
             hash_fn.unwrap()(c_path.as_ptr())
         };
-        
+
         if result.hash == 0 && result.size == 0 {
             return Err(HashError::ComputationFailed);
         }
-        
+
         Ok(result.into())
     }
-    
+
     /// Auto-detect best algorithm for file
     fn hash_file_auto<P: AsRef<Path>>(&self, path: P, size: u64) -> Result<HashResult, HashError> {
         // For large files, always use BLAKE3 due to parallelism
         if size >= HYBRID_THRESHOLD as u64 {
             return self.hash_file_blake3(&path);
         }
-        
+
         // For smaller files, we could sample to determine entropy
         // For now, just use XXH3 for speed
         self.hash_file_xxh3(&path)
     }
-    
+
     /// Calculate Shannon entropy of data (simplified)
     fn calculate_entropy(&self, data: &[u8]) -> f64 {
         if data.is_empty() {
             return 0.0;
         }
-        
+
         let mut counts = [0u32; 256];
         for &byte in data {
             counts[byte as usize] += 1;
         }
-        
+
         let len = data.len() as f64;
         let mut entropy = 0.0;
-        
+
         for &count in &counts {
             if count > 0 {
                 let p = count as f64 / len;
                 entropy -= p * p.log2();
             }
         }
-        
+
         entropy / 8.0 // Normalize to 0-1 range
     }
 }
@@ -403,7 +391,7 @@ impl IncrementalHash for IncrementalHasher {
         if interface.is_null() {
             return Err(HashError::HasherNotInitialized);
         }
-        
+
         let hasher = unsafe {
             let create_fn = (*interface).create_incremental;
             if create_fn.is_none() {
@@ -411,19 +399,19 @@ impl IncrementalHash for IncrementalHasher {
             }
             create_fn.unwrap()(block_size.unwrap_or(4096))
         };
-        
+
         if hasher.is_null() {
             return Err(HashError::HasherNotInitialized);
         }
-        
+
         Ok(IncrementalHasher { hasher, interface })
     }
-    
+
     fn update(&mut self, data: &[u8]) -> Result<HashResult, HashError> {
         if self.hasher.is_null() || self.interface.is_null() {
             return Err(HashError::HasherNotInitialized);
         }
-        
+
         let result = unsafe {
             let update_fn = (*self.interface).update_incremental;
             if update_fn.is_none() {
@@ -431,15 +419,15 @@ impl IncrementalHash for IncrementalHasher {
             }
             update_fn.unwrap()(self.hasher, data.as_ptr() as *const _, data.len())
         };
-        
+
         Ok(result.into())
     }
-    
+
     fn finalize(mut self) -> Result<HashResult, HashError> {
         if self.hasher.is_null() || self.interface.is_null() {
             return Err(HashError::HasherNotInitialized);
         }
-        
+
         let result = unsafe {
             let finalize_fn = (*self.interface).finalize_incremental;
             if finalize_fn.is_none() {
@@ -447,10 +435,10 @@ impl IncrementalHash for IncrementalHasher {
             }
             finalize_fn.unwrap()(self.hasher)
         };
-        
+
         // Prevent double-free by setting to null
         self.hasher = ptr::null_mut();
-        
+
         Ok(result.into())
     }
 }
@@ -470,75 +458,77 @@ impl Drop for IncrementalHasher {
 /// Convenience functions for common operations
 pub mod prelude {
     use super::*;
-    
+
     /// Quick hash of byte data using optimal algorithm
     pub fn hash_bytes(data: &[u8]) -> Result<HashResult, HashError> {
         let engine = HashEngine::new(); // Uses Hybrid by default
         engine.hash_bytes(data)
     }
-    
+
     /// Quick hash of a file using optimal algorithm
     pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<HashResult, HashError> {
         let engine = HashEngine::new(); // Uses Hybrid by default
         engine.hash_file(path)
     }
-    
+
     /// Hash bytes using BLAKE3 specifically
     pub fn hash_bytes_blake3(data: &[u8]) -> Result<HashResult, HashError> {
         let engine = HashEngine::with_strategy(HashStrategy::Blake3Only);
         engine.hash_bytes(data)
     }
-    
+
     /// Hash file using BLAKE3 specifically
     pub fn hash_file_blake3<P: AsRef<Path>>(path: P) -> Result<HashResult, HashError> {
         let engine = HashEngine::with_strategy(HashStrategy::Blake3Only);
         engine.hash_file(path)
     }
-    
+
     /// Hash bytes using XXH3 specifically
     pub fn hash_bytes_xxh3(data: &[u8]) -> Result<HashResult, HashError> {
         let engine = HashEngine::with_strategy(HashStrategy::Xxh3Only);
         engine.hash_bytes(data)
     }
-    
+
     /// Hash file using XXH3 specifically
     pub fn hash_file_xxh3<P: AsRef<Path>>(path: P) -> Result<HashResult, HashError> {
         let engine = HashEngine::with_strategy(HashStrategy::Xxh3Only);
         engine.hash_file(path)
     }
-    
+
     /// Create an incremental hasher with default block size
     pub fn incremental_hasher() -> Result<IncrementalHasher, HashError> {
         IncrementalHasher::new(None)
     }
-    
+
     /// Benchmark both algorithms and return comparison
     pub fn benchmark_algorithms(test_size: usize) -> BenchmarkComparison {
         let data: Vec<u8> = (0..test_size).map(|i| (i * 0x9E3779B1) as u8).collect();
-        
+
         let blake3_engine = HashEngine::with_strategy(HashStrategy::Blake3Only);
         let xxh3_engine = HashEngine::with_strategy(HashStrategy::Xxh3Only);
-        
+
         // Benchmark BLAKE3
         let blake3_start = std::time::Instant::now();
         for _ in 0..100 {
             let _ = blake3_engine.hash_bytes(&data);
         }
         let blake3_time = blake3_start.elapsed();
-        
+
         // Benchmark XXH3
         let xxh3_start = std::time::Instant::now();
         for _ in 0..100 {
             let _ = xxh3_engine.hash_bytes(&data);
         }
         let xxh3_time = xxh3_start.elapsed();
-        
+
         BenchmarkComparison {
             test_size,
             blake3_ns_per_op: blake3_time.as_nanos() / 100,
             xxh3_ns_per_op: xxh3_time.as_nanos() / 100,
-            blake3_throughput_mbps: (test_size as f64 * 100.0) / (blake3_time.as_secs_f64() * 1024.0 * 1024.0),
-            xxh3_throughput_mbps: (test_size as f64 * 100.0) / (xxh3_time.as_secs_f64() * 1024.0 * 1024.0),
+            blake3_throughput_mbps: (test_size as f64 * 100.0)
+                / (blake3_time.as_secs_f64() * 1024.0 * 1024.0),
+            xxh3_throughput_mbps: (test_size as f64 * 100.0)
+                / (xxh3_time.as_secs_f64() * 1024.0 * 1024.0),
         }
     }
 }
@@ -555,125 +545,131 @@ pub struct BenchmarkComparison {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::prelude::*;
-    
+    use super::*;
+
     #[test]
     fn test_engine_initialization() {
         let engine = HashEngine::new();
         let simd_level = engine.simd_level();
         // Should detect some level of SIMD support on modern CPUs
-        println!("Detected SIMD level: {:?}", simd_level);
+        println!("Detected SIMD level: {simd_level:?}");
         println!("Strategy: {:?}", engine.strategy());
     }
-    
+
     #[test]
     fn test_hash_strategies() {
         let data = b"Hello, Retrigger! This is a test of the hybrid hashing system.";
-        
+
         // Test all strategies
         let hybrid = HashEngine::with_strategy(HashStrategy::Hybrid);
         let blake3 = HashEngine::with_strategy(HashStrategy::Blake3Only);
         let xxh3 = HashEngine::with_strategy(HashStrategy::Xxh3Only);
         let auto = HashEngine::with_strategy(HashStrategy::Auto);
-        
+
         let result_hybrid = hybrid.hash_bytes(data).unwrap();
         let result_blake3 = blake3.hash_bytes(data).unwrap();
         let result_xxh3 = xxh3.hash_bytes(data).unwrap();
         let result_auto = auto.hash_bytes(data).unwrap();
-        
+
         // All should produce valid hashes
         assert_ne!(result_hybrid.hash, 0);
         assert_ne!(result_blake3.hash, 0);
         assert_ne!(result_xxh3.hash, 0);
         assert_ne!(result_auto.hash, 0);
-        
+
         // Size should be consistent
         assert_eq!(result_hybrid.size, data.len() as u32);
         assert_eq!(result_blake3.size, data.len() as u32);
         assert_eq!(result_xxh3.size, data.len() as u32);
         assert_eq!(result_auto.size, data.len() as u32);
     }
-    
+
     #[test]
     fn test_hybrid_threshold() {
         // Small data should use XXH3
         let small_data = vec![0u8; 1000];
         // Large data should use BLAKE3
         let large_data = vec![0u8; 2 * 1024 * 1024]; // 2MB
-        
+
         let engine = HashEngine::with_strategy(HashStrategy::Hybrid);
-        
+
         let small_result = engine.hash_bytes(&small_data).unwrap();
         let large_result = engine.hash_bytes(&large_data).unwrap();
-        
+
         assert_ne!(small_result.hash, 0);
         assert_ne!(large_result.hash, 0);
         assert_eq!(small_result.size, small_data.len() as u32);
         assert_eq!(large_result.size, large_data.len() as u32);
     }
-    
+
     #[test]
     fn test_prelude_functions() {
         let data = b"Test data for prelude functions";
-        
+
         let result_default = hash_bytes(data).unwrap();
         let result_blake3 = hash_bytes_blake3(data).unwrap();
         let result_xxh3 = hash_bytes_xxh3(data).unwrap();
-        
+
         assert_ne!(result_default.hash, 0);
         assert_ne!(result_blake3.hash, 0);
         assert_ne!(result_xxh3.hash, 0);
-        
+
         // BLAKE3 and XXH3 should produce different hashes
         assert_ne!(result_blake3.hash, result_xxh3.hash);
     }
-    
+
     #[test]
     fn test_benchmark_comparison() {
         let comparison = benchmark_algorithms(1024);
-        
+
         assert!(comparison.blake3_ns_per_op > 0);
         assert!(comparison.xxh3_ns_per_op > 0);
         assert!(comparison.blake3_throughput_mbps > 0.0);
         assert!(comparison.xxh3_throughput_mbps > 0.0);
-        
+
         println!("Benchmark results for 1KB:");
-        println!("BLAKE3: {} ns/op, {:.2} MB/s", comparison.blake3_ns_per_op, comparison.blake3_throughput_mbps);
-        println!("XXH3: {} ns/op, {:.2} MB/s", comparison.xxh3_ns_per_op, comparison.xxh3_throughput_mbps);
+        println!(
+            "BLAKE3: {} ns/op, {:.2} MB/s",
+            comparison.blake3_ns_per_op, comparison.blake3_throughput_mbps
+        );
+        println!(
+            "XXH3: {} ns/op, {:.2} MB/s",
+            comparison.xxh3_ns_per_op, comparison.xxh3_throughput_mbps
+        );
     }
-    
+
     #[test]
     fn test_performance_targets() {
         // Test 1MB file performance target: <0.1ms
         let mb_data = vec![0xABu8; 1024 * 1024];
         let engine = HashEngine::new();
-        
+
         let start = std::time::Instant::now();
         for _ in 0..10 {
             engine.hash_bytes(&mb_data).unwrap();
         }
         let elapsed = start.elapsed();
         let avg_per_op = elapsed / 10;
-        
-        println!("1MB hash time: {:?} (target: <0.1ms)", avg_per_op);
+
+        println!("1MB hash time: {avg_per_op:?} (target: <0.1ms)");
         // Note: This may not pass on all systems, but gives us a baseline
-        
+
         // Test 100MB would be too large for unit tests, but we can extrapolate
         let estimated_100mb = avg_per_op * 100;
-        println!("Estimated 100MB hash time: {:?} (target: <1ms)", estimated_100mb);
+        println!("Estimated 100MB hash time: {estimated_100mb:?} (target: <1ms)");
     }
-    
+
     #[test]
     fn test_incremental_hashing() {
         let mut hasher = IncrementalHasher::new(Some(1024)).unwrap();
-        
+
         let chunk1 = b"Hello, ";
         let chunk2 = b"Retrigger!";
-        
+
         hasher.update(chunk1).unwrap();
         hasher.update(chunk2).unwrap();
-        
+
         let result = hasher.finalize().unwrap();
         assert!(result.is_incremental);
         assert_eq!(result.size, (chunk1.len() + chunk2.len()) as u32);

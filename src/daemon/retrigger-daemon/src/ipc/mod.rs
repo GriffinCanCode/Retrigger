@@ -1,16 +1,16 @@
 //! Zero-Copy IPC Module
-//! 
-//! Complete shared memory IPC system for ultra-fast communication between 
+//!
+//! Complete shared memory IPC system for ultra-fast communication between
 //! Rust daemon and Node.js processes. Uses memory-mapped files for cross-process
 //! zero-copy communication with sub-millisecond latency.
 
+use anyhow::{Context, Result};
+use memmap2::{MmapMut, MmapOptions};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use anyhow::{Context, Result};
-use memmap2::{MmapMut, MmapOptions};
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use retrigger_system::EnhancedFileEvent;
@@ -18,21 +18,21 @@ use retrigger_system::EnhancedFileEvent;
 /// Zero-copy IPC configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZeroCopyConfig {
-    pub memory_size: usize,        // Total shared memory size
-    pub ring_capacity: usize,      // Number of events in ring
-    pub shared_path: PathBuf,      // Memory-mapped file path
+    pub memory_size: usize,         // Total shared memory size
+    pub ring_capacity: usize,       // Number of events in ring
+    pub shared_path: PathBuf,       // Memory-mapped file path
     pub enable_notifications: bool, // Enable eventfd notifications
-    pub consumer_timeout_ms: u64,  // Consumer read timeout
+    pub consumer_timeout_ms: u64,   // Consumer read timeout
 }
 
 impl Default for ZeroCopyConfig {
     fn default() -> Self {
         Self {
-            memory_size: 64 * 1024 * 1024,              // 64MB
-            ring_capacity: 100_000,                     // 100K events
+            memory_size: 64 * 1024 * 1024, // 64MB
+            ring_capacity: 100_000,        // 100K events
             shared_path: PathBuf::from("/tmp/retrigger-ipc.mmap"),
             enable_notifications: true,
-            consumer_timeout_ms: 1000,                  // 1s timeout
+            consumer_timeout_ms: 1000, // 1s timeout
         }
     }
 }
@@ -47,24 +47,24 @@ pub struct RingHeader {
     // Validation and versioning
     magic: u32,
     version: u32,
-    
+
     // Ring buffer control
     write_pos: AtomicU32,
     read_pos: AtomicU32,
     capacity: u32,
     event_size: u32,
-    
+
     // Statistics and monitoring
     total_events: AtomicU64,
     dropped_events: AtomicU64,
     last_write_timestamp: AtomicU64,
     last_read_timestamp: AtomicU64,
-    
+
     // State flags
     producer_pid: AtomicU32,
     consumer_pid: AtomicU32,
     shutdown_flag: AtomicU32,
-    
+
     // Performance monitoring
     max_utilization: AtomicU32,
     avg_latency_ns: AtomicU64,
@@ -90,7 +90,7 @@ impl RingHeader {
             avg_latency_ns: AtomicU64::new(0),
         }
     }
-    
+
     pub fn is_valid(&self) -> bool {
         self.magic == MAGIC_NUMBER && self.version == VERSION
     }
@@ -101,7 +101,7 @@ impl RingHeader {
 #[derive(Debug, Clone)]
 pub struct SerializedFileEvent {
     timestamp: u64,
-    event_type: u32,  // 0=created, 1=modified, 2=deleted, 3=moved, 4=metadata_changed
+    event_type: u32, // 0=created, 1=modified, 2=deleted, 3=moved, 4=metadata_changed
     path_len: u32,
     size: u64,
     is_directory: u32,
@@ -115,10 +115,10 @@ impl From<&EnhancedFileEvent> for SerializedFileEvent {
         let path_string = event.system_event.path.to_string_lossy();
         let path_bytes = path_string.as_bytes();
         let path_len = std::cmp::min(path_bytes.len(), 511); // Leave room for null terminator
-        
+
         let mut path_data = [0u8; 512];
         path_data[..path_len].copy_from_slice(&path_bytes[..path_len]);
-        
+
         let event_type = match event.system_event.event_type {
             retrigger_system::SystemEventType::Created => 0,
             retrigger_system::SystemEventType::Modified => 1,
@@ -126,13 +126,17 @@ impl From<&EnhancedFileEvent> for SerializedFileEvent {
             retrigger_system::SystemEventType::Moved => 3,
             retrigger_system::SystemEventType::MetadataChanged => 4,
         };
-        
+
         Self {
             timestamp: event.system_event.timestamp,
             event_type,
             path_len: path_len as u32,
             size: event.system_event.size,
-            is_directory: if event.system_event.is_directory { 1 } else { 0 },
+            is_directory: if event.system_event.is_directory {
+                1
+            } else {
+                0
+            },
             hash_present: if event.hash.is_some() { 1 } else { 0 },
             hash_value: event.hash.as_ref().map(|h| h.hash).unwrap_or(0),
             path_data,
@@ -142,21 +146,21 @@ impl From<&EnhancedFileEvent> for SerializedFileEvent {
 
 impl From<&SerializedFileEvent> for EnhancedFileEvent {
     fn from(ser: &SerializedFileEvent) -> Self {
-        let path_str = std::str::from_utf8(&ser.path_data[..ser.path_len as usize])
-            .unwrap_or("invalid_path");
-        
+        let path_str =
+            std::str::from_utf8(&ser.path_data[..ser.path_len as usize]).unwrap_or("invalid_path");
+
         let event_type = match ser.event_type {
             0 => retrigger_system::SystemEventType::Created,
-            1 => retrigger_system::SystemEventType::Modified, 
+            1 => retrigger_system::SystemEventType::Modified,
             2 => retrigger_system::SystemEventType::Deleted,
             3 => retrigger_system::SystemEventType::Moved,
             4 => retrigger_system::SystemEventType::MetadataChanged,
             _ => retrigger_system::SystemEventType::Modified,
         };
-        
-        use retrigger_system::{SystemEvent, EnhancedFileEvent};
+
         use retrigger_core::HashResult;
-        
+        use retrigger_system::{EnhancedFileEvent, SystemEvent};
+
         let system_event = SystemEvent {
             path: PathBuf::from(path_str),
             event_type,
@@ -164,7 +168,7 @@ impl From<&SerializedFileEvent> for EnhancedFileEvent {
             size: ser.size,
             is_directory: ser.is_directory == 1,
         };
-        
+
         let hash = if ser.hash_present == 1 {
             Some(HashResult {
                 hash: ser.hash_value,
@@ -174,7 +178,7 @@ impl From<&SerializedFileEvent> for EnhancedFileEvent {
         } else {
             None
         };
-        
+
         EnhancedFileEvent {
             system_event,
             hash,
@@ -200,7 +204,7 @@ impl ZeroCopyRing {
     /// Create producer (writer) instance
     pub fn create_producer(config: ZeroCopyConfig) -> Result<Self> {
         info!("Creating IPC producer: {}", config.shared_path.display());
-        
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -219,21 +223,20 @@ impl ZeroCopyRing {
         };
 
         let header_ptr = mmap.as_ptr() as *mut RingHeader;
-        
+
         // Initialize header (only producer does this)
         let event_size = std::mem::size_of::<SerializedFileEvent>() as u32;
         let header = RingHeader::new(config.ring_capacity as u32, event_size);
-        
+
         unsafe {
             std::ptr::write(header_ptr, header);
             let header_ref = &*header_ptr;
-            header_ref.producer_pid.store(std::process::id(), Ordering::Release);
+            header_ref
+                .producer_pid
+                .store(std::process::id(), Ordering::Release);
         }
 
-        let data_start = unsafe {
-            mmap.as_ptr()
-                .add(std::mem::size_of::<RingHeader>()) as *mut u8
-        };
+        let data_start = unsafe { mmap.as_ptr().add(std::mem::size_of::<RingHeader>()) as *mut u8 };
 
         // Setup eventfd for notifications if enabled
         let notifications_fd = if config.enable_notifications {
@@ -242,9 +245,11 @@ impl ZeroCopyRing {
             None
         };
 
-        info!("Created zero-copy ring buffer: {} events, {} bytes", 
-              config.ring_capacity, config.memory_size);
-        
+        info!(
+            "Created zero-copy ring buffer: {} events, {} bytes",
+            config.ring_capacity, config.memory_size
+        );
+
         Ok(Self {
             mmap,
             header: header_ptr,
@@ -258,14 +263,15 @@ impl ZeroCopyRing {
     /// Create consumer (reader) instance  
     pub fn create_consumer(config: ZeroCopyConfig) -> Result<Self> {
         info!("Creating IPC consumer: {}", config.shared_path.display());
-        
+
         // Wait for producer to create the file
         let mut attempts = 0;
         let file = loop {
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&config.shared_path) {
+                .open(&config.shared_path)
+            {
                 Ok(file) => break file,
                 Err(_) if attempts < 100 => {
                     attempts += 1;
@@ -284,19 +290,18 @@ impl ZeroCopyRing {
 
         let header_ptr = mmap.as_ptr() as *const RingHeader;
         let header = unsafe { &*header_ptr };
-        
+
         // Validate the shared memory
         if !header.is_valid() {
             return Err(anyhow::anyhow!("Invalid shared memory header"));
         }
 
         // Register as consumer
-        header.consumer_pid.store(std::process::id(), Ordering::Release);
+        header
+            .consumer_pid
+            .store(std::process::id(), Ordering::Release);
 
-        let data_start = unsafe {
-            mmap.as_ptr()
-                .add(std::mem::size_of::<RingHeader>()) as *mut u8
-        };
+        let data_start = unsafe { mmap.as_ptr().add(std::mem::size_of::<RingHeader>()) as *mut u8 };
 
         // Setup eventfd for notifications
         let notifications_fd = if config.enable_notifications {
@@ -306,7 +311,7 @@ impl ZeroCopyRing {
         };
 
         info!("Connected to zero-copy ring buffer");
-        
+
         Ok(Self {
             mmap,
             header: header_ptr,
@@ -327,7 +332,7 @@ impl ZeroCopyRing {
             Ok(fd)
         }
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     fn create_eventfd() -> Result<i32> {
         Err(anyhow::anyhow!("eventfd not supported on this platform"))
@@ -343,7 +348,7 @@ impl ZeroCopyRing {
         let header = unsafe { &*self.header };
         let write_pos = header.write_pos.load(Ordering::Acquire);
         let read_pos = header.read_pos.load(Ordering::Acquire);
-        
+
         let next_write = (write_pos + 1) % header.capacity;
         if next_write == read_pos {
             header.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -355,34 +360,37 @@ impl ZeroCopyRing {
 
         // Zero-copy write directly to shared memory
         let event_ptr = unsafe {
-            self.data_start.add((write_pos as usize) * header.event_size as usize)
+            self.data_start
+                .add((write_pos as usize) * header.event_size as usize)
         } as *mut SerializedFileEvent;
-        
+
         unsafe {
             std::ptr::write(event_ptr, serialized);
         }
-        
+
         // Update statistics
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)
-            .unwrap_or_default().as_nanos() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         header.last_write_timestamp.store(now, Ordering::Relaxed);
         header.total_events.fetch_add(1, Ordering::Relaxed);
-        
+
         // Update utilization tracking
         let utilization = ((next_write.wrapping_sub(read_pos)) * 100) / header.capacity;
         let current_max = header.max_utilization.load(Ordering::Relaxed);
         if utilization > current_max {
             header.max_utilization.store(utilization, Ordering::Relaxed);
         }
-        
+
         // Commit write
         header.write_pos.store(next_write, Ordering::Release);
-        
+
         // Notify consumer if enabled
         if let Some(fd) = self.notifications_fd {
             self.notify_consumer(fd);
         }
-        
+
         true
     }
 
@@ -396,34 +404,41 @@ impl ZeroCopyRing {
         let header = unsafe { &*self.header };
         let read_pos = header.read_pos.load(Ordering::Acquire);
         let write_pos = header.write_pos.load(Ordering::Acquire);
-        
+
         if read_pos == write_pos {
             return None; // Ring buffer empty
         }
 
         // Zero-copy read directly from shared memory
         let event_ptr = unsafe {
-            self.data_start.add((read_pos as usize) * header.event_size as usize)
+            self.data_start
+                .add((read_pos as usize) * header.event_size as usize)
         } as *const SerializedFileEvent;
-        
+
         let serialized = unsafe { std::ptr::read(event_ptr) };
         let event = EnhancedFileEvent::from(&serialized);
-        
+
         // Update statistics
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)
-            .unwrap_or_default().as_nanos() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         header.last_read_timestamp.store(now, Ordering::Relaxed);
-        
+
         // Calculate and update latency
         let latency = now.saturating_sub(serialized.timestamp);
         let current_avg = header.avg_latency_ns.load(Ordering::Relaxed);
-        let new_avg = if current_avg == 0 { latency } else { (current_avg + latency) / 2 };
+        let new_avg = if current_avg == 0 {
+            latency
+        } else {
+            (current_avg + latency) / 2
+        };
         header.avg_latency_ns.store(new_avg, Ordering::Relaxed);
-        
+
         // Commit read
         let next_read = (read_pos + 1) % header.capacity;
         header.read_pos.store(next_read, Ordering::Release);
-        
+
         Some(event)
     }
 
@@ -434,7 +449,7 @@ impl ZeroCopyRing {
             let value: u64 = 1;
             libc::write(fd, &value as *const u64 as *const libc::c_void, 8);
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         let _ = fd; // Unused on non-Linux platforms
     }
@@ -448,7 +463,7 @@ impl ZeroCopyRing {
         let header = unsafe { &*self.header };
         let read_pos = header.read_pos.load(Ordering::Acquire);
         let write_pos = header.write_pos.load(Ordering::Acquire);
-        
+
         if read_pos != write_pos {
             return true; // Events already available
         }
@@ -475,15 +490,15 @@ impl ZeroCopyRing {
     #[cfg(target_os = "linux")]
     fn wait_on_eventfd(&self, fd: i32, timeout_ms: u64) -> bool {
         use std::os::unix::io::RawFd;
-        
+
         let mut poll_fd = libc::pollfd {
             fd: fd as RawFd,
             events: libc::POLLIN,
             revents: 0,
         };
-        
+
         let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms as i32) };
-        
+
         if result > 0 && (poll_fd.revents & libc::POLLIN) != 0 {
             // Read the eventfd value to reset it
             let mut value: u64 = 0;
@@ -501,7 +516,7 @@ impl ZeroCopyRing {
         // Fallback polling on non-Linux systems
         let start = std::time::Instant::now();
         let header = unsafe { &*self.header };
-        
+
         while start.elapsed().as_millis() < timeout_ms as u128 {
             let read_pos = header.read_pos.load(Ordering::Acquire);
             let write_pos = header.write_pos.load(Ordering::Acquire);
@@ -518,13 +533,13 @@ impl ZeroCopyRing {
         let header = unsafe { &*self.header };
         let write_pos = header.write_pos.load(Ordering::Acquire);
         let read_pos = header.read_pos.load(Ordering::Acquire);
-        
+
         let used = if write_pos >= read_pos {
             write_pos - read_pos
         } else {
             header.capacity - read_pos + write_pos
         };
-        
+
         RingStats {
             capacity: header.capacity as usize,
             used: used as usize,
@@ -542,7 +557,7 @@ impl ZeroCopyRing {
     pub fn shutdown(&self) {
         let header = unsafe { &*self.header };
         header.shutdown_flag.store(1, Ordering::Release);
-        
+
         // Notify all consumers
         if let Some(fd) = self.notifications_fd {
             self.notify_consumer(fd);
@@ -570,17 +585,21 @@ impl Drop for ZeroCopyRing {
     fn drop(&mut self) {
         // Signal shutdown
         self.shutdown();
-        
+
         // Close eventfd if open
         if let Some(fd) = self.notifications_fd {
             #[cfg(target_os = "linux")]
             unsafe {
                 if libc::close(fd) != 0 {
-                    warn!("Failed to close eventfd {}: {}", fd, std::io::Error::last_os_error());
+                    warn!(
+                        "Failed to close eventfd {}: {}",
+                        fd,
+                        std::io::Error::last_os_error()
+                    );
                 }
             }
         }
-        
+
         // If we're the producer, cleanup the shared file
         if self.is_producer {
             let _ = std::fs::remove_file(&self.config.shared_path);
@@ -657,8 +676,8 @@ pub struct IPCStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use retrigger_system::{FileInfo, HashInfo};
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_zero_copy_ring_basic() {
@@ -701,7 +720,7 @@ mod tests {
 
         // Push event
         assert!(producer.push(&test_event));
-        
+
         // Check stats after push
         let stats = producer.stats();
         assert_eq!(stats.used, 1);
@@ -711,7 +730,7 @@ mod tests {
         let received = consumer.pop().unwrap();
         assert_eq!(received.path, test_event.path);
         assert_eq!(received.event_type, test_event.event_type);
-        
+
         // Check stats after pop
         let stats = consumer.stats();
         assert_eq!(stats.used, 0);
@@ -729,13 +748,13 @@ mod tests {
         };
 
         let mut manager = IPCManager::new(config);
-        
+
         // Start producer
         let producer = manager.start_producer().await.unwrap();
-        
+
         // Connect consumer
         let consumer = manager.connect_consumer().await.unwrap();
-        
+
         // Test communication
         let test_event = EnhancedFileEvent {
             path: PathBuf::from("/test/manager.txt"),
@@ -747,11 +766,11 @@ mod tests {
         };
 
         assert!(producer.push(&test_event));
-        
+
         let received = consumer.pop().unwrap();
         assert_eq!(received.path, test_event.path);
         assert_eq!(received.event_type, test_event.event_type);
-        
+
         // Check manager stats
         let stats = manager.get_stats();
         assert!(stats.producer_stats.is_some());

@@ -194,29 +194,29 @@ impl CompiledPatterns {
                 .with_context(|| format!("Invalid include pattern: {}", pattern))?;
             include_builder.add(glob);
         }
-        
+
         let mut exclude_builder = GlobSetBuilder::new();
         for pattern in &config.exclude {
             let glob = Glob::new(pattern)
                 .with_context(|| format!("Invalid exclude pattern: {}", pattern))?;
             exclude_builder.add(glob);
         }
-        
+
         Ok(Self {
             include: include_builder.build()?,
             exclude: exclude_builder.build()?,
         })
     }
-    
+
     /// Check if a file should be watched based on patterns
     pub fn should_watch(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
-        
+
         // Check include patterns first
         if !self.include.is_match(&*path_str) {
             return false;
         }
-        
+
         // Check exclude patterns
         !self.exclude.is_match(&*path_str)
     }
@@ -234,11 +234,11 @@ impl ConfigManager {
     /// Create a new configuration manager
     pub fn new() -> Self {
         let config = DaemonConfig::default();
-        let patterns = CompiledPatterns::new(&config.patterns)
-            .expect("Default patterns should be valid");
-        
+        let patterns =
+            CompiledPatterns::new(&config.patterns).expect("Default patterns should be valid");
+
         let (change_sender, _) = broadcast::channel(10);
-        
+
         Self {
             config: Arc::new(RwLock::new(config)),
             patterns: Arc::new(RwLock::new(patterns)),
@@ -246,98 +246,102 @@ impl ConfigManager {
             change_sender,
         }
     }
-    
+
     /// Load configuration from file
     pub async fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let config_str = tokio::fs::read_to_string(path).await
+        let config_str = tokio::fs::read_to_string(path)
+            .await
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        
-        let new_config: DaemonConfig = toml::from_str(&config_str)
-            .with_context(|| "Failed to parse config file")?;
-        
+
+        let new_config: DaemonConfig =
+            toml::from_str(&config_str).with_context(|| "Failed to parse config file")?;
+
         // Compile patterns
         let patterns = CompiledPatterns::new(&new_config.patterns)?;
-        
+
         // Update config
         {
             let mut config_guard = self.config.write().await;
             *config_guard = new_config.clone();
         }
-        
+
         {
             let mut patterns_guard = self.patterns.write().await;
             *patterns_guard = patterns;
         }
-        
+
         self.config_path = Some(path.to_path_buf());
-        
+
         // Notify subscribers of config change
         if let Err(e) = self.change_sender.send(new_config) {
             debug!("No config change subscribers: {}", e);
         }
-        
+
         info!("Loaded configuration from: {}", path.display());
         Ok(())
     }
-    
+
     /// Save current configuration to file
     pub async fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let config = self.config.read().await;
         let config_str = toml::to_string_pretty(&*config)?;
-        
-        tokio::fs::write(path.as_ref(), config_str).await
+
+        tokio::fs::write(path.as_ref(), config_str)
+            .await
             .with_context(|| format!("Failed to write config file: {}", path.as_ref().display()))?;
-        
+
         info!("Saved configuration to: {}", path.as_ref().display());
         Ok(())
     }
-    
+
     /// Get current configuration
     pub async fn get_config(&self) -> DaemonConfig {
         self.config.read().await.clone()
     }
-    
+
     /// Get compiled patterns
     pub async fn get_patterns(&self) -> CompiledPatterns {
         self.patterns.read().await.clone()
     }
-    
+
     /// Subscribe to configuration changes
     pub fn subscribe_changes(&self) -> broadcast::Receiver<DaemonConfig> {
         self.change_sender.subscribe()
     }
-    
+
     /// Start hot-reload monitoring
     pub async fn start_hot_reload(&self) -> Result<()> {
-        let config_path = self.config_path.as_ref()
+        let config_path = self
+            .config_path
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No config file loaded"))?;
-        
+
         let config_path = config_path.clone();
         let config = Arc::clone(&self.config);
         let patterns = Arc::clone(&self.patterns);
         let change_sender = self.change_sender.clone();
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             let mut last_modified = None;
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // Check file modification time
                 match tokio::fs::metadata(&config_path).await {
                     Ok(metadata) => {
                         let modified = metadata.modified().ok();
-                        
+
                         if last_modified.is_none() {
                             last_modified = modified;
                             continue;
                         }
-                        
+
                         if modified != last_modified {
                             last_modified = modified;
-                            
+
                             // Reload config
                             match Self::reload_config(&config_path, &config, &patterns).await {
                                 Ok(new_config) => {
@@ -356,11 +360,11 @@ impl ConfigManager {
                 }
             }
         });
-        
+
         info!("Started configuration hot-reload monitoring");
         Ok(())
     }
-    
+
     /// Internal method to reload configuration
     async fn reload_config(
         path: &Path,
@@ -370,48 +374,46 @@ impl ConfigManager {
         let config_str = tokio::fs::read_to_string(path).await?;
         let new_config: DaemonConfig = toml::from_str(&config_str)?;
         let new_patterns = CompiledPatterns::new(&new_config.patterns)?;
-        
+
         // Update config atomically
         {
             let mut config_guard = config.write().await;
             *config_guard = new_config.clone();
         }
-        
+
         {
             let mut patterns_guard = patterns.write().await;
             *patterns_guard = new_patterns;
         }
-        
+
         Ok(new_config)
     }
-    
+
     /// Validate configuration
     pub fn validate(config: &DaemonConfig) -> Result<()> {
         // Validate server config
         if config.server.port == 0 {
             anyhow::bail!("Invalid server port: {}", config.server.port);
         }
-        
+
         if config.server.max_connections == 0 {
             anyhow::bail!("max_connections must be > 0");
         }
-        
+
         // Validate watcher config
         if config.watcher.event_buffer_size == 0 {
             anyhow::bail!("event_buffer_size must be > 0");
         }
-        
+
         // Validate patterns
         for pattern in &config.patterns.include {
-            Glob::new(pattern)
-                .with_context(|| format!("Invalid include pattern: {}", pattern))?;
+            Glob::new(pattern).with_context(|| format!("Invalid include pattern: {}", pattern))?;
         }
-        
+
         for pattern in &config.patterns.exclude {
-            Glob::new(pattern)
-                .with_context(|| format!("Invalid exclude pattern: {}", pattern))?;
+            Glob::new(pattern).with_context(|| format!("Invalid exclude pattern: {}", pattern))?;
         }
-        
+
         Ok(())
     }
 }
@@ -427,11 +429,11 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
     use tokio::io::AsyncWriteExt;
-    
+
     #[tokio::test]
     async fn test_config_load_save() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        
+
         // Write test config
         let config_toml = r#"
 [server]
@@ -445,20 +447,20 @@ event_buffer_size = 32768
 include = ["**/*.rs", "**/*.toml"]
 exclude = ["**/target/**"]
 "#;
-        
+
         temp_file.write_all(config_toml.as_bytes()).unwrap();
         temp_file.flush().unwrap();
-        
+
         // Load config
         let mut manager = ConfigManager::new();
         manager.load_from_file(temp_file.path()).await.unwrap();
-        
+
         let config = manager.get_config().await;
         assert_eq!(config.server.bind_address, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.watcher.event_buffer_size, 32768);
     }
-    
+
     #[tokio::test]
     async fn test_pattern_matching() {
         let config = PatternConfig {
@@ -466,9 +468,9 @@ exclude = ["**/target/**"]
             exclude: vec!["**/target/**".to_string()],
             ..Default::default()
         };
-        
+
         let patterns = CompiledPatterns::new(&config).unwrap();
-        
+
         assert!(patterns.should_watch(Path::new("src/main.rs")));
         assert!(!patterns.should_watch(Path::new("target/debug/main.rs")));
         assert!(!patterns.should_watch(Path::new("README.md")));

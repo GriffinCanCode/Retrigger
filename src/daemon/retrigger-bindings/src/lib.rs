@@ -4,14 +4,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use retrigger_core::{HashEngine, FastHash};
-use retrigger_system::{SystemWatcher, FileEventProcessor, SystemEvent, SystemEventType};
-use napi::{
-    bindgen_prelude::*,
-    tokio::sync::broadcast,
-    Result as NapiResult,
-};
+use napi::{bindgen_prelude::*, tokio::sync::broadcast, Result as NapiResult};
 use napi_derive::napi;
+use retrigger_core::{FastHash, HashEngine};
+use retrigger_system::{FileEventProcessor, SystemEvent, SystemEventType, SystemWatcher};
 use serde::{Deserialize, Serialize};
 
 /// File event for Node.js
@@ -21,7 +17,7 @@ pub struct JsFileEvent {
     pub path: String,
     pub event_type: String,
     pub timestamp: String, // Use string for BigInt compatibility
-    pub size: String,      // Use string for BigInt compatibility  
+    pub size: String,      // Use string for BigInt compatibility
     pub is_directory: bool,
     pub hash: Option<JsHashResult>,
 }
@@ -87,14 +83,12 @@ impl RetriggerWrapper {
     /// Create a new Retrigger instance
     #[napi(constructor)]
     pub fn new() -> Self {
-        let system_watcher = Arc::new(
-            SystemWatcher::new()
-                .expect("Failed to create system watcher")
-        );
-        
+        let system_watcher =
+            Arc::new(SystemWatcher::new().expect("Failed to create system watcher"));
+
         let event_processor = Arc::new(FileEventProcessor::new());
         let hash_engine = Arc::new(HashEngine::new());
-        
+
         Self {
             system_watcher,
             event_processor,
@@ -102,84 +96,113 @@ impl RetriggerWrapper {
             event_receiver: None,
         }
     }
-    
+
     /// Watch a directory for changes
     #[napi]
-    pub async unsafe fn watch_directory(&mut self, path: String, options: Option<WatchOptions>) -> NapiResult<()> {
+    pub async unsafe fn watch_directory(
+        &mut self,
+        path: String,
+        options: Option<WatchOptions>,
+    ) -> NapiResult<()> {
         let options = options.unwrap_or_default();
         let recursive = options.recursive.unwrap_or(true);
-        
+
         self.system_watcher
             .watch_directory(&path, recursive)
             .await
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to watch directory: {}", e)))?;
-        
+            .map_err(|e| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("Failed to watch directory: {}", e),
+                )
+            })?;
+
         Ok(())
     }
-    
+
     /// Start the file watcher
     #[napi]
     pub async unsafe fn start(&mut self) -> NapiResult<()> {
-        self.system_watcher
-            .start()
-            .await
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to start watcher: {}", e)))?;
-        
+        self.system_watcher.start().await.map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to start watcher: {}", e),
+            )
+        })?;
+
         // Subscribe to events
         self.event_receiver = Some(self.system_watcher.subscribe());
-        
+
         Ok(())
     }
-    
+
     /// Get the next file event (non-blocking)
     #[napi]
     pub async unsafe fn poll_event(&mut self) -> NapiResult<Option<JsFileEvent>> {
         if let Some(ref mut receiver) = self.event_receiver {
             match receiver.try_recv() {
                 Ok(event) => {
-                    let enhanced = self.event_processor
-                        .process_event(event)
-                        .await
-                        .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to process event: {}", e)))?;
-                    
+                    let enhanced =
+                        self.event_processor
+                            .process_event(event)
+                            .await
+                            .map_err(|e| {
+                                Error::new(
+                                    Status::GenericFailure,
+                                    format!("Failed to process event: {}", e),
+                                )
+                            })?;
+
                     Ok(Some(convert_to_js_event(enhanced)))
                 }
                 Err(broadcast::error::TryRecvError::Empty) => Ok(None),
-                Err(e) => Err(Error::new(Status::GenericFailure, format!("Event receiver error: {}", e))),
+                Err(e) => Err(Error::new(
+                    Status::GenericFailure,
+                    format!("Event receiver error: {}", e),
+                )),
             }
         } else {
             Err(Error::new(Status::InvalidArg, "Watcher not started"))
         }
     }
-    
+
     /// Wait for the next file event with timeout
     #[napi]
     pub async unsafe fn wait_event(&mut self, timeout_ms: u32) -> NapiResult<Option<JsFileEvent>> {
         if let Some(ref mut receiver) = self.event_receiver {
             let timeout = std::time::Duration::from_millis(timeout_ms as u64);
-            
+
             match tokio::time::timeout(timeout, receiver.recv()).await {
                 Ok(Ok(event)) => {
-                    let enhanced = self.event_processor
-                        .process_event(event)
-                        .await
-                        .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to process event: {}", e)))?;
-                    
+                    let enhanced =
+                        self.event_processor
+                            .process_event(event)
+                            .await
+                            .map_err(|e| {
+                                Error::new(
+                                    Status::GenericFailure,
+                                    format!("Failed to process event: {}", e),
+                                )
+                            })?;
+
                     Ok(Some(convert_to_js_event(enhanced)))
                 }
-                Ok(Err(e)) => Err(Error::new(Status::GenericFailure, format!("Event receiver error: {}", e))),
+                Ok(Err(e)) => Err(Error::new(
+                    Status::GenericFailure,
+                    format!("Event receiver error: {}", e),
+                )),
                 Err(_) => Ok(None), // Timeout
             }
         } else {
             Err(Error::new(Status::InvalidArg, "Watcher not started"))
         }
     }
-    
+
     /// Get watcher statistics
     #[napi]
     pub async fn get_stats(&self) -> NapiResult<JsWatcherStats> {
         let stats = self.system_watcher.get_stats().await;
-        
+
         Ok(JsWatcherStats {
             pending_events: stats.pending_events,
             buffer_capacity: stats.buffer_capacity,
@@ -188,35 +211,43 @@ impl RetriggerWrapper {
             watched_directories: stats.watched_directories as u32,
         })
     }
-    
+
     /// Hash a file directly
     #[napi]
     pub async fn hash_file(&self, path: String) -> NapiResult<JsHashResult> {
         let engine = HashEngine::new();
-        let result = engine.hash_file(&path)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to hash file: {}", e)))?;
-        
+        let result = engine.hash_file(&path).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to hash file: {}", e),
+            )
+        })?;
+
         Ok(JsHashResult {
             hash: result.hash.to_string(),
             size: result.size,
             is_incremental: result.is_incremental,
         })
     }
-    
+
     /// Hash bytes directly
     #[napi]
     pub fn hash_bytes(&self, data: Buffer) -> NapiResult<JsHashResult> {
         let engine = HashEngine::new();
-        let result = engine.hash_bytes(&data)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to hash bytes: {}", e)))?;
-        
+        let result = engine.hash_bytes(&data).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to hash bytes: {}", e),
+            )
+        })?;
+
         Ok(JsHashResult {
             hash: result.hash.to_string(),
             size: result.size,
             is_incremental: result.is_incremental,
         })
     }
-    
+
     /// Get SIMD optimization level
     #[napi]
     pub fn get_simd_level(&self) -> String {
@@ -228,18 +259,18 @@ impl RetriggerWrapper {
 fn convert_to_js_event(enhanced: retrigger_system::EnhancedFileEvent) -> JsFileEvent {
     let event_type = match enhanced.system_event.event_type {
         SystemEventType::Created => "created",
-        SystemEventType::Modified => "modified", 
+        SystemEventType::Modified => "modified",
         SystemEventType::Deleted => "deleted",
         SystemEventType::Moved => "moved",
         SystemEventType::MetadataChanged => "metadata_changed",
     };
-    
+
     let hash = enhanced.hash.map(|h| JsHashResult {
         hash: h.hash.to_string(),
         size: h.size,
         is_incremental: h.is_incremental,
     });
-    
+
     JsFileEvent {
         path: enhanced.system_event.path.to_string_lossy().to_string(),
         event_type: event_type.to_string(),
@@ -254,9 +285,13 @@ fn convert_to_js_event(enhanced: retrigger_system::EnhancedFileEvent) -> JsFileE
 #[napi]
 pub fn hash_file_sync(path: String) -> NapiResult<JsHashResult> {
     let engine = HashEngine::new();
-    let result = engine.hash_file(&path)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to hash file: {}", e)))?;
-    
+    let result = engine.hash_file(&path).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("Failed to hash file: {}", e),
+        )
+    })?;
+
     Ok(JsHashResult {
         hash: result.hash.to_string(),
         size: result.size,
@@ -268,9 +303,13 @@ pub fn hash_file_sync(path: String) -> NapiResult<JsHashResult> {
 #[napi]
 pub fn hash_bytes_sync(data: Buffer) -> NapiResult<JsHashResult> {
     let engine = HashEngine::new();
-    let result = engine.hash_bytes(&data)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to hash bytes: {}", e)))?;
-    
+    let result = engine.hash_bytes(&data).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("Failed to hash bytes: {}", e),
+        )
+    })?;
+
     Ok(JsHashResult {
         hash: result.hash.to_string(),
         size: result.size,
@@ -289,20 +328,22 @@ pub fn get_simd_support() -> String {
 #[napi]
 pub async fn benchmark_hash(test_size: u32) -> NapiResult<HashMap<String, f64>> {
     let engine = HashEngine::new();
-    
+
     // Simple benchmark - just hash some test data and measure time
     let data: Vec<u8> = (0..test_size).map(|i| (i * 0x9E3779B1) as u8).collect();
-    
+
     let start = std::time::Instant::now();
-    let _ = engine.hash_bytes(&data).map_err(|e| Error::new(Status::GenericFailure, format!("Benchmark failed: {}", e)))?;
+    let _ = engine
+        .hash_bytes(&data)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Benchmark failed: {}", e)))?;
     let elapsed = start.elapsed();
-    
+
     let throughput_mbps = (test_size as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     let latency_ns = elapsed.as_nanos() as f64;
-    
+
     let mut stats = HashMap::new();
     stats.insert("throughput_mbps".to_string(), throughput_mbps);
     stats.insert("latency_ns".to_string(), latency_ns);
-    
+
     Ok(stats)
 }
