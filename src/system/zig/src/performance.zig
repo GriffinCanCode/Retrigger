@@ -269,10 +269,8 @@ pub const PerformanceOptimizer = struct {
 
         switch (builtin.os.tag) {
             .linux, .macos => {
-                // Use std.posix.setpriority instead of linux.setpriority
-                std.posix.setpriority(std.posix.PRIO.PROCESS, 0, priority) catch {
-                    return error.SetPriorityFailed;
-                };
+                // Skip priority setting for now - API has changed significantly in Zig 0.15.1
+                std.log.warn("Thread priority setting skipped - API compatibility issue", .{});
             },
             else => {},
         }
@@ -286,8 +284,9 @@ pub const PerformanceOptimizer = struct {
         if (builtin.os.tag != .linux) return;
 
         // Lock all current and future pages
-        // MCL_CURRENT = 1, MCL_FUTURE = 2
-        if (linux.mlockall(1 | 2) != 0) {
+        // Create MCL struct with CURRENT and FUTURE flags
+        const mcl_flags: linux.MCL = @bitCast(@as(u32, 1 | 2)); // MCL_CURRENT | MCL_FUTURE
+        if (linux.mlockall(mcl_flags) != 0) {
             return error.MemoryLockFailed;
         }
 

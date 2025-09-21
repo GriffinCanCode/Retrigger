@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "@parcel/watcher": "^2.5.1",
-    "chokidar": "^4.0.3"
+    "chokidar": "^4.0.3",
+    "watchpack": "^2.4.4"
   }
 }
