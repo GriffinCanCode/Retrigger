@@ -1,1 +1,1 @@
-../../crates/retrigger-bindings/build.rs
+../../daemon/retrigger-bindings/build.rs

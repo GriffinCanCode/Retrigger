@@ -20,7 +20,7 @@
 #define XXH3_SECRET_SIZE 192
 #define XXH3_BLOCK_SIZE 4096
 
-static const uint64_t XXH3_SECRET[XXH3_SECRET_SIZE/8] = {
+static const uint64_t XXH3_SECRET[XXH3_SECRET_SIZE/8] __attribute__((unused)) = {
     0x9E3779B185EBCA87ULL, 0xC2B2AE3D27D4EB4FULL,
     // ... rest of secret would be here in full implementation
 };
@@ -39,9 +39,16 @@ static rtr_simd_level_t current_simd_level = RTR_SIMD_NONE;
 
 // Forward declarations for SIMD implementations
 rtr_hash_result_t rtr_hash_generic(const void* data, size_t len);
+
+// Platform-specific forward declarations
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 rtr_hash_result_t rtr_hash_avx2(const void* data, size_t len);
 rtr_hash_result_t rtr_hash_avx512(const void* data, size_t len);
+#endif
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
 rtr_hash_result_t rtr_hash_neon(const void* data, size_t len);
+#endif
 
 // CPU feature detection implementation
 rtr_simd_level_t rtr_detect_simd_support(void) {
@@ -245,15 +252,19 @@ rtr_simd_level_t rtr_hash_init(void) {
     
     // Set implementation based on SIMD level
     switch (current_simd_level) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
         case RTR_SIMD_AVX512:
             hash_impl = rtr_hash_avx512;
             break;
         case RTR_SIMD_AVX2:
             hash_impl = rtr_hash_avx2;
             break;
+#endif
+#if defined(__aarch64__) || defined(__ARM_NEON)
         case RTR_SIMD_NEON:
             hash_impl = rtr_hash_neon;
             break;
+#endif
         default:
             hash_impl = rtr_hash_generic;
             break;

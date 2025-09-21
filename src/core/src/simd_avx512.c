@@ -1,5 +1,7 @@
 #include "../include/retrigger_hash.h"
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
 
 // Forward declaration for fallback
 rtr_hash_result_t rtr_hash_generic(const void* data, size_t len);
@@ -10,7 +12,7 @@ rtr_hash_result_t rtr_hash_generic(const void* data, size_t len);
  */
 
 rtr_hash_result_t rtr_hash_avx512(const void* data, size_t len) {
-#ifdef __AVX512F__
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
     const uint8_t* input = (const uint8_t*)data;
     
     // AVX-512 constants
@@ -51,7 +53,16 @@ rtr_hash_result_t rtr_hash_avx512(const void* data, size_t len) {
     acc = _mm512_xor_si512(acc0, acc1);
     
     // Horizontal reduction - AVX-512 to scalar
-    uint64_t hash = _mm512_reduce_xor_epi64(acc);
+    // Use manual reduction since _mm512_reduce_xor_epi64 may not be available
+    __m256i lo = _mm512_extracti64x4_epi64(acc, 0);
+    __m256i hi = _mm512_extracti64x4_epi64(acc, 1);
+    __m256i combined = _mm256_xor_si256(lo, hi);
+    
+    __m128i lo128 = _mm256_extracti128_si256(combined, 0);
+    __m128i hi128 = _mm256_extracti128_si256(combined, 1);
+    __m128i final128 = _mm_xor_si128(lo128, hi128);
+    
+    uint64_t hash = _mm_extract_epi64(final128, 0) ^ _mm_extract_epi64(final128, 1);
     
     // Process remaining bytes
     size_t remaining_start = chunks * 64;

@@ -1,5 +1,7 @@
 #include "../include/retrigger_hash.h"
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
 
 // Forward declaration for fallback
 rtr_hash_result_t rtr_hash_generic(const void* data, size_t len);

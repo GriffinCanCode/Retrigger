@@ -43,10 +43,10 @@ endif
 
 # SIMD detection and flags
 ifeq ($(UNAME_M),x86_64)
-    # Check for AVX-512 support
-    AVX512_SUPPORT := $(shell $(CC) -mavx512f -E -dM - < /dev/null 2>/dev/null | grep -q "__AVX512F__" && echo 1 || echo 0)
+    # Check for AVX-512 support (requires both F and DQ for full functionality)
+    AVX512_SUPPORT := $(shell $(CC) -mavx512f -mavx512dq -E -dM - < /dev/null 2>/dev/null | grep -E "__AVX512(F|DQ)__" | wc -l | grep -q "2" && echo 1 || echo 0)
     ifeq ($(AVX512_SUPPORT),1)
-        CFLAGS += -mavx512f -DHAVE_AVX512
+        CFLAGS += -mavx512f -mavx512dq -DHAVE_AVX512
     endif
     
     # Check for AVX2 support  
