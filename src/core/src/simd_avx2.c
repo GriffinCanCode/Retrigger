@@ -1,6 +1,9 @@
 #include "../include/retrigger_hash.h"
 #include <immintrin.h>
 
+// Forward declaration for fallback
+rtr_hash_result_t rtr_hash_generic(const void* data, size_t len);
+
 /**
  * AVX2-optimized XXH3 implementation
  * Processes 32 bytes per iteration using AVX2 instructions
@@ -12,7 +15,6 @@ rtr_hash_result_t rtr_hash_avx2(const void* data, size_t len) {
     
     // AVX2 constants
     const __m256i secret1 = _mm256_set1_epi64x(0x9E3779B185EBCA87ULL);
-    const __m256i secret2 = _mm256_set1_epi64x(0xC2B2AE3D27D4EB4FULL);
     const __m256i mult = _mm256_set1_epi64x(0x165667919E3779F9ULL);
     
     __m256i acc = _mm256_set1_epi64x(0x9E3779B185EBCA87ULL);
@@ -64,6 +66,6 @@ rtr_hash_result_t rtr_hash_avx2(const void* data, size_t len) {
     };
 #else
     // Fallback to generic implementation if AVX2 not available
-    return fw_hash_generic(data, len);
+    return rtr_hash_generic(data, len);
 #endif
 }

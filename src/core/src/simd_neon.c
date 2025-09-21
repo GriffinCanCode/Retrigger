@@ -4,6 +4,9 @@
 #include <arm_neon.h>
 #endif
 
+// Forward declaration for fallback
+rtr_hash_result_t rtr_hash_generic(const void* data, size_t len);
+
 /**
  * NEON-optimized XXH3 implementation for ARM/Apple Silicon
  * Processes 16 bytes per iteration using NEON instructions

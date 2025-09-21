@@ -1,6 +1,9 @@
 #include "../include/retrigger_hash.h"
 #include <immintrin.h>
 
+// Forward declaration for fallback
+rtr_hash_result_t rtr_hash_generic(const void* data, size_t len);
+
 /**
  * AVX-512 optimized XXH3 implementation
  * Processes 64 bytes per iteration using AVX-512 instructions
@@ -70,7 +73,7 @@ rtr_hash_result_t rtr_hash_avx512(const void* data, size_t len) {
         .is_incremental = false
     };
 #else
-    // Fallback to AVX2 or generic
-    return rtr_hash_avx2(data, len);
+    // Fallback to generic implementation if AVX512 not available
+    return rtr_hash_generic(data, len);
 #endif
 }
