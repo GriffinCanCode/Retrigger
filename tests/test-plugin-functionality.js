@@ -27,7 +27,7 @@ function test(name, fn) {
 
 // Test 1: Basic module loading
 test('Load main Retrigger module', () => {
-  const retrigger = require('./src/bindings/nodejs/index.js');
+  const retrigger = require('../src/bindings/nodejs/index.js');
   
   if (!retrigger.RetriggerWebpackPlugin) {
     throw new Error('RetriggerWebpackPlugin not exported');
@@ -48,7 +48,7 @@ test('Load main Retrigger module', () => {
 
 // Test 2: Webpack Plugin instantiation
 test('Create Webpack Plugin instance', () => {
-  const { RetriggerWebpackPlugin } = require('./src/bindings/nodejs/index.js');
+  const { RetriggerWebpackPlugin } = require('../src/bindings/nodejs/index.js');
   
   const plugin = new RetriggerWebpackPlugin({
     watchPaths: ['./src', './test'],
@@ -72,7 +72,7 @@ test('Create Webpack Plugin instance', () => {
 
 // Test 3: Vite Plugin creation
 test('Create Vite Plugin instance', () => {
-  const { createRetriggerVitePlugin } = require('./src/bindings/nodejs/index.js');
+  const { createRetriggerVitePlugin } = require('../src/bindings/nodejs/index.js');
   
   const plugin = createRetriggerVitePlugin({
     watchPaths: ['./src'],
@@ -91,7 +91,7 @@ test('Create Vite Plugin instance', () => {
 
 // Test 4: Mock webpack compiler integration
 test('Webpack Plugin integration with mock compiler', () => {
-  const { RetriggerWebpackPlugin } = require('./src/bindings/nodejs/index.js');
+  const { RetriggerWebpackPlugin } = require('../src/bindings/nodejs/index.js');
   
   let hooksRegistered = 0;
   const mockCompiler = {
@@ -123,7 +123,7 @@ test('Webpack Plugin integration with mock compiler', () => {
 
 // Test 5: Mock Vite server integration
 test('Vite Plugin integration with mock server', () => {
-  const { createRetriggerVitePlugin } = require('./src/bindings/nodejs/index.js');
+  const { createRetriggerVitePlugin } = require('../src/bindings/nodejs/index.js');
   
   let middlewareCount = 0;
   const mockServer = {
@@ -165,7 +165,7 @@ test('Vite Plugin integration with mock server', () => {
 
 // Test 6: Plugin options validation
 test('Plugin options validation', () => {
-  const { RetriggerWebpackPlugin, createRetriggerVitePlugin } = require('./src/bindings/nodejs/index.js');
+  const { RetriggerWebpackPlugin, createRetriggerVitePlugin } = require('../src/bindings/nodejs/index.js');
   
   // Test with no options
   const webpackPlugin1 = new RetriggerWebpackPlugin();
@@ -195,7 +195,7 @@ test('Plugin options validation', () => {
 
 // Test 7: Error handling
 test('Plugin error handling', () => {
-  const { RetriggerWebpackPlugin } = require('./src/bindings/nodejs/index.js');
+  const { RetriggerWebpackPlugin } = require('../src/bindings/nodejs/index.js');
   
   const plugin = new RetriggerWebpackPlugin();
   
@@ -272,7 +272,7 @@ test('Package.json NPM readiness', () => {
 
 // Test 10: Advanced features availability (graceful degradation)
 test('Advanced features graceful degradation', () => {
-  const { createAdvancedRetrigger } = require('./src/bindings/nodejs/index.js');
+  const { createAdvancedRetrigger } = require('../src/bindings/nodejs/index.js');
   
   const advancedInstance = createAdvancedRetrigger({
     enablePerformanceMonitoring: false,

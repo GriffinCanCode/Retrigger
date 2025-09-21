@@ -13,14 +13,14 @@ console.log('🔍 Testing Retrigger webpack readiness...\n');
 // Test 1: Check if webpack plugin file exists and is valid
 console.log('1. Checking webpack plugin...');
 try {
-  const pluginPath = path.join(__dirname, 'bindings/nodejs/plugins/webpack-plugin.js');
+  const pluginPath = path.join(__dirname, 'src/bindings/nodejs/plugins/webpack-plugin.js');
   
   if (!fs.existsSync(pluginPath)) {
     throw new Error('Webpack plugin file not found');
   }
   
   // Try to require the plugin
-  const RetriggerWebpackPlugin = require('./bindings/nodejs/plugins/webpack-plugin.js');
+  const RetriggerWebpackPlugin = require('../src/bindings/nodejs/plugins/webpack-plugin.js');
   
   if (typeof RetriggerWebpackPlugin !== 'function') {
     throw new Error('Webpack plugin is not a constructor function');
@@ -35,7 +35,7 @@ try {
 // Test 2: Check if the plugin can be instantiated
 console.log('\n2. Testing plugin instantiation...');
 try {
-  const RetriggerWebpackPlugin = require('./bindings/nodejs/plugins/webpack-plugin.js');
+  const RetriggerWebpackPlugin = require('../src/bindings/nodejs/plugins/webpack-plugin.js');
   
   const plugin = new RetriggerWebpackPlugin({
     watchPaths: ['./test'],
@@ -64,7 +64,7 @@ try {
   }
   
   // Check if native lib exists
-  const nativeLib = path.join(__dirname, 'bindings/nodejs/retrigger-bindings.darwin-arm64.node');
+  const nativeLib = path.join(__dirname, 'src/bindings/nodejs/retrigger-bindings.darwin-arm64.node');
   if (fs.existsSync(nativeLib)) {
     console.log('✅ Native bindings found');
   } else {
@@ -80,7 +80,7 @@ try {
 // Test 4: Test with a mock webpack compiler
 console.log('\n4. Testing webpack integration...');
 try {
-  const RetriggerWebpackPlugin = require('./bindings/nodejs/plugins/webpack-plugin.js');
+  const RetriggerWebpackPlugin = require('../src/bindings/nodejs/plugins/webpack-plugin.js');
   
   // Create mock compiler
   const mockCompiler = {
@@ -111,7 +111,7 @@ try {
 // Test 5: Check package.json and dependencies
 console.log('\n5. Checking Node.js package...');
 try {
-  const packagePath = path.join(__dirname, 'bindings/nodejs/package.json');
+  const packagePath = path.join(__dirname, 'src/bindings/nodejs/package.json');
   
   if (!fs.existsSync(packagePath)) {
     throw new Error('package.json not found');
