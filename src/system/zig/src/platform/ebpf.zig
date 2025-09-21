@@ -42,7 +42,7 @@ pub const EBPFManager = struct {
     perf_fds: std.ArrayList(i32),
 
     // Memory mapped perf buffers
-    perf_buffers: std.ArrayList([]align(std.mem.page_size) u8),
+    perf_buffers: std.ArrayList([]align(4096) u8),
 
     // Event processing
     event_buffer: ?*EventRingBuffer,
@@ -61,7 +61,7 @@ pub const EBPFManager = struct {
             .prog_fds = std.ArrayList(i32).init(allocator),
             .map_fds = std.ArrayList(i32).init(allocator),
             .perf_fds = std.ArrayList(i32).init(allocator),
-            .perf_buffers = std.ArrayList([]align(std.mem.page_size) u8).init(allocator),
+            .perf_buffers = std.ArrayList([]align(4096) u8).init(allocator),
             .event_buffer = null,
             .events_processed = std.atomic.Value(u64).init(0),
             .events_dropped = std.atomic.Value(u64).init(0),
@@ -432,7 +432,7 @@ pub const EBPFManager = struct {
             try self.perf_fds.append(self.allocator, @intCast(perf_fd));
 
             // Memory map the perf buffer
-            const mmap_size = 8 * std.mem.page_size; // 8 pages: 1 metadata + 7 data
+            const mmap_size = 8 * 4096; // 8 pages: 1 metadata + 7 data
             const ptr = try std.os.mmap(
                 null,
                 mmap_size,
@@ -506,7 +506,7 @@ pub const EBPFManager = struct {
         const data_tail = metadata.data_tail;
 
         while (data_tail != data_head) {
-            const event_ptr = buffer.ptr + std.mem.page_size + (data_tail % (7 * std.mem.page_size));
+            const event_ptr = buffer.ptr + 4096 + (data_tail % (7 * 4096));
             const perf_sample = @as(*linux.perf_event_header, @ptrCast(@alignCast(event_ptr)));
 
             if (perf_sample.type == linux.PERF.RECORD.SAMPLE) {
