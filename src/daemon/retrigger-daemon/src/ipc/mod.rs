@@ -189,6 +189,7 @@ impl From<&SerializedFileEvent> for EnhancedFileEvent {
 
 /// Zero-Copy Ring Buffer implementation
 pub struct ZeroCopyRing {
+    #[allow(dead_code)]
     mmap: MmapMut,
     header: *const RingHeader,
     data_start: *mut u8,
@@ -676,7 +677,7 @@ pub struct IPCStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use retrigger_system::{FileInfo, HashInfo};
+    use retrigger_system::EnhancedFileEvent;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -700,22 +701,21 @@ mod tests {
         assert_eq!(stats.utilization, 0.0);
 
         // Test event push/pop
+        use retrigger_system::{SystemEvent, SystemEventType};
         let test_event = EnhancedFileEvent {
-            path: PathBuf::from("/test/file.txt"),
-            event_type: "modified".to_string(),
-            timestamp: 123456789,
-            file_info: Some(FileInfo {
+            system_event: SystemEvent {
+                path: PathBuf::from("/test/file.txt"),
+                event_type: SystemEventType::Modified,
+                timestamp: 123456789,
                 size: 1024,
                 is_directory: false,
-                permissions: 0o644,
-                modified_time: 123456789,
-            }),
-            hash_info: Some(HashInfo {
+            },
+            hash: Some(retrigger_core::HashResult {
                 hash: 0xDEADBEEF,
-                algorithm: "XXH3".to_string(),
+                size: 1024,
                 is_incremental: false,
             }),
-            metadata: std::collections::HashMap::new(),
+            processing_time_ns: 1000000,
         };
 
         // Push event
@@ -728,8 +728,8 @@ mod tests {
 
         // Pop event
         let received = consumer.pop().unwrap();
-        assert_eq!(received.path, test_event.path);
-        assert_eq!(received.event_type, test_event.event_type);
+        assert_eq!(received.system_event.path, test_event.system_event.path);
+        assert_eq!(received.system_event.event_type, test_event.system_event.event_type);
 
         // Check stats after pop
         let stats = consumer.stats();
@@ -757,19 +757,22 @@ mod tests {
 
         // Test communication
         let test_event = EnhancedFileEvent {
-            path: PathBuf::from("/test/manager.txt"),
-            event_type: "created".to_string(),
-            timestamp: 987654321,
-            file_info: None,
-            hash_info: None,
-            metadata: std::collections::HashMap::new(),
+            system_event: SystemEvent {
+                path: PathBuf::from("/test/manager.txt"),
+                event_type: SystemEventType::Created,
+                timestamp: 987654321,
+                size: 512,
+                is_directory: false,
+            },
+            hash: None,
+            processing_time_ns: 500000,
         };
 
         assert!(producer.push(&test_event));
 
         let received = consumer.pop().unwrap();
-        assert_eq!(received.path, test_event.path);
-        assert_eq!(received.event_type, test_event.event_type);
+        assert_eq!(received.system_event.path, test_event.system_event.path);
+        assert_eq!(received.system_event.event_type, test_event.system_event.event_type);
 
         // Check manager stats
         let stats = manager.get_stats();

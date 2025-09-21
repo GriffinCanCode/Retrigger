@@ -14,7 +14,9 @@ use tracing::info;
 
 /// gRPC service implementation
 pub struct RetriggerService {
+    #[allow(dead_code)]
     system_watcher: Arc<SystemWatcher>,
+    #[allow(dead_code)]
     enhanced_events: broadcast::Receiver<EnhancedFileEvent>,
 }
 

@@ -16,6 +16,7 @@ use crate::ipc::{RingStats, ZeroCopyConfig, ZeroCopyRing};
 /// Follows Single Responsibility: only consumes events
 pub struct ZeroCopyConsumer {
     ring: ZeroCopyRing,
+    #[allow(dead_code)]
     config: ZeroCopyConfig,
 }
 
@@ -195,6 +196,8 @@ mod tests {
             memory_size: 1024 * 1024, // 1MB
             ring_capacity: 1000,
             shared_path: temp_file.path().to_path_buf(),
+            consumer_timeout_ms: 1000,
+            enable_notifications: false,
         };
 
         // Create producer first (simulating daemon)
