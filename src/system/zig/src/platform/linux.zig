@@ -2,6 +2,15 @@
 //! Uses inotify, fanotify, io_uring, and eBPF for maximum performance
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Only compile Linux watcher on Linux platforms
+comptime {
+    if (builtin.os.tag != .linux) {
+        @compileError("Linux watcher is only available on Linux platforms");
+    }
+}
+
 const linux = std.os.linux;
 const main = @import("../main.zig");
 const FileEvent = main.FileEvent;
@@ -9,6 +18,7 @@ const EventType = main.EventType;
 const EventRingBuffer = main.EventRingBuffer;
 const ebpf = @import("ebpf.zig");
 
+// C imports are only processed on Linux platforms
 const c = @cImport({
     @cInclude("sys/inotify.h");
     @cInclude("sys/fanotify.h");
@@ -70,7 +80,7 @@ pub const LinuxWatcher = struct {
         }
 
         // Initialize fanotify for mount-wide monitoring
-        const fanotify_fd = c.fanotify_init(c.FAN_CLASS_NOTIF | c.FAN_CLOEXEC | c.FAN_NONBLOCK, c.O_RDONLY | c.O_LARGEFILE);
+        const fanotify_fd = c.fanotify_init(c.FAN_CLASS_NOTIF | c.FAN_CLOEXEC | c.FAN_NONBLOCK, c.O_RDONLY);
         // Note: fanotify_fd might be -1 if no permissions, that's ok
 
         // Create epoll for event multiplexing
@@ -158,7 +168,10 @@ pub const LinuxWatcher = struct {
         const mask = linux.IN.CREATE | linux.IN.DELETE | linux.IN.MODIFY |
             linux.IN.MOVED_FROM | linux.IN.MOVED_TO | linux.IN.ATTRIB;
 
-        const wd = linux.inotify_add_watch(self.inotify_fd, path.ptr, mask);
+        // Ensure null-terminated string for inotify_add_watch
+        const path_z = try self.path_allocator.dupeZ(u8, path);
+        defer self.path_allocator.free(path_z);
+        const wd = linux.inotify_add_watch(self.inotify_fd, path_z.ptr, mask);
         if (wd < 0) {
             return error.WatchAddFailed;
         }

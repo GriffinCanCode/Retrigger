@@ -176,7 +176,7 @@ pub const CrossPlatformEBPF = struct {
             else => return EBPFError.PlatformNotSupported,
         };
 
-        var self = Self{
+        const self = Self{
             .allocator = allocator,
             .platform = platform,
             .programs = std.ArrayList(EBPFProgram).init(allocator),
@@ -435,12 +435,7 @@ pub const CrossPlatformEBPF = struct {
     }
 
     // Platform-specific implementations (would be filled in with actual logic)
-    fn create_linux_map(self: *Self, map_type: EBPFMapType, key_size: u32, value_size: u32, max_entries: u32) !i32 {
-        _ = self;
-        _ = map_type;
-        _ = key_size;
-        _ = value_size;
-        _ = max_entries;
+    fn create_linux_map(_: *Self, _: EBPFMapType, _: u32, _: u32, _: u32) !i32 {
         if (builtin.os.tag == .linux) {
             // Would use linux.bpf() syscall
             return 1; // Placeholder
@@ -448,12 +443,7 @@ pub const CrossPlatformEBPF = struct {
         return EBPFError.PlatformNotSupported;
     }
 
-    fn create_windows_map(self: *Self, map_type: EBPFMapType, key_size: u32, value_size: u32, max_entries: u32) !WindowsEBPFHandle {
-        _ = self;
-        _ = map_type;
-        _ = key_size;
-        _ = value_size;
-        _ = max_entries;
+    fn create_windows_map(_: *Self, _: EBPFMapType, _: u32, _: u32, _: u32) !WindowsEBPFHandle {
         if (builtin.os.tag == .windows) {
             // Would use Windows eBPF APIs
             return WindowsEBPFHandle{ .program_fd = 1, .map_fd = 1, .attach_handle = 1 };
@@ -472,19 +462,10 @@ pub const CrossPlatformEBPF = struct {
             const map_id = try self.macos_vm.create_map(vm_map_type, key_size, value_size, max_entries);
             return MacOSEBPFHandle{ .program_id = 0, .map_id = map_id, .vm_ref = &self.macos_vm };
         }
-        _ = self;
-        _ = map_type;
-        _ = key_size;
-        _ = value_size;
-        _ = max_entries;
         return EBPFError.PlatformNotSupported;
     }
 
-    fn load_linux_program(self: *Self, instructions: []const EBPFInstruction, program_type: EBPFProgramType, name: []const u8) !i32 {
-        _ = self;
-        _ = instructions;
-        _ = program_type;
-        _ = name;
+    fn load_linux_program(_: *Self, _: []const EBPFInstruction, _: EBPFProgramType, _: []const u8) !i32 {
         if (builtin.os.tag == .linux) {
             // Would convert instructions and use linux.bpf() syscall
             return 1; // Placeholder
@@ -492,11 +473,7 @@ pub const CrossPlatformEBPF = struct {
         return EBPFError.PlatformNotSupported;
     }
 
-    fn load_windows_program(self: *Self, instructions: []const EBPFInstruction, program_type: EBPFProgramType, name: []const u8) !WindowsEBPFHandle {
-        _ = self;
-        _ = instructions;
-        _ = program_type;
-        _ = name;
+    fn load_windows_program(_: *Self, _: []const EBPFInstruction, _: EBPFProgramType, _: []const u8) !WindowsEBPFHandle {
         if (builtin.os.tag == .windows) {
             // Would use Windows eBPF APIs
             return WindowsEBPFHandle{ .program_fd = 1, .map_fd = 1, .attach_handle = 1 };
@@ -530,30 +507,19 @@ pub const CrossPlatformEBPF = struct {
             const program_id = try self.macos_vm.load_program(vm_instructions.items, vm_program_type, name);
             return MacOSEBPFHandle{ .program_id = program_id, .map_id = 0, .vm_ref = &self.macos_vm };
         }
-        _ = self;
-        _ = instructions;
-        _ = program_type;
-        _ = name;
         return EBPFError.PlatformNotSupported;
     }
 
     // Additional platform-specific helper methods would go here...
-    fn attach_linux_program(self: *Self, fd: i32, attach_point: []const u8) !void {
-        _ = self;
-        _ = fd;
-        _ = attach_point;
+    fn attach_linux_program(_: *Self, _: i32, _: []const u8) !void {
         // Linux-specific attachment logic
     }
 
-    fn attach_windows_program(self: *Self, handle: *WindowsEBPFHandle, attach_point: []const u8) !void {
-        _ = self;
-        _ = handle;
-        _ = attach_point;
+    fn attach_windows_program(_: *Self, _: *WindowsEBPFHandle, _: []const u8) !void {
         // Windows-specific attachment logic
     }
 
-    fn attach_macos_program(self: *Self, handle: *MacOSEBPFHandle, attach_point: []const u8) !void {
-        _ = attach_point;
+    fn attach_macos_program(self: *Self, handle: *MacOSEBPFHandle, _: []const u8) !void {
         if (builtin.os.tag == .macos) {
             // Mark program as attached in VM
             if (handle.program_id < self.macos_vm.programs.items.len) {
@@ -562,23 +528,15 @@ pub const CrossPlatformEBPF = struct {
         }
     }
 
-    fn linux_map_lookup(self: *Self, fd: i32, key: []const u8) !?[]const u8 {
-        _ = self;
-        _ = fd;
-        _ = key;
+    fn linux_map_lookup(_: *Self, _: i32, _: []const u8) !?[]const u8 {
         return null; // Placeholder
     }
 
-    fn windows_map_lookup(self: *Self, handle: *WindowsEBPFHandle, key: []const u8) !?[]const u8 {
-        _ = self;
-        _ = handle;
-        _ = key;
+    fn windows_map_lookup(_: *Self, _: *WindowsEBPFHandle, _: []const u8) !?[]const u8 {
         return null; // Placeholder
     }
 
     fn macos_map_lookup(self: *Self, handle: *MacOSEBPFHandle, key: []const u8) !?[]const u8 {
-        _ = handle;
-        _ = key;
         if (builtin.os.tag == .macos) {
             // Use VM map lookup
             _ = try self.macos_vm.map_lookup_elem(handle.map_id, @intFromPtr(key.ptr));
@@ -586,21 +544,11 @@ pub const CrossPlatformEBPF = struct {
         return null; // Placeholder
     }
 
-    fn linux_map_update(self: *Self, fd: i32, key: []const u8, value: []const u8, flags: u64) !void {
-        _ = self;
-        _ = fd;
-        _ = key;
-        _ = value;
-        _ = flags;
+    fn linux_map_update(_: *Self, _: i32, _: []const u8, _: []const u8, _: u64) !void {
         // Linux map update logic
     }
 
-    fn windows_map_update(self: *Self, handle: *WindowsEBPFHandle, key: []const u8, value: []const u8, flags: u64) !void {
-        _ = self;
-        _ = handle;
-        _ = key;
-        _ = value;
-        _ = flags;
+    fn windows_map_update(_: *Self, _: *WindowsEBPFHandle, _: []const u8, _: []const u8, _: u64) !void {
         // Windows map update logic
     }
 
@@ -608,10 +556,6 @@ pub const CrossPlatformEBPF = struct {
         if (builtin.os.tag == .macos) {
             _ = try self.macos_vm.map_update_elem(handle.map_id, @intFromPtr(key.ptr), @intFromPtr(value.ptr), flags);
         }
-        _ = handle;
-        _ = key;
-        _ = value;
-        _ = flags;
     }
 };
 

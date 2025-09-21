@@ -2,12 +2,22 @@
 //! Follows SRP: Only responsible for eBPF tracepoint management and syscall interception
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Only compile eBPF support on Linux
+comptime {
+    if (builtin.os.tag != .linux) {
+        @compileError("eBPF support is only available on Linux");
+    }
+}
+
 const linux = std.os.linux;
 const main = @import("../main.zig");
 const FileEvent = main.FileEvent;
 const EventType = main.EventType;
 const EventRingBuffer = main.EventRingBuffer;
 
+// C imports are only processed on Linux platforms
 const c = @cImport({
     @cInclude("linux/bpf.h");
     @cInclude("linux/perf_event.h");
@@ -86,7 +96,7 @@ pub const EBPFManager = struct {
 
         // Unmap perf buffers
         for (self.perf_buffers.items) |buffer| {
-            std.os.munmap(buffer);
+            std.posix.munmap(buffer);
         }
 
         self.prog_fds.deinit(self.allocator);
@@ -145,8 +155,8 @@ pub const EBPFManager = struct {
         };
 
         // Zero the map name and set it
-        std.mem.set(u8, &map_create.map_name, 0);
-        std.mem.copy(u8, &map_create.map_name, "events_map");
+        @memset(&map_create.map_name, 0);
+        @memcpy(map_create.map_name[0.."events_map".len], "events_map");
 
         const map_fd = linux.bpf(.MAP_CREATE, @ptrCast(&map_create), @sizeOf(@TypeOf(map_create)));
         if (map_fd < 0) {
@@ -187,8 +197,8 @@ pub const EBPFManager = struct {
             .line_info_cnt = 0,
         };
 
-        std.mem.set(u8, &prog_load.prog_name, 0);
-        std.mem.copy(u8, &prog_load.prog_name, "file_tracer");
+        @memset(&prog_load.prog_name, 0);
+        @memcpy(prog_load.prog_name[0.."file_tracer".len], "file_tracer");
 
         const prog_fd = linux.bpf(.PROG_LOAD, @ptrCast(&prog_load), @sizeOf(@TypeOf(prog_load)));
         if (prog_fd < 0) {
@@ -433,11 +443,11 @@ pub const EBPFManager = struct {
 
             // Memory map the perf buffer
             const mmap_size = 8 * 4096; // 8 pages: 1 metadata + 7 data
-            const ptr = try std.os.mmap(
+            const ptr = try std.posix.mmap(
                 null,
                 mmap_size,
-                std.os.PROT.READ | std.os.PROT.WRITE,
-                std.os.MAP.SHARED,
+                std.posix.PROT.READ | std.posix.PROT.WRITE,
+                std.posix.MAP.SHARED,
                 @intCast(perf_fd),
                 0,
             );

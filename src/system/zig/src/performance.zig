@@ -195,9 +195,12 @@ pub const PerformanceOptimizer = struct {
         // Get current affinity
         var cpu_set: linux.cpu_set_t = undefined;
         if (linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &cpu_set) == 0) {
-            // Convert cpu_set to DynamicBitSet
+            // Convert cpu_set to DynamicBitSet (manual bit checking)
+            const cpu_set_bytes = std.mem.asBytes(&cpu_set);
             for (0..128) |i| {
-                if (linux.CPU_ISSET(i, &cpu_set)) {
+                const byte_idx = i / 8;
+                const bit_idx = @as(u3, @intCast(i % 8));
+                if (byte_idx < cpu_set_bytes.len and (cpu_set_bytes[byte_idx] & (@as(u8, 1) << bit_idx)) != 0) {
                     original.set(i);
                 }
             }
@@ -205,10 +208,16 @@ pub const PerformanceOptimizer = struct {
         }
 
         // Set new affinity
-        std.mem.set(u8, std.mem.asBytes(&cpu_set), 0);
+        @memset(std.mem.asBytes(&cpu_set), 0);
         var iter = mask.iterator(.{});
         while (iter.next()) |cpu| {
-            linux.CPU_SET(cpu, &cpu_set);
+            // Manual bit setting
+            const cpu_set_bytes = std.mem.asBytes(&cpu_set);
+            const byte_idx = cpu / 8;
+            const bit_idx = @as(u3, @intCast(cpu % 8));
+            if (byte_idx < cpu_set_bytes.len) {
+                cpu_set_bytes[byte_idx] |= (@as(u8, 1) << bit_idx);
+            }
         }
 
         if (linux.sched_setaffinity(0, @sizeOf(linux.cpu_set_t), &cpu_set) != 0) {
@@ -223,11 +232,17 @@ pub const PerformanceOptimizer = struct {
         if (builtin.os.tag != .linux) return;
 
         var cpu_set: linux.cpu_set_t = undefined;
-        std.mem.set(u8, std.mem.asBytes(&cpu_set), 0);
+        @memset(std.mem.asBytes(&cpu_set), 0);
 
         var iter = original.iterator(.{});
         while (iter.next()) |cpu| {
-            linux.CPU_SET(cpu, &cpu_set);
+            // Manual bit setting
+            const cpu_set_bytes = std.mem.asBytes(&cpu_set);
+            const byte_idx = cpu / 8;
+            const bit_idx = @as(u3, @intCast(cpu % 8));
+            if (byte_idx < cpu_set_bytes.len) {
+                cpu_set_bytes[byte_idx] |= (@as(u8, 1) << bit_idx);
+            }
         }
 
         _ = linux.sched_setaffinity(0, @sizeOf(linux.cpu_set_t), &cpu_set);
@@ -238,7 +253,8 @@ pub const PerformanceOptimizer = struct {
         _ = self;
         if (builtin.os.tag != .linux) return;
 
-        var param: linux.sched_param = .{ .sched_priority = 50 }; // High RT priority
+        var param: linux.sched_param = std.mem.zeroes(linux.sched_param);
+        param.priority = 50; // High RT priority
         if (linux.sched_setscheduler(0, linux.SCHED.FIFO, &param) != 0) {
             return error.SetSchedulerFailed;
         }
