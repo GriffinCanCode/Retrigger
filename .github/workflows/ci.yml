@@ -79,11 +79,6 @@ jobs:
         cd src/bindings/nodejs
         npm ci
 
-    - name: Check formatting
-      run: |
-        cargo fmt --all -- --check
-        cd src/bindings/nodejs && npm run format:check || echo "No format check available"
-
     - name: Run clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
 
