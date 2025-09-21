@@ -1,6 +1,6 @@
 /**
  * Advanced HMR Integration System
- * 
+ *
  * Features:
  * - Intelligent module graph analysis
  * - Source map support for accurate line mapping
@@ -35,7 +35,7 @@ class HMRManager extends EventEmitter {
     this.sourceMapManager = new SourceMapManager(this.options);
     this.invalidationStrategies = new InvalidationStrategies();
     this.performanceTracker = new HMRPerformanceTracker();
-    
+
     this.activeUpdates = new Map();
     this.updateQueue = [];
     this.isProcessingUpdates = false;
@@ -53,13 +53,13 @@ class HMRManager extends EventEmitter {
     // Initialize subsystems
     await this.moduleRegistry.initialize(bundlerType, bundlerInstance);
     await this.dependencyGraph.initialize(bundlerInstance);
-    
+
     if (this.options.enableSourceMaps) {
       await this.sourceMapManager.initialize(bundlerInstance);
     }
 
     this.emit('initialized', { bundlerType });
-    
+
     if (this.options.verbose) {
       console.log(`[HMR] Initialized for ${bundlerType} bundler`);
     }
@@ -70,37 +70,40 @@ class HMRManager extends EventEmitter {
    * @param {Object} event - File system event
    * @returns {Promise<Object>} Update result
    */
-  async processFileChange(event) {    
+  async processFileChange(event) {
     try {
       // Fast path: Skip complex analysis for simple changes
       const isSimpleChange = this.isSimpleFileChange(event);
-      
+
       if (isSimpleChange) {
         return await this.processSimpleUpdate(event);
       }
 
       // Complex path: Full analysis for special cases
       const moduleId = await this.moduleRegistry.getOrCreateModule(event.path);
-      
+
       if (!moduleId) {
-        return { type: 'skip', reason: 'not-in-module-graph', path: event.path };
+        return {
+          type: 'skip',
+          reason: 'not-in-module-graph',
+          path: event.path,
+        };
       }
 
       const updatePlan = await this.createUpdatePlan(moduleId, event);
-      
+
       if (updatePlan.type === 'full-reload') {
         return await this.triggerFullReload(updatePlan);
       }
 
       const updateResult = await this.executeUpdate(updatePlan);
-      
+
       // Track performance asynchronously
       setImmediate(() => {
         this.performanceTracker.recordUpdate(0, updateResult);
       });
 
       return updateResult;
-
     } catch (error) {
       this.emit('error', error);
       return await this.triggerFullReload({
@@ -120,14 +123,17 @@ class HMRManager extends EventEmitter {
   isSimpleFileChange(event) {
     // Fast path for common file types that don't need complex analysis
     const simpleExtensions = ['.js', '.jsx', '.ts', '.tsx', '.css', '.scss'];
-    const hasSimpleExtension = simpleExtensions.some(ext => event.path.endsWith(ext));
-    
+    const hasSimpleExtension = simpleExtensions.some((ext) =>
+      event.path.endsWith(ext)
+    );
+
     // Skip complex analysis for standard modifications
-    const isSimpleModification = event.event_type === 'modified' || event.event_type === 'changed';
-    
+    const isSimpleModification =
+      event.event_type === 'modified' || event.event_type === 'changed';
+
     // Not in node_modules (which would need full reload)
     const isNotDependency = !event.path.includes('node_modules');
-    
+
     return hasSimpleExtension && isSimpleModification && isNotDependency;
   }
 
@@ -144,17 +150,19 @@ class HMRManager extends EventEmitter {
       affectedModules: [event.path],
       strategy: 'fast-path',
       timestamp: Date.now(),
-      updates: [{
-        moduleId: event.path,
-        path: event.path,
-        type: event.path.endsWith('.css') ? 'css-update' : 'js-update',
-        timestamp: Date.now(),
-      }],
+      updates: [
+        {
+          moduleId: event.path,
+          path: event.path,
+          type: event.path.endsWith('.css') ? 'css-update' : 'js-update',
+          timestamp: Date.now(),
+        },
+      ],
     };
 
     // Send directly to bundler without complex processing
     await this.sendUpdatesToClient(result);
-    
+
     // Update metrics asynchronously
     setImmediate(() => {
       this.emit('update-complete', result);
@@ -173,10 +181,10 @@ class HMRManager extends EventEmitter {
   async createUpdatePlan(moduleId, event) {
     const module = this.moduleRegistry.getModule(moduleId);
     const dependencies = this.dependencyGraph.getDependents(moduleId);
-    
+
     // Analyze change impact
     const changeAnalysis = await this.analyzeChangeImpact(module, event);
-    
+
     // Select invalidation strategy
     const strategy = this.invalidationStrategies.select(
       this.options.invalidationStrategy,
@@ -197,15 +205,21 @@ class HMRManager extends EventEmitter {
       case 'conservative':
         // Only update the changed module
         break;
-        
+
       case 'smart':
         // Update changed module and immediate dependents
-        dependencies.immediate.forEach(dep => updatePlan.affectedModules.add(dep));
+        dependencies.immediate.forEach((dep) =>
+          updatePlan.affectedModules.add(dep)
+        );
         break;
-        
+
       case 'aggressive':
         // Update entire dependency chain (with depth limit)
-        this.addDependencyChain(updatePlan.affectedModules, moduleId, this.options.maxInvalidationDepth);
+        this.addDependencyChain(
+          updatePlan.affectedModules,
+          moduleId,
+          this.options.maxInvalidationDepth
+        );
         break;
     }
 
@@ -238,7 +252,10 @@ class HMRManager extends EventEmitter {
 
     // Analyze source maps if available
     if (this.options.enableSourceMaps) {
-      analysis.sourceMapInfo = await this.sourceMapManager.analyzeChange(module, event);
+      analysis.sourceMapInfo = await this.sourceMapManager.analyzeChange(
+        module,
+        event
+      );
     }
 
     // Determine if full reload is required
@@ -290,7 +307,6 @@ class HMRManager extends EventEmitter {
 
       this.emit('update-complete', result);
       return result;
-
     } finally {
       this.activeUpdates.delete(updatePlan.moduleId);
     }
@@ -305,7 +321,7 @@ class HMRManager extends EventEmitter {
    */
   async updateModule(moduleId, updatePlan) {
     const module = this.moduleRegistry.getModule(moduleId);
-    
+
     const moduleUpdate = {
       moduleId,
       path: module.path,
@@ -319,11 +335,11 @@ class HMRManager extends EventEmitter {
       case 'js-update':
         moduleUpdate.content = await this.generateJSUpdate(module, updatePlan);
         break;
-        
+
       case 'css-update':
         moduleUpdate.content = await this.generateCSSUpdate(module, updatePlan);
         break;
-        
+
       case 'asset-update':
         moduleUpdate.url = await this.generateAssetUpdate(module, updatePlan);
         break;
@@ -348,15 +364,15 @@ class HMRManager extends EventEmitter {
       case 'webpack':
         await this.sendWebpackUpdate(updateResult);
         break;
-        
+
       case 'vite':
         await this.sendViteUpdate(updateResult);
         break;
-        
+
       case 'rspack':
         await this.sendRspackUpdate(updateResult);
         break;
-        
+
       default:
         throw new Error(`Unsupported bundler type: ${this.bundlerType}`);
     }
@@ -372,8 +388,8 @@ class HMRManager extends EventEmitter {
 
     // Webpack-specific HMR update
     const compilation = this.bundlerInstance.watching.compiler.compilation;
-    
-    updateResult.updates.forEach(update => {
+
+    updateResult.updates.forEach((update) => {
       // Invalidate webpack module
       const module = compilation.moduleGraph.getModuleById(update.moduleId);
       if (module) {
@@ -387,14 +403,14 @@ class HMRManager extends EventEmitter {
 
   /**
    * Send updates via Vite's HMR
-   * @param {Object} updateResult - Update to send  
+   * @param {Object} updateResult - Update to send
    * @private
    */
   async sendViteUpdate(updateResult) {
     if (!this.bundlerInstance || !this.bundlerInstance.ws) return;
 
     // Convert updates to Vite format
-    const viteUpdates = updateResult.updates.map(update => ({
+    const viteUpdates = updateResult.updates.map((update) => ({
       type: update.type === 'css-update' ? 'css-update' : 'js-update',
       path: update.path,
       acceptedPath: update.path,
@@ -412,7 +428,7 @@ class HMRManager extends EventEmitter {
   /**
    * Send updates via Rspack's HMR
    * @param {Object} updateResult - Update to send
-   * @private  
+   * @private
    */
   async sendRspackUpdate(updateResult) {
     // Rspack HMR (similar to webpack but with optimizations)
@@ -440,13 +456,13 @@ class HMRManager extends EventEmitter {
           this.bundlerInstance.watching.invalidate();
         }
         break;
-        
+
       case 'vite':
         if (this.bundlerInstance.ws) {
           this.bundlerInstance.ws.send({ type: 'full-reload' });
         }
         break;
-        
+
       case 'rspack':
         // Rspack full reload
         if (this.bundlerInstance.watching) {
@@ -456,7 +472,7 @@ class HMRManager extends EventEmitter {
     }
 
     this.emit('full-reload', result);
-    
+
     if (this.options.verbose) {
       console.log(`[HMR] Full reload triggered: ${reloadInfo.reason}`);
     }
@@ -502,8 +518,15 @@ class HMRManager extends EventEmitter {
    * @private
    */
   isStylesheet(filePath) {
-    const styleExtensions = ['.css', '.scss', '.sass', '.less', '.styl', '.stylus'];
-    return styleExtensions.some(ext => filePath.endsWith(ext));
+    const styleExtensions = [
+      '.css',
+      '.scss',
+      '.sass',
+      '.less',
+      '.styl',
+      '.stylus',
+    ];
+    return styleExtensions.some((ext) => filePath.endsWith(ext));
   }
 
   /**
@@ -544,7 +567,7 @@ class ModuleRegistry {
 
   async getOrCreateModule(filePath) {
     const normalizedPath = path.normalize(filePath);
-    
+
     if (this.pathToId.has(normalizedPath)) {
       return this.pathToId.get(normalizedPath);
     }
@@ -577,12 +600,26 @@ class ModuleRegistry {
 
   isModuleFile(filePath) {
     const moduleExtensions = [
-      '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte',
-      '.css', '.scss', '.sass', '.less', '.styl',
-      '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
+      '.js',
+      '.jsx',
+      '.ts',
+      '.tsx',
+      '.vue',
+      '.svelte',
+      '.css',
+      '.scss',
+      '.sass',
+      '.less',
+      '.styl',
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.gif',
+      '.svg',
+      '.webp',
     ];
 
-    return moduleExtensions.some(ext => filePath.endsWith(ext));
+    return moduleExtensions.some((ext) => filePath.endsWith(ext));
   }
 
   inferModuleType(filePath) {
@@ -604,7 +641,7 @@ class ModuleRegistry {
 class DependencyGraph {
   constructor() {
     this.dependencies = new Map(); // moduleId -> Set of dependencies
-    this.dependents = new Map();   // moduleId -> Set of dependents
+    this.dependents = new Map(); // moduleId -> Set of dependents
   }
 
   async initialize(bundlerInstance) {
@@ -630,9 +667,9 @@ class DependencyGraph {
     // Add transitive dependents
     const addTransitive = (id, depth = 0) => {
       if (depth > 10) return; // Prevent infinite loops
-      
+
       const deps = this.dependents.get(id) || new Set();
-      deps.forEach(dep => {
+      deps.forEach((dep) => {
         if (!all.has(dep)) {
           all.add(dep);
           addTransitive(dep, depth + 1);
@@ -640,7 +677,7 @@ class DependencyGraph {
       });
     };
 
-    immediate.forEach(dep => addTransitive(dep));
+    immediate.forEach((dep) => addTransitive(dep));
 
     return { immediate, all };
   }
@@ -718,13 +755,13 @@ class HMRPerformanceTracker {
 
   recordUpdate(duration, result) {
     this.stats.totalUpdates++;
-    this.stats.averageUpdateTime = 
+    this.stats.averageUpdateTime =
       (this.stats.averageUpdateTime + duration) / 2;
     this.stats.fastestUpdate = Math.min(this.stats.fastestUpdate, duration);
     this.stats.slowestUpdate = Math.max(this.stats.slowestUpdate, duration);
 
     const updateType = result.type;
-    this.stats.updatesByType[updateType] = 
+    this.stats.updatesByType[updateType] =
       (this.stats.updatesByType[updateType] || 0) + 1;
 
     this.stats.recentUpdates.push({

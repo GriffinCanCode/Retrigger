@@ -34,10 +34,10 @@ class RetriggerEmitter extends EventEmitter {
    */
   async start() {
     if (this.running) return;
-    
+
     this.running = true;
     await this.watcher.start();
-    
+
     // Start event polling loop
     this._startEventLoop();
   }
@@ -62,16 +62,17 @@ class RetriggerEmitter extends EventEmitter {
       try {
         // Wait for event with 100ms timeout
         const event = await this.watcher.wait_event(100);
-        
+
         if (event) {
           // Emit specific event type
           this.emit(`file-${event.event_type}`, event);
-          
+
           // Emit generic change event
           this.emit('file-changed', event);
-          
+
           // Emit stats periodically
-          if (Math.random() < 0.01) { // 1% chance to emit stats
+          if (Math.random() < 0.01) {
+            // 1% chance to emit stats
             const stats = await this.watcher.get_stats();
             this.emit('stats', stats);
           }
@@ -79,7 +80,7 @@ class RetriggerEmitter extends EventEmitter {
       } catch (error) {
         this.emit('error', error);
         // Brief pause on error to avoid tight error loop
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
   }
@@ -93,63 +94,63 @@ class RetriggerEmitter extends EventEmitter {
 function createRetrigger(options = {}) {
   const wrapper = new RetriggerWrapper();
   const emitter = new RetriggerEmitter(wrapper);
-  
+
   return {
     // Core functionality
     wrapper,
     emitter,
-    
+
     // Convenience methods
     async watch(paths, watchOptions) {
       const pathArray = Array.isArray(paths) ? paths : [paths];
-      
+
       for (const watchPath of pathArray) {
         await wrapper.watch_directory(path.resolve(watchPath), watchOptions);
       }
-      
+
       return this;
     },
-    
+
     async start() {
       await emitter.start();
       return this;
     },
-    
+
     stop() {
       emitter.stop();
       return this;
     },
-    
+
     // Event handlers
     on(event, listener) {
       emitter.on(event, listener);
       return this;
     },
-    
+
     once(event, listener) {
       emitter.once(event, listener);
       return this;
     },
-    
+
     off(event, listener) {
       emitter.off(event, listener);
       return this;
     },
-    
+
     // Stats and info
     async getStats() {
       return await wrapper.get_stats();
     },
-    
+
     getSimdLevel() {
       return wrapper.get_simd_level();
     },
-    
+
     // Hashing utilities
     async hashFile(filePath) {
       return await wrapper.hash_file(path.resolve(filePath));
     },
-    
+
     hashBytes(data) {
       return wrapper.hash_bytes(data);
     },
@@ -191,7 +192,7 @@ function getSystemInfo() {
  */
 async function runBenchmark(testSize = 1024 * 1024) {
   const results = await benchmark_hash(testSize);
-  
+
   return {
     test_size_mb: (testSize / (1024 * 1024)).toFixed(2),
     throughput_mbps: results.throughput_mbps.toFixed(2),
@@ -232,7 +233,7 @@ function getBundlerAdapters() {
  */
 function createAdvancedRetrigger(options = {}) {
   const retrigger = createRetrigger(options);
-  
+
   // Add advanced features
   const advancedOptions = {
     enablePerformanceMonitoring: options.enablePerformanceMonitoring !== false,
@@ -249,15 +250,17 @@ function createAdvancedRetrigger(options = {}) {
 
   return {
     ...retrigger,
-    
+
     // Advanced initialization
     async initializeAdvanced() {
       // Initialize performance monitoring
       if (advancedOptions.enablePerformanceMonitoring) {
         const PerformanceMonitor = getPerformanceMonitor();
-        performanceMonitor = new PerformanceMonitor(advancedOptions.performanceOptions);
+        performanceMonitor = new PerformanceMonitor(
+          advancedOptions.performanceOptions
+        );
         await performanceMonitor.initialize();
-        
+
         // Hook into file events for performance tracking
         retrigger.on('file-changed', (event) => {
           performanceMonitor.recordEvent(event);
@@ -267,9 +270,11 @@ function createAdvancedRetrigger(options = {}) {
       // Initialize SharedArrayBuffer communication
       if (advancedOptions.enableSharedBuffer) {
         const SharedBufferCommunicator = getSharedBufferCommunicator();
-        sharedComm = new SharedBufferCommunicator(advancedOptions.sharedBufferSize);
+        sharedComm = new SharedBufferCommunicator(
+          advancedOptions.sharedBufferSize
+        );
         await sharedComm.initializeAsMain();
-        
+
         // Bridge events from shared buffer to retrigger
         sharedComm.on('file-event', (event) => {
           retrigger.emitter.emit('file-changed', event);
@@ -291,7 +296,9 @@ function createAdvancedRetrigger(options = {}) {
 
     // Performance monitoring API
     getPerformanceStats() {
-      return performanceMonitor ? performanceMonitor.getPerformanceReport() : null;
+      return performanceMonitor
+        ? performanceMonitor.getPerformanceReport()
+        : null;
     },
 
     getDashboard() {
@@ -299,7 +306,9 @@ function createAdvancedRetrigger(options = {}) {
     },
 
     forceGC() {
-      return performanceMonitor ? performanceMonitor.forceGarbageCollection() : false;
+      return performanceMonitor
+        ? performanceMonitor.forceGarbageCollection()
+        : false;
     },
 
     // SharedArrayBuffer API
@@ -308,7 +317,11 @@ function createAdvancedRetrigger(options = {}) {
     },
 
     // HMR API
-    async processFileChangeForHMR(event, bundlerInstance, bundlerType = 'webpack') {
+    async processFileChangeForHMR(
+      event,
+      bundlerInstance,
+      bundlerType = 'webpack'
+    ) {
       if (!hmrManager) {
         throw new Error('HMR manager not initialized');
       }
@@ -352,46 +365,59 @@ module.exports = {
   // Main API
   createRetrigger,
   createAdvancedRetrigger,
-  
+
   // Low-level API
   RetriggerWrapper,
   RetriggerEmitter,
-  
+
   // Utilities
   quickHash,
   getSystemInfo,
   runBenchmark,
-  
+
   // Synchronous functions
   hash_file_sync,
   hash_bytes_sync,
   get_simd_support,
   benchmark_hash,
-  
+
   // Plugins (lazy-loaded to avoid circular dependencies)
-  get RetriggerWebpackPlugin() { return getRetriggerWebpackPlugin(); },
-  get createRetriggerVitePlugin() { return getCreateRetriggerVitePlugin(); },
-  
+  get RetriggerWebpackPlugin() {
+    return getRetriggerWebpackPlugin();
+  },
+  get createRetriggerVitePlugin() {
+    return getCreateRetriggerVitePlugin();
+  },
+
   // Advanced Components (lazy-loaded to avoid circular dependencies)
-  get SharedBufferCommunicator() { return getSharedBufferCommunicator(); },
-  get HMRManager() { return getHMRManager(); },
-  get PerformanceMonitor() { return getPerformanceMonitor(); },
-  
+  get SharedBufferCommunicator() {
+    return getSharedBufferCommunicator();
+  },
+  get HMRManager() {
+    return getHMRManager();
+  },
+  get PerformanceMonitor() {
+    return getPerformanceMonitor();
+  },
+
   // Bundler Adapters (lazy-loaded to avoid circular dependencies)
-  get BundlerFactory() { return getBundlerAdapters().BundlerFactory; },
-  get WebpackAdapter() { return getBundlerAdapters().WebpackAdapter; },
-  get RspackAdapter() { return getBundlerAdapters().RspackAdapter; },
-  get TurbopackAdapter() { return getBundlerAdapters().TurbopackAdapter; },
-  
+  get BundlerFactory() {
+    return getBundlerAdapters().BundlerFactory;
+  },
+  get WebpackAdapter() {
+    return getBundlerAdapters().WebpackAdapter;
+  },
+  get RspackAdapter() {
+    return getBundlerAdapters().RspackAdapter;
+  },
+  get TurbopackAdapter() {
+    return getBundlerAdapters().TurbopackAdapter;
+  },
+
   // Constants
   DEFAULT_WATCH_OPTIONS: {
     recursive: true,
-    exclude_patterns: [
-      '**/node_modules/**',
-      '**/.git/**',
-      '**/.*',
-      '**/*.log',
-    ],
+    exclude_patterns: ['**/node_modules/**', '**/.git/**', '**/.*', '**/*.log'],
     enable_hashing: true,
     hash_block_size: 4096,
   },

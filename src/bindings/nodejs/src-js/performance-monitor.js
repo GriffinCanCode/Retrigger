@@ -1,12 +1,12 @@
 /**
  * Performance Monitor & Memory Management System
- * 
+ *
  * Advanced performance monitoring, memory management, and optimization features
  * for production deployments of Retrigger Node.js integration.
- * 
+ *
  * Features:
  * - Real-time performance metrics collection
- * - Memory usage monitoring and leak detection  
+ * - Memory usage monitoring and leak detection
  * - Adaptive resource management
  * - Performance bottleneck identification
  * - Automatic optimization recommendations
@@ -29,22 +29,22 @@ class PerformanceMonitor extends EventEmitter {
       metricsInterval: options.metricsInterval || 1000,
       memoryCheckInterval: options.memoryCheckInterval || 5000,
       gcAnalysisInterval: options.gcAnalysisInterval || 10000,
-      
+
       // Thresholds for alerts
       memoryThreshold: options.memoryThreshold || 0.85, // 85% of heap limit
       cpuThreshold: options.cpuThreshold || 0.8, // 80% CPU usage
       eventLatencyThreshold: options.eventLatencyThreshold || 100, // 100ms
-      
+
       // Feature flags
       enableMemoryLeakDetection: options.enableMemoryLeakDetection !== false,
       enableGCAnalysis: options.enableGCAnalysis !== false,
       enableAdaptiveOptimization: options.enableAdaptiveOptimization !== false,
       enableAlerting: options.enableAlerting !== false,
-      
+
       // History settings
       maxHistorySize: options.maxHistorySize || 1000,
       metricsRetentionMs: options.metricsRetentionMs || 24 * 60 * 60 * 1000, // 24 hours
-      
+
       verbose: options.verbose || false,
       ...options,
     };
@@ -55,12 +55,12 @@ class PerformanceMonitor extends EventEmitter {
     this.performanceAnalyzer = new PerformanceAnalyzer(this.options);
     this.adaptiveOptimizer = new AdaptiveOptimizer(this.options);
     this.alertSystem = new AlertSystem(this.options);
-    
+
     // State
     this.isMonitoring = false;
     this.intervals = {};
     this.startTime = Date.now();
-    
+
     // Bind event handlers
     this.setupEventHandlers();
   }
@@ -72,14 +72,16 @@ class PerformanceMonitor extends EventEmitter {
     if (this.isMonitoring) return;
 
     if (this.options.verbose) {
-      console.log('[PerformanceMonitor] Initializing comprehensive monitoring system');
+      console.log(
+        '[PerformanceMonitor] Initializing comprehensive monitoring system'
+      );
     }
 
     // Initialize components
     await this.metricsCollector.initialize();
     await this.memoryManager.initialize();
     await this.performanceAnalyzer.initialize();
-    
+
     if (this.options.enableAdaptiveOptimization) {
       await this.adaptiveOptimizer.initialize();
     }
@@ -90,7 +92,7 @@ class PerformanceMonitor extends EventEmitter {
 
     // Start monitoring intervals
     this.startMonitoring();
-    
+
     this.emit('initialized');
     return true;
   }
@@ -136,22 +138,22 @@ class PerformanceMonitor extends EventEmitter {
     try {
       // Lightweight metrics collection during hot reload activity
       const metrics = await this.metricsCollector.collectLightweight();
-      
+
       // Store metrics asynchronously
       setImmediate(() => {
         this.performanceAnalyzer.addMetrics(metrics);
       });
-      
+
       // Skip heavy analysis during high-activity periods (hot reload)
       const isHighActivity = metrics.events.events_per_second > 5;
-      
+
       if (!isHighActivity) {
         // Only do full analysis during low activity
         const issues = this.performanceAnalyzer.analyzeLatestMetrics(metrics);
-        
+
         if (issues.length > 0) {
           this.emit('performance-issues', issues);
-          
+
           if (this.options.enableAlerting) {
             setImmediate(() => {
               this.alertSystem.handlePerformanceIssues(issues);
@@ -163,7 +165,8 @@ class PerformanceMonitor extends EventEmitter {
         if (this.options.enableAdaptiveOptimization) {
           setImmediate(async () => {
             try {
-              const optimizations = await this.adaptiveOptimizer.suggestOptimizations(metrics);
+              const optimizations =
+                await this.adaptiveOptimizer.suggestOptimizations(metrics);
               if (optimizations.length > 0) {
                 this.emit('optimization-suggestions', optimizations);
               }
@@ -175,9 +178,11 @@ class PerformanceMonitor extends EventEmitter {
       }
 
       this.emit('metrics-collected', metrics);
-
     } catch (error) {
-      this.emit('error', new Error(`Failed to collect metrics: ${error.message}`));
+      this.emit(
+        'error',
+        new Error(`Failed to collect metrics: ${error.message}`)
+      );
     }
   }
 
@@ -188,11 +193,11 @@ class PerformanceMonitor extends EventEmitter {
   async checkMemoryUsage() {
     try {
       const memoryInfo = await this.memoryManager.analyzeMemoryUsage();
-      
+
       // Check for memory threshold violations
       if (memoryInfo.heapUtilization > this.options.memoryThreshold) {
         this.emit('memory-threshold-exceeded', memoryInfo);
-        
+
         if (this.options.enableAlerting) {
           this.alertSystem.handleMemoryAlert(memoryInfo);
         }
@@ -201,10 +206,10 @@ class PerformanceMonitor extends EventEmitter {
       // Memory leak detection
       if (this.options.enableMemoryLeakDetection) {
         const leakAnalysis = await this.memoryManager.detectMemoryLeaks();
-        
+
         if (leakAnalysis.suspected) {
           this.emit('memory-leak-suspected', leakAnalysis);
-          
+
           if (this.options.enableAlerting) {
             this.alertSystem.handleMemoryLeakAlert(leakAnalysis);
           }
@@ -212,7 +217,6 @@ class PerformanceMonitor extends EventEmitter {
       }
 
       this.emit('memory-checked', memoryInfo);
-
     } catch (error) {
       this.emit('error', new Error(`Memory check failed: ${error.message}`));
     }
@@ -225,17 +229,16 @@ class PerformanceMonitor extends EventEmitter {
   async analyzeGarbageCollection() {
     try {
       const gcAnalysis = await this.memoryManager.analyzeGC();
-      
+
       if (gcAnalysis.issues.length > 0) {
         this.emit('gc-issues', gcAnalysis);
-        
+
         if (this.options.enableAlerting) {
           this.alertSystem.handleGCAlert(gcAnalysis);
         }
       }
 
       this.emit('gc-analyzed', gcAnalysis);
-
     } catch (error) {
       this.emit('error', new Error(`GC analysis failed: ${error.message}`));
     }
@@ -257,9 +260,12 @@ class PerformanceMonitor extends EventEmitter {
     // Add to metrics asynchronously to avoid blocking hot reload
     setImmediate(() => {
       this.metricsCollector.addEventMetric(eventMetrics);
-      
+
       // Check for latency issues only if monitoring is active
-      if (this.isMonitoring && eventMetrics.latency > this.options.eventLatencyThreshold) {
+      if (
+        this.isMonitoring &&
+        eventMetrics.latency > this.options.eventLatencyThreshold
+      ) {
         this.emit('high-latency-event', eventMetrics);
       }
     });
@@ -271,7 +277,7 @@ class PerformanceMonitor extends EventEmitter {
    */
   getPerformanceReport() {
     const uptime = Date.now() - this.startTime;
-    
+
     return {
       system: {
         uptime_ms: uptime,
@@ -279,19 +285,19 @@ class PerformanceMonitor extends EventEmitter {
         monitoring_active: this.isMonitoring,
         start_time: this.startTime,
       },
-      
+
       current_metrics: this.metricsCollector.getCurrentMetrics(),
       memory: this.memoryManager.getCurrentMemoryInfo(),
       performance_analysis: this.performanceAnalyzer.getLatestAnalysis(),
-      
-      optimization_suggestions: this.options.enableAdaptiveOptimization 
-        ? this.adaptiveOptimizer.getLatestSuggestions() 
+
+      optimization_suggestions: this.options.enableAdaptiveOptimization
+        ? this.adaptiveOptimizer.getLatestSuggestions()
         : null,
-        
-      alerts: this.options.enableAlerting 
-        ? this.alertSystem.getRecentAlerts() 
+
+      alerts: this.options.enableAlerting
+        ? this.alertSystem.getRecentAlerts()
         : null,
-        
+
       configuration: this.options,
     };
   }
@@ -307,7 +313,7 @@ class PerformanceMonitor extends EventEmitter {
 
     return {
       timestamp: Date.now(),
-      
+
       // Key metrics
       metrics: {
         cpu_usage: metrics.cpu_usage,
@@ -319,14 +325,21 @@ class PerformanceMonitor extends EventEmitter {
       // Status indicators
       status: {
         overall: this.getOverallStatus(metrics, memoryInfo, analysis),
-        memory: memoryInfo.heapUtilization < this.options.memoryThreshold ? 'healthy' : 'warning',
-        performance: analysis.performance_score > 0.8 ? 'excellent' : 
-                    analysis.performance_score > 0.6 ? 'good' : 'needs_attention',
+        memory:
+          memoryInfo.heapUtilization < this.options.memoryThreshold
+            ? 'healthy'
+            : 'warning',
+        performance:
+          analysis.performance_score > 0.8
+            ? 'excellent'
+            : analysis.performance_score > 0.6
+              ? 'good'
+              : 'needs_attention',
       },
 
       // Recent issues
       recent_issues: analysis.recent_issues || [],
-      
+
       // Trends (last hour)
       trends: this.performanceAnalyzer.getTrends(60 * 60 * 1000), // 1 hour
     };
@@ -343,7 +356,10 @@ class PerformanceMonitor extends EventEmitter {
         this.emit('gc-forced');
         return true;
       } else {
-        this.emit('warning', 'Garbage collection not available (run with --expose-gc)');
+        this.emit(
+          'warning',
+          'Garbage collection not available (run with --expose-gc)'
+        );
         return false;
       }
     } catch (error) {
@@ -360,7 +376,7 @@ class PerformanceMonitor extends EventEmitter {
     // Memory manager events
     this.memoryManager.on('memory-pressure', (info) => {
       this.emit('memory-pressure', info);
-      
+
       // Auto-trigger GC if available and pressure is high
       if (info.pressure_level === 'critical') {
         this.forceGarbageCollection();
@@ -437,7 +453,7 @@ class PerformanceMonitor extends EventEmitter {
     this.isMonitoring = false;
 
     // Clear intervals
-    Object.values(this.intervals).forEach(interval => {
+    Object.values(this.intervals).forEach((interval) => {
       clearInterval(interval);
     });
     this.intervals = {};
@@ -446,11 +462,11 @@ class PerformanceMonitor extends EventEmitter {
     this.metricsCollector.destroy();
     this.memoryManager.destroy();
     this.performanceAnalyzer.destroy();
-    
+
     if (this.adaptiveOptimizer) {
       this.adaptiveOptimizer.destroy();
     }
-    
+
     if (this.alertSystem) {
       this.alertSystem.destroy();
     }
@@ -480,7 +496,7 @@ class MetricsCollector {
   async collect() {
     const systemMetrics = await this.collectSystemMetrics();
     const eventMetrics = this.getEventMetrics();
-    
+
     const combined = {
       timestamp: Date.now(),
       system: systemMetrics,
@@ -490,7 +506,7 @@ class MetricsCollector {
 
     // Store in history
     this.systemMetrics.push(combined);
-    
+
     // Trim history
     if (this.systemMetrics.length > this.options.maxHistorySize) {
       this.systemMetrics.shift();
@@ -507,7 +523,7 @@ class MetricsCollector {
     // Only collect essential metrics during hot reload
     const memoryUsage = process.memoryUsage();
     const eventMetrics = this.getEventMetrics();
-    
+
     const lightweight = {
       timestamp: Date.now(),
       system: {
@@ -532,9 +548,8 @@ class MetricsCollector {
     const timeDelta = now - this.lastMetricsTime;
 
     // Calculate CPU usage percentage
-    const cpuPercent = timeDelta > 0 
-      ? ((cpuUsage.user + cpuUsage.system) / 1000) / timeDelta
-      : 0;
+    const cpuPercent =
+      timeDelta > 0 ? (cpuUsage.user + cpuUsage.system) / 1000 / timeDelta : 0;
 
     this.lastCpuUsage = process.cpuUsage();
     this.lastMetricsTime = now;
@@ -550,7 +565,7 @@ class MetricsCollector {
 
   getEventMetrics() {
     const recentEvents = this.eventMetrics.filter(
-      event => Date.now() - event.timestamp < 60000 // Last minute
+      (event) => Date.now() - event.timestamp < 60000 // Last minute
     );
 
     if (recentEvents.length === 0) {
@@ -561,7 +576,9 @@ class MetricsCollector {
       };
     }
 
-    const averageLatency = recentEvents.reduce((sum, event) => sum + event.latency, 0) / recentEvents.length;
+    const averageLatency =
+      recentEvents.reduce((sum, event) => sum + event.latency, 0) /
+      recentEvents.length;
     const eventsPerSecond = recentEvents.length / 60; // Per minute / 60
 
     return {
@@ -583,15 +600,17 @@ class MetricsCollector {
 
   addEventMetric(eventMetric) {
     this.eventMetrics.push(eventMetric);
-    
+
     // Trim old events
     const cutoff = Date.now() - this.options.metricsRetentionMs;
-    this.eventMetrics = this.eventMetrics.filter(event => event.timestamp > cutoff);
+    this.eventMetrics = this.eventMetrics.filter(
+      (event) => event.timestamp > cutoff
+    );
   }
 
   getCurrentMetrics() {
-    return this.systemMetrics.length > 0 
-      ? this.systemMetrics[this.systemMetrics.length - 1] 
+    return this.systemMetrics.length > 0
+      ? this.systemMetrics[this.systemMetrics.length - 1]
       : null;
   }
 
@@ -622,7 +641,7 @@ class MemoryManager extends EventEmitter {
   async analyzeMemoryUsage() {
     const memoryUsage = process.memoryUsage();
     const heapStats = require('v8').getHeapStatistics();
-    
+
     const memoryInfo = {
       timestamp: Date.now(),
       heap_used: memoryUsage.heapUsed,
@@ -631,7 +650,7 @@ class MemoryManager extends EventEmitter {
       heapUtilization: memoryUsage.heapUsed / heapStats.heap_size_limit,
       external: memoryUsage.external,
       array_buffers: memoryUsage.arrayBuffers,
-      
+
       // V8 heap statistics
       total_heap_size: heapStats.total_heap_size,
       used_heap_size: heapStats.used_heap_size,
@@ -642,7 +661,7 @@ class MemoryManager extends EventEmitter {
 
     // Store in history
     this.memoryHistory.push(memoryInfo);
-    
+
     // Trim history
     if (this.memoryHistory.length > this.options.maxHistorySize) {
       this.memoryHistory.shift();
@@ -661,45 +680,52 @@ class MemoryManager extends EventEmitter {
 
     const recent = this.memoryHistory.slice(-10);
     const growthRate = this.calculateMemoryGrowthRate(recent);
-    
+
     // Detect consistent upward trend
-    const isSuspicious = growthRate > 0.1 && // 10% growth rate
-                        recent.every((sample, i) => 
-                          i === 0 || sample.heap_used >= recent[i-1].heap_used
-                        );
+    const isSuspicious =
+      growthRate > 0.1 && // 10% growth rate
+      recent.every(
+        (sample, i) => i === 0 || sample.heap_used >= recent[i - 1].heap_used
+      );
 
     return {
       suspected: isSuspicious,
       growth_rate: growthRate,
       trend: this.analyzeMemoryTrend(recent),
-      recommendation: isSuspicious ? 'Consider investigating potential memory leaks' : null,
+      recommendation: isSuspicious
+        ? 'Consider investigating potential memory leaks'
+        : null,
     };
   }
 
   calculateMemoryGrowthRate(samples) {
     if (samples.length < 2) return 0;
-    
+
     const first = samples[0].heap_used;
     const last = samples[samples.length - 1].heap_used;
-    const timeDiff = samples[samples.length - 1].timestamp - samples[0].timestamp;
-    
+    const timeDiff =
+      samples[samples.length - 1].timestamp - samples[0].timestamp;
+
     return timeDiff > 0 ? (last - first) / first : 0;
   }
 
   analyzeMemoryTrend(samples) {
     // Simple linear regression to detect trend
     const n = samples.length;
-    let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-    
+    let sumX = 0,
+      sumY = 0,
+      sumXY = 0,
+      sumXX = 0;
+
     samples.forEach((sample, i) => {
       sumX += i;
       sumY += sample.heap_used;
       sumXY += i * sample.heap_used;
       sumXX += i * i;
     });
-    
+
     const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
-    
+
     if (slope > 1000000) return 'increasing'; // 1MB+ per sample
     if (slope < -1000000) return 'decreasing';
     return 'stable';
@@ -707,12 +733,12 @@ class MemoryManager extends EventEmitter {
 
   checkMemoryPressure(memoryInfo) {
     const pressureThresholds = {
-      warning: 0.7,   // 70%
-      critical: 0.9,  // 90%
+      warning: 0.7, // 70%
+      critical: 0.9, // 90%
     };
 
     let pressureLevel = 'normal';
-    
+
     if (memoryInfo.heapUtilization > pressureThresholds.critical) {
       pressureLevel = 'critical';
     } else if (memoryInfo.heapUtilization > pressureThresholds.warning) {
@@ -746,7 +772,7 @@ class MemoryManager extends EventEmitter {
   }
 
   getCurrentMemoryInfo() {
-    return this.memoryHistory.length > 0 
+    return this.memoryHistory.length > 0
       ? this.memoryHistory[this.memoryHistory.length - 1]
       : null;
   }
@@ -772,7 +798,7 @@ class PerformanceAnalyzer {
     // Establish performance baseline
     this.performanceBaseline = {
       memory_usage: 0.1, // 10% baseline
-      cpu_usage: 0.05,   // 5% baseline
+      cpu_usage: 0.05, // 5% baseline
       event_latency: 10, // 10ms baseline
     };
   }
@@ -780,7 +806,7 @@ class PerformanceAnalyzer {
   addMetrics(metrics) {
     const analysis = this.analyzeMetrics(metrics);
     this.analysisHistory.push(analysis);
-    
+
     // Trim history
     if (this.analysisHistory.length > this.options.maxHistorySize) {
       this.analysisHistory.shift();
@@ -790,7 +816,7 @@ class PerformanceAnalyzer {
   analyzeMetrics(metrics) {
     const issues = [];
     const recommendations = [];
-    
+
     // CPU analysis
     if (metrics.system.cpu_usage > this.options.cpuThreshold) {
       issues.push({
@@ -799,7 +825,7 @@ class PerformanceAnalyzer {
         value: metrics.system.cpu_usage,
         threshold: this.options.cpuThreshold,
       });
-      
+
       recommendations.push('Consider optimizing CPU-intensive operations');
     }
 
@@ -811,20 +837,26 @@ class PerformanceAnalyzer {
         value: metrics.system.heap_utilization,
         threshold: this.options.memoryThreshold,
       });
-      
-      recommendations.push('Consider memory optimization or garbage collection tuning');
+
+      recommendations.push(
+        'Consider memory optimization or garbage collection tuning'
+      );
     }
 
     // Event latency analysis
-    if (metrics.events.average_event_latency > this.options.eventLatencyThreshold) {
+    if (
+      metrics.events.average_event_latency > this.options.eventLatencyThreshold
+    ) {
       issues.push({
         type: 'high-latency',
         severity: 'performance',
         value: metrics.events.average_event_latency,
         threshold: this.options.eventLatencyThreshold,
       });
-      
-      recommendations.push('Investigate file system event processing bottlenecks');
+
+      recommendations.push(
+        'Investigate file system event processing bottlenecks'
+      );
     }
 
     // Calculate performance score
@@ -846,12 +878,23 @@ class PerformanceAnalyzer {
 
   calculatePerformanceScore(metrics) {
     // Weighted performance score (0-1, higher is better)
-    const cpuScore = Math.max(0, 1 - (metrics.system.cpu_usage / this.options.cpuThreshold));
-    const memoryScore = Math.max(0, 1 - (metrics.system.heap_utilization / this.options.memoryThreshold));
-    const latencyScore = Math.max(0, 1 - (metrics.events.average_event_latency / this.options.eventLatencyThreshold));
-    
+    const cpuScore = Math.max(
+      0,
+      1 - metrics.system.cpu_usage / this.options.cpuThreshold
+    );
+    const memoryScore = Math.max(
+      0,
+      1 - metrics.system.heap_utilization / this.options.memoryThreshold
+    );
+    const latencyScore = Math.max(
+      0,
+      1 -
+        metrics.events.average_event_latency /
+          this.options.eventLatencyThreshold
+    );
+
     // Weighted average
-    return (cpuScore * 0.3 + memoryScore * 0.4 + latencyScore * 0.3);
+    return cpuScore * 0.3 + memoryScore * 0.4 + latencyScore * 0.3;
   }
 
   analyzeLatestMetrics(metrics) {
@@ -860,30 +903,39 @@ class PerformanceAnalyzer {
   }
 
   getLatestAnalysis() {
-    return this.analysisHistory.length > 0 
+    return this.analysisHistory.length > 0
       ? this.analysisHistory[this.analysisHistory.length - 1]
       : null;
   }
 
   getTrends(timeWindowMs) {
     const cutoff = Date.now() - timeWindowMs;
-    const recentAnalysis = this.analysisHistory.filter(a => a.timestamp > cutoff);
-    
+    const recentAnalysis = this.analysisHistory.filter(
+      (a) => a.timestamp > cutoff
+    );
+
     if (recentAnalysis.length < 2) {
       return { trend: 'insufficient-data' };
     }
 
-    const scores = recentAnalysis.map(a => a.performance_score);
-    const avgScore = scores.reduce((sum, score) => sum + score, 0) / scores.length;
-    
+    const scores = recentAnalysis.map((a) => a.performance_score);
+    const avgScore =
+      scores.reduce((sum, score) => sum + score, 0) / scores.length;
+
     const firstHalf = scores.slice(0, Math.floor(scores.length / 2));
     const secondHalf = scores.slice(Math.floor(scores.length / 2));
-    
-    const firstAvg = firstHalf.reduce((sum, score) => sum + score, 0) / firstHalf.length;
-    const secondAvg = secondHalf.reduce((sum, score) => sum + score, 0) / secondHalf.length;
-    
-    const trend = secondAvg > firstAvg + 0.1 ? 'improving' :
-                 secondAvg < firstAvg - 0.1 ? 'degrading' : 'stable';
+
+    const firstAvg =
+      firstHalf.reduce((sum, score) => sum + score, 0) / firstHalf.length;
+    const secondAvg =
+      secondHalf.reduce((sum, score) => sum + score, 0) / secondHalf.length;
+
+    const trend =
+      secondAvg > firstAvg + 0.1
+        ? 'improving'
+        : secondAvg < firstAvg - 0.1
+          ? 'degrading'
+          : 'stable';
 
     return {
       trend,
@@ -910,13 +962,15 @@ class AdaptiveOptimizer extends EventEmitter {
 
   async initialize() {
     if (this.options.verbose) {
-      console.log('[AdaptiveOptimizer] Initialized adaptive optimization system');
+      console.log(
+        '[AdaptiveOptimizer] Initialized adaptive optimization system'
+      );
     }
   }
 
   async suggestOptimizations(metrics) {
     const suggestions = [];
-    
+
     // Memory optimizations
     if (metrics.system.heap_utilization > 0.8) {
       suggestions.push({
@@ -981,33 +1035,47 @@ class AlertSystem extends EventEmitter {
   }
 
   handlePerformanceIssues(issues) {
-    issues.forEach(issue => {
-      this.createAlert('performance', issue.severity, `${issue.type}: ${issue.value.toFixed(2)}`, issue);
+    issues.forEach((issue) => {
+      this.createAlert(
+        'performance',
+        issue.severity,
+        `${issue.type}: ${issue.value.toFixed(2)}`,
+        issue
+      );
     });
   }
 
   handleMemoryAlert(memoryInfo) {
-    this.createAlert('memory', 'warning', 
-      `High memory usage: ${(memoryInfo.heapUtilization * 100).toFixed(1)}%`, 
+    this.createAlert(
+      'memory',
+      'warning',
+      `High memory usage: ${(memoryInfo.heapUtilization * 100).toFixed(1)}%`,
       memoryInfo
     );
   }
 
   handleMemoryLeakAlert(leakAnalysis) {
-    this.createAlert('memory-leak', 'critical',
+    this.createAlert(
+      'memory-leak',
+      'critical',
       `Memory leak suspected: ${(leakAnalysis.growth_rate * 100).toFixed(1)}% growth rate`,
       leakAnalysis
     );
   }
 
   handleGCAlert(gcAnalysis) {
-    this.createAlert('gc', 'warning', 'Garbage collection issues detected', gcAnalysis);
+    this.createAlert(
+      'gc',
+      'warning',
+      'Garbage collection issues detected',
+      gcAnalysis
+    );
   }
 
   createAlert(type, severity, message, data) {
     const alertKey = `${type}-${severity}`;
     const cooldownMs = 5 * 60 * 1000; // 5 minutes
-    
+
     // Check cooldown
     const lastAlert = this.alertCooldowns.get(alertKey);
     if (lastAlert && Date.now() - lastAlert < cooldownMs) {
@@ -1025,16 +1093,18 @@ class AlertSystem extends EventEmitter {
 
     this.alertHistory.push(alert);
     this.alertCooldowns.set(alertKey, Date.now());
-    
+
     // Trim history
     if (this.alertHistory.length > 100) {
       this.alertHistory.shift();
     }
 
     this.emit('alert-created', alert);
-    
+
     if (this.options.verbose) {
-      console.log(`[AlertSystem] ${severity.toUpperCase()} ${type}: ${message}`);
+      console.log(
+        `[AlertSystem] ${severity.toUpperCase()} ${type}: ${message}`
+      );
     }
   }
 

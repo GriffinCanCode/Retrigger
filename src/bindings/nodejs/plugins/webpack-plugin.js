@@ -1,7 +1,7 @@
 /**
  * Retrigger Webpack Plugin - Enhanced with SharedArrayBuffer and Advanced Integration
  * Replaces webpack's default file watching with ultra-fast native watching
- * 
+ *
  * Features:
  * - SharedArrayBuffer communication for sub-millisecond event propagation
  * - Complete webpack FileSystemWatcher interface implementation
@@ -37,9 +37,11 @@ class RetriggerWebpackPlugin {
           '**/build/**',
           '**/*.log',
           '**/.*',
-          ...((options.watchOptions && options.watchOptions.exclude_patterns) || []),
+          ...((options.watchOptions && options.watchOptions.exclude_patterns) ||
+            []),
         ],
-        include_patterns: options.watchOptions && options.watchOptions.include_patterns,
+        include_patterns:
+          options.watchOptions && options.watchOptions.include_patterns,
         enable_hashing: options.watchOptions?.enable_hashing ?? true,
         hash_block_size: options.watchOptions?.hash_block_size || 4096,
         ...options.watchOptions,
@@ -53,7 +55,7 @@ class RetriggerWebpackPlugin {
       enableAdvancedInvalidation: options.enableAdvancedInvalidation !== false,
       enableNativeWatching: options.enableNativeWatching !== false,
     };
-    
+
     this.watcher = null;
     this.compiler = null;
     this.bundlerAdapter = null;
@@ -77,29 +79,35 @@ class RetriggerWebpackPlugin {
    */
   apply(compiler) {
     this.compiler = compiler;
-    
+
     // Validate compiler has required structure
     if (!compiler || !compiler.hooks) {
       if (this.options.verbose) {
-        console.warn('[Retrigger] Invalid webpack compiler provided, plugin will not function');
+        console.warn(
+          '[Retrigger] Invalid webpack compiler provided, plugin will not function'
+        );
       }
       return;
     }
-    
+
     // Skip bundler adapter when running inside webpack (prevents circular dependency)
     this.bundlerAdapter = null;
-    
+
     // Initialize SharedArrayBuffer communication if enabled
     if (this.options.useSharedBuffer) {
       const SharedBufferCommunicator = getSharedBufferCommunicator();
-      this.sharedComm = new SharedBufferCommunicator(this.options.sharedBufferSize);
+      this.sharedComm = new SharedBufferCommunicator(
+        this.options.sharedBufferSize
+      );
     }
-    
+
     // Log plugin initialization (always register this hook for counting)
     if (compiler.hooks.initialize) {
       compiler.hooks.initialize.tap('RetriggerWebpackPlugin', () => {
         if (this.options.verbose) {
-          console.log('[Retrigger] Initializing enhanced webpack plugin with SharedArrayBuffer');
+          console.log(
+            '[Retrigger] Initializing enhanced webpack plugin with SharedArrayBuffer'
+          );
         }
       });
     }
@@ -108,12 +116,15 @@ class RetriggerWebpackPlugin {
     this._setupCompilationHooks(compiler);
 
     // Hook into webpack's watch mode
-    compiler.hooks.watchRun.tapAsync('RetriggerWebpackPlugin', async (compilation, callback) => {
-      if (!this.isWatching) {
-        await this.startWatching(compilation);
+    compiler.hooks.watchRun.tapAsync(
+      'RetriggerWebpackPlugin',
+      async (compilation, callback) => {
+        if (!this.isWatching) {
+          await this.startWatching(compilation);
+        }
+        callback();
       }
-      callback();
-    });
+    );
 
     // Clean up on watch close
     compiler.hooks.watchClose.tap('RetriggerWebpackPlugin', () => {
@@ -150,27 +161,30 @@ class RetriggerWebpackPlugin {
       });
 
       // Track dependency relationships
-      compilation.hooks.succeedModule.tap('RetriggerWebpackPlugin', (module) => {
-        if (module.resource && module.dependencies) {
-          const moduleInfo = this.moduleGraph.get(module.resource);
-          if (moduleInfo) {
-            module.dependencies.forEach(dep => {
-              if (dep.module && dep.module.resource) {
-                moduleInfo.dependencies.add(dep.module.resource);
-                
-                // Add reverse dependency
-                const depInfo = this.moduleGraph.get(dep.module.resource) || {
-                  dependencies: new Set(),
-                  dependents: new Set(),
-                  lastModified: Date.now(),
-                };
-                depInfo.dependents.add(module.resource);
-                this.moduleGraph.set(dep.module.resource, depInfo);
-              }
-            });
+      compilation.hooks.succeedModule.tap(
+        'RetriggerWebpackPlugin',
+        (module) => {
+          if (module.resource && module.dependencies) {
+            const moduleInfo = this.moduleGraph.get(module.resource);
+            if (moduleInfo) {
+              module.dependencies.forEach((dep) => {
+                if (dep.module && dep.module.resource) {
+                  moduleInfo.dependencies.add(dep.module.resource);
+
+                  // Add reverse dependency
+                  const depInfo = this.moduleGraph.get(dep.module.resource) || {
+                    dependencies: new Set(),
+                    dependents: new Set(),
+                    lastModified: Date.now(),
+                  };
+                  depInfo.dependents.add(module.resource);
+                  this.moduleGraph.set(dep.module.resource, depInfo);
+                }
+              });
+            }
           }
         }
-      });
+      );
     });
 
     // SharedArrayBuffer communication setup
@@ -186,9 +200,12 @@ class RetriggerWebpackPlugin {
       });
 
       // Initialize as main thread
-      this.sharedComm.initializeAsMain().catch(error => {
+      this.sharedComm.initializeAsMain().catch((error) => {
         if (this.options.verbose) {
-          console.error('[Retrigger] Failed to initialize SharedArrayBuffer:', error);
+          console.error(
+            '[Retrigger] Failed to initialize SharedArrayBuffer:',
+            error
+          );
         }
       });
     }
@@ -210,7 +227,7 @@ class RetriggerWebpackPlugin {
 
     // Update performance metrics
     this.performanceMetrics.eventsProcessed++;
-    
+
     // Direct invalidation for maximum speed
     if (this.options.enableAdvancedInvalidation) {
       this.invalidateModuleTree(event.path);
@@ -228,18 +245,20 @@ class RetriggerWebpackPlugin {
     const moduleInfo = this.moduleGraph.get(changedFile);
     if (!moduleInfo) {
       // File not in module graph, trigger standard compilation
-      this.triggerWebpackCompilation([{ path: changedFile, event_type: 'modified' }]);
+      this.triggerWebpackCompilation([
+        { path: changedFile, event_type: 'modified' },
+      ]);
       return;
     }
 
     // Collect all files that need invalidation
     const toInvalidate = new Set([changedFile]);
-    
+
     // Add all dependents (files that import this file)
     const addDependents = (filePath) => {
       const info = this.moduleGraph.get(filePath);
       if (info) {
-        info.dependents.forEach(dependent => {
+        info.dependents.forEach((dependent) => {
           if (!toInvalidate.has(dependent)) {
             toInvalidate.add(dependent);
             addDependents(dependent); // Recursive dependency invalidation
@@ -249,13 +268,15 @@ class RetriggerWebpackPlugin {
     };
 
     addDependents(changedFile);
-    
+
     if (this.options.verbose) {
-      console.log(`[Retrigger] Advanced invalidation: ${changedFile} affects ${toInvalidate.size - 1} dependent modules`);
+      console.log(
+        `[Retrigger] Advanced invalidation: ${changedFile} affects ${toInvalidate.size - 1} dependent modules`
+      );
     }
 
     // Trigger webpack compilation with specific file set
-    const events = Array.from(toInvalidate).map(path => ({
+    const events = Array.from(toInvalidate).map((path) => ({
       path,
       event_type: 'modified',
       timestamp: Date.now().toString(),
@@ -275,10 +296,12 @@ class RetriggerWebpackPlugin {
 
     // Batch events if too many
     const eventsToProcess = events.slice(0, this.options.maxEventBatch);
-    
+
     if (this.options.verbose) {
-      console.log(`[Retrigger] Triggering compilation for ${eventsToProcess.length} file changes`);
-      eventsToProcess.forEach(event => {
+      console.log(
+        `[Retrigger] Triggering compilation for ${eventsToProcess.length} file changes`
+      );
+      eventsToProcess.forEach((event) => {
         console.log(`  - ${event.event_type}: ${event.path}`);
       });
     }
@@ -288,12 +311,12 @@ class RetriggerWebpackPlugin {
 
     // Trigger webpack's invalidation
     if (this.compiler.watching) {
-      const filePaths = eventsToProcess.map(event => event.path);
+      const filePaths = eventsToProcess.map((event) => event.path);
       this.compiler.watching.invalidate(filePaths);
 
       // Calculate average event latency
       const latency = Number(process.hrtime.bigint() - startTime) / 1000000; // Convert to milliseconds
-      this.performanceMetrics.averageEventLatency = 
+      this.performanceMetrics.averageEventLatency =
         (this.performanceMetrics.averageEventLatency + latency) / 2;
     }
   }
@@ -308,7 +331,9 @@ class RetriggerWebpackPlugin {
     // Skip native watching if disabled
     if (!this.options.enableNativeWatching) {
       if (this.options.verbose) {
-        console.log('[Retrigger] Native watching disabled, using webpack default watching');
+        console.log(
+          '[Retrigger] Native watching disabled, using webpack default watching'
+        );
       }
       this.isWatching = true;
       return;
@@ -321,10 +346,10 @@ class RetriggerWebpackPlugin {
 
       // Determine paths to watch
       const watchPaths = this.getWatchPaths(compilation);
-      
+
       if (this.options.verbose) {
         console.log(`[Retrigger] Watching ${watchPaths.length} directories:`);
-        watchPaths.forEach(p => console.log(`  - ${p}`));
+        watchPaths.forEach((p) => console.log(`  - ${p}`));
       }
 
       // Watch directories
@@ -342,9 +367,10 @@ class RetriggerWebpackPlugin {
         const stats = await this.watcher.getStats();
         const simdLevel = this.watcher.getSimdLevel();
         console.log(`[Retrigger] Started with SIMD level: ${simdLevel}`);
-        console.log(`[Retrigger] Watching ${stats.watched_directories} directories`);
+        console.log(
+          `[Retrigger] Watching ${stats.watched_directories} directories`
+        );
       }
-
     } catch (error) {
       console.error('[Retrigger] Failed to start watching:', error);
       this.isWatching = false;
@@ -360,12 +386,12 @@ class RetriggerWebpackPlugin {
       this.watcher.stop();
       this.watcher = null;
       this.isWatching = false;
-      
+
       if (this.debounceTimer) {
         clearTimeout(this.debounceTimer);
         this.debounceTimer = null;
       }
-      
+
       if (this.options.verbose) {
         console.log('[Retrigger] Stopped watching');
       }
@@ -379,29 +405,29 @@ class RetriggerWebpackPlugin {
    */
   getWatchPaths(compilation) {
     const paths = new Set();
-    
+
     // Add explicitly configured paths
-    this.options.watchPaths.forEach(p => paths.add(path.resolve(p)));
-    
+    this.options.watchPaths.forEach((p) => paths.add(path.resolve(p)));
+
     // Add webpack context
     if (compilation.compiler.context) {
       paths.add(compilation.compiler.context);
     }
-    
+
     // Add entry points
     if (compilation.entries) {
-      compilation.entries.forEach(entry => {
+      compilation.entries.forEach((entry) => {
         if (entry.resource) {
           paths.add(path.dirname(path.resolve(entry.resource)));
         }
       });
     }
-    
+
     // Default to current working directory if no paths found
     if (paths.size === 0) {
       paths.add(process.cwd());
     }
-    
+
     return Array.from(paths);
   }
 
@@ -422,7 +448,9 @@ class RetriggerWebpackPlugin {
     // Log stats periodically if verbose
     if (this.options.verbose) {
       this.watcher.on('stats', (stats) => {
-        console.log(`[Retrigger] Stats - Pending: ${stats.pending_events}, Total: ${stats.total_events}`);
+        console.log(
+          `[Retrigger] Stats - Pending: ${stats.pending_events}, Total: ${stats.total_events}`
+        );
       });
     }
   }
@@ -464,23 +492,17 @@ class RetriggerWebpackPlugin {
   shouldIncludeFile(filePath) {
     // Skip common non-source files
     const skipExtensions = ['.log', '.lock', '.tmp', '.swp', '.DS_Store'];
-    const skipPatterns = [
-      /node_modules/,
-      /\.git/,
-      /dist/,
-      /build/,
-      /coverage/,
-    ];
+    const skipPatterns = [/node_modules/, /\.git/, /dist/, /build/, /coverage/];
 
     const basename = path.basename(filePath);
-    
+
     // Check extensions
-    if (skipExtensions.some(ext => basename.endsWith(ext))) {
+    if (skipExtensions.some((ext) => basename.endsWith(ext))) {
       return false;
     }
 
     // Check patterns
-    if (skipPatterns.some(pattern => pattern.test(filePath))) {
+    if (skipPatterns.some((pattern) => pattern.test(filePath))) {
       return false;
     }
 
@@ -499,7 +521,9 @@ class RetriggerWebpackPlugin {
     this.changeBuffer.clear();
 
     if (this.options.verbose) {
-      console.log(`[Retrigger] Triggering compilation for ${changes.length} changes`);
+      console.log(
+        `[Retrigger] Triggering compilation for ${changes.length} changes`
+      );
       changes.forEach(({ event }) => {
         console.log(`  - ${event.event_type}: ${event.path}`);
       });
@@ -528,9 +552,11 @@ class RetriggerWebpackPlugin {
       pending_events: stats.pending_events,
       total_events: parseInt(stats.total_events),
       dropped_events: parseInt(stats.dropped_events),
-      buffer_utilization: stats.buffer_capacity > 0 
-        ? (stats.pending_events / stats.buffer_capacity * 100).toFixed(1) + '%'
-        : '0%',
+      buffer_utilization:
+        stats.buffer_capacity > 0
+          ? ((stats.pending_events / stats.buffer_capacity) * 100).toFixed(1) +
+            '%'
+          : '0%',
     };
   }
 }
@@ -554,9 +580,11 @@ class RetriggerFileSystem {
    */
   watch(files, dirs, missing, startTime, options, callback, callbackUndelayed) {
     const watcherId = ++this.watcherCounter;
-    
+
     if (this.options.verbose) {
-      console.log(`[Retrigger] FileSystem.watch() #${watcherId} - Files: ${files.length}, Dirs: ${dirs.length}, Missing: ${missing.length}`);
+      console.log(
+        `[Retrigger] FileSystem.watch() #${watcherId} - Files: ${files.length}, Dirs: ${dirs.length}, Missing: ${missing.length}`
+      );
     }
 
     // Create a comprehensive watcher that handles all webpack requirements
@@ -576,12 +604,23 @@ class RetriggerFileSystem {
     this.watchers.set(watcherId, watcher);
 
     // Initialize the watcher
-    watcher.initialize().catch(error => {
+    watcher.initialize().catch((error) => {
       if (this.options.verbose) {
-        console.error(`[Retrigger] Failed to initialize watcher #${watcherId}:`, error);
+        console.error(
+          `[Retrigger] Failed to initialize watcher #${watcherId}:`,
+          error
+        );
       }
       // Fallback to original file system on error
-      this.originalFs.watch(files, dirs, missing, startTime, options, callback, callbackUndelayed);
+      this.originalFs.watch(
+        files,
+        dirs,
+        missing,
+        startTime,
+        options,
+        callback,
+        callbackUndelayed
+      );
     });
 
     // Return watcher with close method
@@ -614,7 +653,7 @@ class RetriggerWatcher {
     this.callbackUndelayed = config.callbackUndelayed;
     this.plugin = config.plugin;
     this.verbose = config.verbose;
-    
+
     this.watcher = null;
     this.isActive = true;
     this.isPaused = false;
@@ -654,7 +693,7 @@ class RetriggerWatcher {
 
     // Update time info
     const timestamp = parseInt(event.timestamp) / 1000000; // Convert nanoseconds to milliseconds
-    
+
     if (event.event_type === 'deleted') {
       this.removedFiles.add(eventPath);
       this.fileTimeInfoEntries.delete(eventPath);
@@ -695,7 +734,7 @@ class RetriggerWatcher {
   isRelevantFile(filePath) {
     // Check if file is in our watch list
     if (this.files.has(filePath)) return true;
-    
+
     // Check if file is within watched directories
     for (const dir of this.directories) {
       if (filePath.startsWith(dir + path.sep) || filePath === dir) {
@@ -733,7 +772,9 @@ class RetriggerWatcher {
     this.changedFiles.clear();
 
     if (this.verbose) {
-      console.log(`[Retrigger] Watcher #${this.id} processing ${changes.length} events - Changed: ${changedFiles.length}, Removed: ${removedFiles.length}`);
+      console.log(
+        `[Retrigger] Watcher #${this.id} processing ${changes.length} events - Changed: ${changedFiles.length}, Removed: ${removedFiles.length}`
+      );
     }
 
     // Update plugin performance metrics
@@ -783,7 +824,7 @@ class RetriggerWatcher {
 
   close() {
     this.isActive = false;
-    
+
     if (this.processingTimeout) {
       clearTimeout(this.processingTimeout);
       this.processingTimeout = null;

@@ -62,7 +62,7 @@
   "keywords": [
     "file-watcher",
     "webpack",
-    "webpack-plugin", 
+    "webpack-plugin",
     "vite",
     "vite-plugin",
     "hot-reload",

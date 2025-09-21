@@ -1,14 +1,14 @@
 /**
  * Zero-Copy IPC Communication System
  * Direct connection to Rust daemon using shared memory-mapped files
- * 
+ *
  * This replaces the previous SharedArrayBuffer + Worker approach with
  * direct memory-mapped file access to the Rust daemon for true zero-copy
  * inter-process communication with sub-millisecond latency.
- * 
+ *
  * Features:
  * - Direct memory access to Rust daemon's ring buffer
- * - Zero-copy event deserialization 
+ * - Zero-copy event deserialization
  * - Sub-millisecond latency
  * - Automatic reconnection and error recovery
  * - Comprehensive performance monitoring
@@ -21,14 +21,14 @@ const { RustIPCBridge } = require('./ipc-bridge');
  * Memory layout constants for SharedArrayBuffer
  */
 const MEMORY_LAYOUT = {
-  HEADER_SIZE: 64,           // Header information (64 bytes)
-  CONTROL_OFFSET: 0,         // Control flags (4 bytes)
-  WRITE_POS_OFFSET: 4,       // Write position (4 bytes) 
-  READ_POS_OFFSET: 8,        // Read position (4 bytes)
-  EVENT_COUNT_OFFSET: 12,    // Total events processed (8 bytes)
-  BUFFER_SIZE_OFFSET: 20,    // Buffer size (4 bytes)
-  MAX_EVENT_SIZE: 512,       // Maximum size per event (bytes)
-  MAGIC_NUMBER: 0x52545247,  // 'RTRG' magic number
+  HEADER_SIZE: 64, // Header information (64 bytes)
+  CONTROL_OFFSET: 0, // Control flags (4 bytes)
+  WRITE_POS_OFFSET: 4, // Write position (4 bytes)
+  READ_POS_OFFSET: 8, // Read position (4 bytes)
+  EVENT_COUNT_OFFSET: 12, // Total events processed (8 bytes)
+  BUFFER_SIZE_OFFSET: 20, // Buffer size (4 bytes)
+  MAX_EVENT_SIZE: 512, // Maximum size per event (bytes)
+  MAGIC_NUMBER: 0x52545247, // 'RTRG' magic number
 };
 
 /**
@@ -51,7 +51,7 @@ class SharedBufferInterface {
     if (new.target === SharedBufferInterface) {
       throw new Error('Cannot instantiate abstract class');
     }
-    
+
     this.buffer = buffer;
     this.view = new Int32Array(buffer);
     this.byteView = new Uint8Array(buffer);
@@ -66,17 +66,37 @@ class SharedBufferInterface {
   _initialize() {
     if (this.isProducer) {
       // Initialize header with magic number
-      Atomics.store(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4, MEMORY_LAYOUT.MAGIC_NUMBER);
-      Atomics.store(this.view, MEMORY_LAYOUT.WRITE_POS_OFFSET / 4, MEMORY_LAYOUT.HEADER_SIZE);
-      Atomics.store(this.view, MEMORY_LAYOUT.READ_POS_OFFSET / 4, MEMORY_LAYOUT.HEADER_SIZE);
+      Atomics.store(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4,
+        MEMORY_LAYOUT.MAGIC_NUMBER
+      );
+      Atomics.store(
+        this.view,
+        MEMORY_LAYOUT.WRITE_POS_OFFSET / 4,
+        MEMORY_LAYOUT.HEADER_SIZE
+      );
+      Atomics.store(
+        this.view,
+        MEMORY_LAYOUT.READ_POS_OFFSET / 4,
+        MEMORY_LAYOUT.HEADER_SIZE
+      );
       Atomics.store(this.view, MEMORY_LAYOUT.EVENT_COUNT_OFFSET / 4, 0);
       Atomics.store(this.view, (MEMORY_LAYOUT.EVENT_COUNT_OFFSET + 4) / 4, 0);
-      Atomics.store(this.view, MEMORY_LAYOUT.BUFFER_SIZE_OFFSET / 4, this.buffer.byteLength);
-      
+      Atomics.store(
+        this.view,
+        MEMORY_LAYOUT.BUFFER_SIZE_OFFSET / 4,
+        this.buffer.byteLength
+      );
+
       // Set ready flag
-      Atomics.or(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, CONTROL_FLAGS.READY);
+      Atomics.or(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        CONTROL_FLAGS.READY
+      );
     }
-    
+
     this.isReady = true;
   }
 
@@ -87,8 +107,11 @@ class SharedBufferInterface {
   isValid() {
     const magic = Atomics.load(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4);
     const flags = Atomics.load(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1);
-    
-    return magic === MEMORY_LAYOUT.MAGIC_NUMBER && (flags & CONTROL_FLAGS.READY) !== 0;
+
+    return (
+      magic === MEMORY_LAYOUT.MAGIC_NUMBER &&
+      (flags & CONTROL_FLAGS.READY) !== 0
+    );
   }
 
   /**
@@ -98,21 +121,38 @@ class SharedBufferInterface {
   getStats() {
     if (!this.isValid()) return null;
 
-    const writePos = Atomics.load(this.view, MEMORY_LAYOUT.WRITE_POS_OFFSET / 4);
+    const writePos = Atomics.load(
+      this.view,
+      MEMORY_LAYOUT.WRITE_POS_OFFSET / 4
+    );
     const readPos = Atomics.load(this.view, MEMORY_LAYOUT.READ_POS_OFFSET / 4);
-    const eventCountLow = Atomics.load(this.view, MEMORY_LAYOUT.EVENT_COUNT_OFFSET / 4);
-    const eventCountHigh = Atomics.load(this.view, (MEMORY_LAYOUT.EVENT_COUNT_OFFSET + 4) / 4);
-    const bufferSize = Atomics.load(this.view, MEMORY_LAYOUT.BUFFER_SIZE_OFFSET / 4);
+    const eventCountLow = Atomics.load(
+      this.view,
+      MEMORY_LAYOUT.EVENT_COUNT_OFFSET / 4
+    );
+    const eventCountHigh = Atomics.load(
+      this.view,
+      (MEMORY_LAYOUT.EVENT_COUNT_OFFSET + 4) / 4
+    );
+    const bufferSize = Atomics.load(
+      this.view,
+      MEMORY_LAYOUT.BUFFER_SIZE_OFFSET / 4
+    );
 
-    const pendingBytes = writePos >= readPos ? writePos - readPos : 
-                        (bufferSize - MEMORY_LAYOUT.HEADER_SIZE) - (readPos - writePos);
+    const pendingBytes =
+      writePos >= readPos
+        ? writePos - readPos
+        : bufferSize - MEMORY_LAYOUT.HEADER_SIZE - (readPos - writePos);
 
     return {
       bufferSize,
       writePosition: writePos,
       readPosition: readPos,
       pendingBytes,
-      utilization: (pendingBytes / (bufferSize - MEMORY_LAYOUT.HEADER_SIZE) * 100).toFixed(1),
+      utilization: (
+        (pendingBytes / (bufferSize - MEMORY_LAYOUT.HEADER_SIZE)) *
+        100
+      ).toFixed(1),
       totalEvents: (eventCountHigh << 32) | eventCountLow,
       isReady: this.isReady,
     };
@@ -121,8 +161,12 @@ class SharedBufferInterface {
   /**
    * Abstract methods to be implemented by subclasses
    */
-  read() { throw new Error('Must implement read method'); }
-  write() { throw new Error('Must implement write method'); }
+  read() {
+    throw new Error('Must implement read method');
+  }
+  write() {
+    throw new Error('Must implement write method');
+  }
 }
 
 /**
@@ -151,11 +195,24 @@ class SharedBufferProducer extends SharedBufferInterface {
       if (!serialized) return false;
 
       // Get available space and positions
-      const bufferSize = Atomics.load(this.view, MEMORY_LAYOUT.BUFFER_SIZE_OFFSET / 4);
-      const writePos = Atomics.load(this.view, MEMORY_LAYOUT.WRITE_POS_OFFSET / 4);
-      const readPos = Atomics.load(this.view, MEMORY_LAYOUT.READ_POS_OFFSET / 4);
-      
-      const availableSpace = this._getAvailableSpace(writePos, readPos, bufferSize);
+      const bufferSize = Atomics.load(
+        this.view,
+        MEMORY_LAYOUT.BUFFER_SIZE_OFFSET / 4
+      );
+      const writePos = Atomics.load(
+        this.view,
+        MEMORY_LAYOUT.WRITE_POS_OFFSET / 4
+      );
+      const readPos = Atomics.load(
+        this.view,
+        MEMORY_LAYOUT.READ_POS_OFFSET / 4
+      );
+
+      const availableSpace = this._getAvailableSpace(
+        writePos,
+        readPos,
+        bufferSize
+      );
       const eventSize = serialized.byteLength + 4; // +4 for length prefix
 
       if (eventSize > availableSpace) {
@@ -163,35 +220,52 @@ class SharedBufferProducer extends SharedBufferInterface {
       }
 
       // Set writing flag
-      Atomics.or(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, CONTROL_FLAGS.WRITING);
+      Atomics.or(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        CONTROL_FLAGS.WRITING
+      );
 
       // Write event length
       const lengthPos = writePos;
-      this.byteView[lengthPos] = eventSize & 0xFF;
-      this.byteView[lengthPos + 1] = (eventSize >> 8) & 0xFF;
-      this.byteView[lengthPos + 2] = (eventSize >> 16) & 0xFF;
-      this.byteView[lengthPos + 3] = (eventSize >> 24) & 0xFF;
+      this.byteView[lengthPos] = eventSize & 0xff;
+      this.byteView[lengthPos + 1] = (eventSize >> 8) & 0xff;
+      this.byteView[lengthPos + 2] = (eventSize >> 16) & 0xff;
+      this.byteView[lengthPos + 3] = (eventSize >> 24) & 0xff;
 
       // Write event data
       const dataPos = lengthPos + 4;
       this.byteView.set(new Uint8Array(serialized), dataPos);
 
       // Update write position atomically
-      const newWritePos = (writePos + eventSize) % (bufferSize - MEMORY_LAYOUT.HEADER_SIZE) + MEMORY_LAYOUT.HEADER_SIZE;
+      const newWritePos =
+        ((writePos + eventSize) % (bufferSize - MEMORY_LAYOUT.HEADER_SIZE)) +
+        MEMORY_LAYOUT.HEADER_SIZE;
       Atomics.store(this.view, MEMORY_LAYOUT.WRITE_POS_OFFSET / 4, newWritePos);
 
       // Increment event counter
       this._incrementEventCounter();
 
       // Clear writing flag
-      Atomics.and(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, ~CONTROL_FLAGS.WRITING);
+      Atomics.and(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        ~CONTROL_FLAGS.WRITING
+      );
 
       return true;
-
     } catch (error) {
       // Set error flag and clear writing flag
-      Atomics.or(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, CONTROL_FLAGS.ERROR);
-      Atomics.and(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, ~CONTROL_FLAGS.WRITING);
+      Atomics.or(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        CONTROL_FLAGS.ERROR
+      );
+      Atomics.and(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        ~CONTROL_FLAGS.WRITING
+      );
       return false;
     }
   }
@@ -215,7 +289,6 @@ class SharedBufferProducer extends SharedBufferInterface {
 
       const encoder = new TextEncoder();
       return encoder.encode(jsonStr).buffer;
-
     } catch (error) {
       return null;
     }
@@ -227,7 +300,7 @@ class SharedBufferProducer extends SharedBufferInterface {
    */
   _getAvailableSpace(writePos, readPos, bufferSize) {
     const dataSize = bufferSize - MEMORY_LAYOUT.HEADER_SIZE;
-    
+
     if (writePos >= readPos) {
       return dataSize - (writePos - readPos) - MEMORY_LAYOUT.HEADER_SIZE;
     } else {
@@ -241,15 +314,19 @@ class SharedBufferProducer extends SharedBufferInterface {
    */
   _incrementEventCounter() {
     // 64-bit atomic increment (low, then high if overflow)
-    const oldLow = Atomics.add(this.view, MEMORY_LAYOUT.EVENT_COUNT_OFFSET / 4, 1);
-    if (oldLow === 0xFFFFFFFF) {
+    const oldLow = Atomics.add(
+      this.view,
+      MEMORY_LAYOUT.EVENT_COUNT_OFFSET / 4,
+      1
+    );
+    if (oldLow === 0xffffffff) {
       Atomics.add(this.view, (MEMORY_LAYOUT.EVENT_COUNT_OFFSET + 4) / 4, 1);
     }
   }
 }
 
 /**
- * Consumer class for reading events from SharedArrayBuffer  
+ * Consumer class for reading events from SharedArrayBuffer
  * Implements Single Responsibility Principle
  */
 class SharedBufferConsumer extends SharedBufferInterface {
@@ -268,15 +345,32 @@ class SharedBufferConsumer extends SharedBufferInterface {
 
     try {
       // Set reading flag
-      Atomics.or(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, CONTROL_FLAGS.READING);
+      Atomics.or(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        CONTROL_FLAGS.READING
+      );
 
-      const bufferSize = Atomics.load(this.view, MEMORY_LAYOUT.BUFFER_SIZE_OFFSET / 4);
-      const writePos = Atomics.load(this.view, MEMORY_LAYOUT.WRITE_POS_OFFSET / 4);
-      const readPos = Atomics.load(this.view, MEMORY_LAYOUT.READ_POS_OFFSET / 4);
+      const bufferSize = Atomics.load(
+        this.view,
+        MEMORY_LAYOUT.BUFFER_SIZE_OFFSET / 4
+      );
+      const writePos = Atomics.load(
+        this.view,
+        MEMORY_LAYOUT.WRITE_POS_OFFSET / 4
+      );
+      const readPos = Atomics.load(
+        this.view,
+        MEMORY_LAYOUT.READ_POS_OFFSET / 4
+      );
 
       // Check if data is available
       if (readPos === writePos) {
-        Atomics.and(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, ~CONTROL_FLAGS.READING);
+        Atomics.and(
+          this.view,
+          MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+          ~CONTROL_FLAGS.READING
+        );
         return null; // No data available
       }
 
@@ -285,35 +379,59 @@ class SharedBufferConsumer extends SharedBufferInterface {
         this.byteView[readPos],
         this.byteView[readPos + 1],
         this.byteView[readPos + 2],
-        this.byteView[readPos + 3]
+        this.byteView[readPos + 3],
       ];
-      const eventSize = lengthBytes[0] | (lengthBytes[1] << 8) | (lengthBytes[2] << 16) | (lengthBytes[3] << 24);
+      const eventSize =
+        lengthBytes[0] |
+        (lengthBytes[1] << 8) |
+        (lengthBytes[2] << 16) |
+        (lengthBytes[3] << 24);
 
       if (eventSize < 4 || eventSize > MEMORY_LAYOUT.MAX_EVENT_SIZE) {
         // Corrupted data, reset read position
         Atomics.store(this.view, MEMORY_LAYOUT.READ_POS_OFFSET / 4, writePos);
-        Atomics.and(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, ~CONTROL_FLAGS.READING);
+        Atomics.and(
+          this.view,
+          MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+          ~CONTROL_FLAGS.READING
+        );
         return null;
       }
 
       // Read event data
       const dataStart = readPos + 4;
-      const eventData = this.byteView.slice(dataStart, dataStart + eventSize - 4);
+      const eventData = this.byteView.slice(
+        dataStart,
+        dataStart + eventSize - 4
+      );
 
       // Update read position
-      const newReadPos = (readPos + eventSize) % (bufferSize - MEMORY_LAYOUT.HEADER_SIZE) + MEMORY_LAYOUT.HEADER_SIZE;
+      const newReadPos =
+        ((readPos + eventSize) % (bufferSize - MEMORY_LAYOUT.HEADER_SIZE)) +
+        MEMORY_LAYOUT.HEADER_SIZE;
       Atomics.store(this.view, MEMORY_LAYOUT.READ_POS_OFFSET / 4, newReadPos);
 
       // Clear reading flag
-      Atomics.and(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, ~CONTROL_FLAGS.READING);
+      Atomics.and(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        ~CONTROL_FLAGS.READING
+      );
 
       // Deserialize event
       return this._deserializeEvent(eventData);
-
     } catch (error) {
       // Set error flag and clear reading flag
-      Atomics.or(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, CONTROL_FLAGS.ERROR);
-      Atomics.and(this.view, MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1, ~CONTROL_FLAGS.READING);
+      Atomics.or(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        CONTROL_FLAGS.ERROR
+      );
+      Atomics.and(
+        this.view,
+        MEMORY_LAYOUT.CONTROL_OFFSET / 4 + 1,
+        ~CONTROL_FLAGS.READING
+      );
       return null;
     }
   }
@@ -342,7 +460,7 @@ class SharedBufferConsumer extends SharedBufferInterface {
 class SharedBufferCommunicator extends EventEmitter {
   constructor(options = {}) {
     super();
-    
+
     // Configuration
     this.options = {
       mmapPath: options.mmapPath || '/tmp/retrigger-ipc.mmap',
@@ -352,13 +470,13 @@ class SharedBufferCommunicator extends EventEmitter {
       enableAutoReconnect: options.enableAutoReconnect !== false,
       ...options,
     };
-    
+
     // State
     this.bridge = null;
     this.isConnected = false;
     this.reconnectAttempts = 0;
     this.reconnectTimer = null;
-    
+
     // Performance monitoring
     this.performanceStats = {
       eventsReceived: 0,
@@ -368,7 +486,7 @@ class SharedBufferCommunicator extends EventEmitter {
       lastEventTime: 0,
       errorCount: 0,
     };
-    
+
     // Create the IPC bridge
     this.bridge = new RustIPCBridge(this.options.mmapPath);
     this._setupBridgeEvents();
@@ -384,7 +502,7 @@ class SharedBufferCommunicator extends EventEmitter {
       this.isConnected = true;
       this.reconnectAttempts = 0;
       this.performanceStats.connectionUptime = Date.now();
-      
+
       console.log('Connected to Rust daemon IPC');
       this.emit('connected');
     });
@@ -393,7 +511,7 @@ class SharedBufferCommunicator extends EventEmitter {
       this.isConnected = false;
       console.log('Disconnected from Rust daemon IPC');
       this.emit('disconnected');
-      
+
       if (this.options.enableAutoReconnect) {
         this._scheduleReconnect();
       }
@@ -403,11 +521,10 @@ class SharedBufferCommunicator extends EventEmitter {
     this.bridge.on('file-event', (event) => {
       this.performanceStats.eventsReceived++;
       this.performanceStats.lastEventTime = Date.now();
-      
+
       // Calculate approximate bytes transferred
-      this.performanceStats.bytesTransferred += 
-        (event.path.length + 100); // Rough estimate
-      
+      this.performanceStats.bytesTransferred += event.path.length + 100; // Rough estimate
+
       this.emit('file-event', event);
     });
 
@@ -427,7 +544,7 @@ class SharedBufferCommunicator extends EventEmitter {
       this.performanceStats.errorCount++;
       console.error('IPC Bridge error:', error);
       this.emit('error', error);
-      
+
       if (this.options.enableAutoReconnect && !this.isConnected) {
         this._scheduleReconnect();
       }
@@ -440,15 +557,15 @@ class SharedBufferCommunicator extends EventEmitter {
    */
   async initializeAsMain() {
     console.log('Initializing zero-copy IPC connection to Rust daemon...');
-    
+
     try {
       await this.bridge.connect();
       this.bridge.startPolling(this.options.pollIntervalMs);
-      
+
       console.log('Zero-copy IPC initialized successfully');
     } catch (error) {
       console.error('Failed to initialize IPC:', error);
-      
+
       if (this.options.enableAutoReconnect) {
         this._scheduleReconnect();
       } else {
@@ -484,11 +601,11 @@ class SharedBufferCommunicator extends EventEmitter {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    
+
     if (this.bridge) {
       this.bridge.disconnect();
     }
-    
+
     this.isConnected = false;
     this.reconnectAttempts = 0;
   }
@@ -507,26 +624,32 @@ class SharedBufferCommunicator extends EventEmitter {
    */
   _scheduleReconnect() {
     if (this.reconnectTimer || this.isConnected) return;
-    
+
     if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
-      console.error(`Max reconnection attempts (${this.options.maxReconnectAttempts}) exceeded`);
+      console.error(
+        `Max reconnection attempts (${this.options.maxReconnectAttempts}) exceeded`
+      );
       this.emit('max-reconnect-attempts-exceeded');
       return;
     }
-    
+
     const delay = Math.min(
       this.options.reconnectIntervalMs * Math.pow(2, this.reconnectAttempts),
       30000 // Max 30 seconds
     );
-    
+
     this.reconnectAttempts++;
-    console.log(`Scheduling reconnection attempt ${this.reconnectAttempts} in ${delay}ms`);
-    
+    console.log(
+      `Scheduling reconnection attempt ${this.reconnectAttempts} in ${delay}ms`
+    );
+
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      
+
       try {
-        console.log(`Reconnection attempt ${this.reconnectAttempts}/${this.options.maxReconnectAttempts}`);
+        console.log(
+          `Reconnection attempt ${this.reconnectAttempts}/${this.options.maxReconnectAttempts}`
+        );
         await this.initializeAsMain();
       } catch (error) {
         console.error('Reconnection failed:', error);
@@ -541,15 +664,16 @@ class SharedBufferCommunicator extends EventEmitter {
    */
   getStats() {
     const bridgeStats = this.bridge ? this.bridge.getStats() : {};
-    const uptime = this.performanceStats.connectionUptime ? 
-      Date.now() - this.performanceStats.connectionUptime : 0;
-    
+    const uptime = this.performanceStats.connectionUptime
+      ? Date.now() - this.performanceStats.connectionUptime
+      : 0;
+
     return {
       // Connection status
       connected: this.isConnected,
       mmapPath: this.options.mmapPath,
       reconnectAttempts: this.reconnectAttempts,
-      
+
       // Performance metrics
       eventsReceived: this.performanceStats.eventsReceived,
       bytesTransferred: this.performanceStats.bytesTransferred,
@@ -557,14 +681,16 @@ class SharedBufferCommunicator extends EventEmitter {
       lastEventTime: this.performanceStats.lastEventTime,
       errorCount: this.performanceStats.errorCount,
       uptime,
-      
+
       // Throughput calculations
-      eventsPerSecond: uptime > 0 ? 
-        (this.performanceStats.eventsReceived / (uptime / 1000)).toFixed(2) : 0,
-      
+      eventsPerSecond:
+        uptime > 0
+          ? (this.performanceStats.eventsReceived / (uptime / 1000)).toFixed(2)
+          : 0,
+
       // Bridge statistics
       bridge: bridgeStats,
-      
+
       // Configuration
       options: {
         pollIntervalMs: this.options.pollIntervalMs,
@@ -605,7 +731,7 @@ class SharedBufferCommunicator extends EventEmitter {
 module.exports = {
   SharedBufferCommunicator,
   RustIPCBridge: require('./ipc-bridge').RustIPCBridge,
-  
+
   // Legacy exports for backward compatibility
   SharedBufferProducer,
   SharedBufferConsumer,

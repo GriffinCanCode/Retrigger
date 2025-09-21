@@ -1,6 +1,6 @@
 /**
  * Bundler Adapters - Unified interfaces for webpack, Rspack, and Turbopack
- * 
+ *
  * Implements SOLID principles with elegant, modular design:
  * - Single Responsibility: Each adapter handles one bundler type
  * - Open/Closed: Easy to extend with new bundlers
@@ -19,7 +19,7 @@ const path = require('path');
 class BundlerAdapter extends EventEmitter {
   constructor(config = {}) {
     super();
-    
+
     if (new.target === BundlerAdapter) {
       throw new Error('Cannot instantiate abstract BundlerAdapter class');
     }
@@ -33,7 +33,7 @@ class BundlerAdapter extends EventEmitter {
   /**
    * Abstract methods that must be implemented by subclasses
    */
-  
+
   /** Initialize the bundler with configuration */
   async initialize() {
     throw new Error('Method initialize() must be implemented');
@@ -104,7 +104,7 @@ class BundlerAdapter extends EventEmitter {
     ];
 
     const normalizedPath = this._normalizePath(filePath);
-    return !skipPatterns.some(pattern => pattern.test(normalizedPath));
+    return !skipPatterns.some((pattern) => pattern.test(normalizedPath));
   }
 
   /**
@@ -152,26 +152,33 @@ class WebpackAdapter extends BundlerAdapter {
         this.emit('initialized', { type: 'webpack', source: 'existing' });
         return true;
       }
-      
+
       // Try to require webpack normally
       this.webpack = require('webpack');
       this.compiler = this.webpack(this.config);
-      
+
       // Hook into compiler events
       this._setupCompilerHooks();
-      
+
       this.emit('initialized', { type: 'webpack' });
       return true;
-      
     } catch (error) {
       // If webpack is not available or there's a circular dependency, just skip initialization
-      if (error.message.includes('circular') || error.code === 'MODULE_NOT_FOUND') {
-        console.log('[Retrigger] Skipping webpack adapter initialization (running in webpack context)');
+      if (
+        error.message.includes('circular') ||
+        error.code === 'MODULE_NOT_FOUND'
+      ) {
+        console.log(
+          '[Retrigger] Skipping webpack adapter initialization (running in webpack context)'
+        );
         this.emit('initialized', { type: 'webpack', source: 'skipped' });
         return true;
       }
-      
-      this.emit('error', new Error(`Failed to initialize Webpack: ${error.message}`));
+
+      this.emit(
+        'error',
+        new Error(`Failed to initialize Webpack: ${error.message}`)
+      );
       return false;
     }
   }
@@ -190,7 +197,7 @@ class WebpackAdapter extends BundlerAdapter {
         }
 
         const info = stats.toJson();
-        
+
         if (stats.hasErrors()) {
           const errors = info.errors;
           this.emit('build-error', errors);
@@ -242,7 +249,7 @@ class WebpackAdapter extends BundlerAdapter {
         }
 
         const info = stats.toJson();
-        
+
         if (stats.hasErrors()) {
           this.emit('watch-error', info.errors);
         } else if (stats.hasWarnings()) {
@@ -260,7 +267,7 @@ class WebpackAdapter extends BundlerAdapter {
 
       this.isWatching = true;
       this.emit('watch-started');
-      
+
       if (!this.isWatching) resolve(this.watching);
     });
   }
@@ -272,7 +279,7 @@ class WebpackAdapter extends BundlerAdapter {
           if (err) {
             this.emit('error', err);
           }
-          
+
           this.watching = null;
           this.isWatching = false;
           this.emit('watch-stopped');
@@ -280,7 +287,7 @@ class WebpackAdapter extends BundlerAdapter {
         });
       });
     }
-    
+
     return Promise.resolve();
   }
 
@@ -288,11 +295,11 @@ class WebpackAdapter extends BundlerAdapter {
     if (!this.watching) return false;
 
     const filesToInvalidate = Array.isArray(files) ? files : [files];
-    const resolvedFiles = filesToInvalidate.map(f => path.resolve(f));
-    
+    const resolvedFiles = filesToInvalidate.map((f) => path.resolve(f));
+
     this.watching.invalidate(resolvedFiles);
     this.emit('invalidated', { files: resolvedFiles });
-    
+
     return true;
   }
 
@@ -306,12 +313,16 @@ class WebpackAdapter extends BundlerAdapter {
         config: this._extractConfigInfo(),
         cache: this._getCacheStats(),
         modules: webpackStats ? webpackStats.compilation.modules.size : 0,
-        assets: webpackStats ? Object.keys(webpackStats.compilation.assets).length : 0,
+        assets: webpackStats
+          ? Object.keys(webpackStats.compilation.assets).length
+          : 0,
       },
-      watching: this.watching ? {
-        startTime: this.watching.startTime,
-        running: this.watching.running,
-      } : null,
+      watching: this.watching
+        ? {
+            startTime: this.watching.startTime,
+            running: this.watching.running,
+          }
+        : null,
     };
   }
 
@@ -390,12 +401,17 @@ class WebpackAdapter extends BundlerAdapter {
       mode: this.config.mode,
       devtool: this.config.devtool,
       target: this.config.target,
-      entry: typeof this.config.entry === 'object' ? Object.keys(this.config.entry) : !!this.config.entry,
-      output: this.config.output ? {
-        path: this.config.output.path,
-        filename: this.config.output.filename,
-        publicPath: this.config.output.publicPath,
-      } : null,
+      entry:
+        typeof this.config.entry === 'object'
+          ? Object.keys(this.config.entry)
+          : !!this.config.entry,
+      output: this.config.output
+        ? {
+            path: this.config.output.path,
+            filename: this.config.output.filename,
+            publicPath: this.config.output.publicPath,
+          }
+        : null,
     };
   }
 
@@ -432,17 +448,24 @@ class RspackAdapter extends BundlerAdapter {
       // Try to load @rspack/core
       this.rspack = require('@rspack/core');
       this.compiler = this.rspack(this.config);
-      
+
       this._setupCompilerHooks();
-      
+
       this.emit('initialized', { type: 'rspack' });
       return true;
-      
     } catch (error) {
       if (error.code === 'MODULE_NOT_FOUND') {
-        this.emit('error', new Error('Rspack not installed. Install @rspack/core to use RspackAdapter'));
+        this.emit(
+          'error',
+          new Error(
+            'Rspack not installed. Install @rspack/core to use RspackAdapter'
+          )
+        );
       } else {
-        this.emit('error', new Error(`Failed to initialize Rspack: ${error.message}`));
+        this.emit(
+          'error',
+          new Error(`Failed to initialize Rspack: ${error.message}`)
+        );
       }
       return false;
     }
@@ -463,7 +486,7 @@ class RspackAdapter extends BundlerAdapter {
 
         // Rspack stats processing (similar to webpack but with Rspack-specific optimizations)
         const info = stats.toJson();
-        
+
         if (stats.hasErrors()) {
           const errors = info.errors;
           this.emit('build-error', errors);
@@ -508,7 +531,7 @@ class RspackAdapter extends BundlerAdapter {
         }
 
         const info = stats.toJson();
-        
+
         this.emit('watch-rebuild', {
           stats: info,
           duration: info.time,
@@ -527,7 +550,7 @@ class RspackAdapter extends BundlerAdapter {
       return new Promise((resolve) => {
         this.watching.close((err) => {
           if (err) this.emit('error', err);
-          
+
           this.watching = null;
           this.isWatching = false;
           this.emit('watch-stopped');
@@ -535,7 +558,7 @@ class RspackAdapter extends BundlerAdapter {
         });
       });
     }
-    
+
     return Promise.resolve();
   }
 
@@ -543,11 +566,11 @@ class RspackAdapter extends BundlerAdapter {
     if (!this.watching) return false;
 
     const filesToInvalidate = Array.isArray(files) ? files : [files];
-    
+
     // Rspack-specific invalidation
     this.watching.invalidate();
     this.emit('invalidated', { files: filesToInvalidate });
-    
+
     return true;
   }
 
@@ -625,18 +648,22 @@ class TurbopackAdapter extends BundlerAdapter {
       // Turbopack integration (experimental)
       // This would integrate with Next.js 13+ turbopack
       this.turbopack = await this._loadTurbopack();
-      
+
       this.emit('initialized', { type: 'turbopack' });
       return true;
-      
     } catch (error) {
-      this.emit('error', new Error(`Failed to initialize Turbopack: ${error.message}`));
+      this.emit(
+        'error',
+        new Error(`Failed to initialize Turbopack: ${error.message}`)
+      );
       return false;
     }
   }
 
   async build() {
-    throw new Error('Turbopack build mode not yet implemented - primarily for Next.js dev mode');
+    throw new Error(
+      'Turbopack build mode not yet implemented - primarily for Next.js dev mode'
+    );
   }
 
   async watch() {
@@ -647,10 +674,10 @@ class TurbopackAdapter extends BundlerAdapter {
     // Turbopack watching implementation
     this.isWatching = true;
     this.emit('watch-started');
-    
+
     // Turbopack has built-in watching via Next.js dev server
     this._setupTurbopackWatching();
-    
+
     return Promise.resolve();
   }
 
@@ -659,7 +686,7 @@ class TurbopackAdapter extends BundlerAdapter {
       this.isWatching = false;
       this.emit('watch-stopped');
     }
-    
+
     return Promise.resolve();
   }
 
@@ -698,7 +725,9 @@ class TurbopackAdapter extends BundlerAdapter {
   async _loadTurbopack() {
     // Placeholder for Turbopack loading logic
     // In reality, this would integrate with Next.js 13+ dev server
-    throw new Error('Turbopack adapter is experimental and requires Next.js 13+');
+    throw new Error(
+      'Turbopack adapter is experimental and requires Next.js 13+'
+    );
   }
 
   _setupTurbopackWatching() {
@@ -726,15 +755,17 @@ class BundlerFactory {
     switch (normalizedType) {
       case 'webpack':
         return new WebpackAdapter(config);
-      
+
       case 'rspack':
         return new RspackAdapter(config);
-      
+
       case 'turbopack':
         return new TurbopackAdapter(config);
-      
+
       default:
-        throw new Error(`Unsupported bundler type: ${type}. Supported types: ${this.supportedTypes.join(', ')}`);
+        throw new Error(
+          `Unsupported bundler type: ${type}. Supported types: ${this.supportedTypes.join(', ')}`
+        );
     }
   }
 
@@ -748,8 +779,13 @@ class BundlerFactory {
     const packageJsonPath = path.join(projectPath, 'package.json');
 
     try {
-      const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf8'));
-      const deps = { ...packageJson.dependencies, ...packageJson.devDependencies };
+      const packageJson = JSON.parse(
+        await fs.readFile(packageJsonPath, 'utf8')
+      );
+      const deps = {
+        ...packageJson.dependencies,
+        ...packageJson.devDependencies,
+      };
 
       // Check for Next.js with Turbopack
       if (deps.next && this._hasNextjsTurbopack(packageJson)) {
@@ -774,10 +810,13 @@ class BundlerFactory {
 
   static _hasNextjsTurbopack(packageJson) {
     // Check if Next.js version supports Turbopack (13+)
-    const nextVersion = packageJson.dependencies?.next || packageJson.devDependencies?.next;
+    const nextVersion =
+      packageJson.dependencies?.next || packageJson.devDependencies?.next;
     if (!nextVersion) return false;
 
-    const majorVersion = parseInt(nextVersion.replace(/[^\d.].*$/, '').split('.')[0]);
+    const majorVersion = parseInt(
+      nextVersion.replace(/[^\d.].*$/, '').split('.')[0]
+    );
     return majorVersion >= 13;
   }
 

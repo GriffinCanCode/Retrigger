@@ -1,7 +1,7 @@
 /**
  * Retrigger Vite Plugin - Enhanced with Advanced HMR Integration
  * Integrates Retrigger with Vite's HMR system for ultra-fast hot reloading
- * 
+ *
  * Features:
  * - Advanced HMR with intelligent module invalidation
  * - Source map support for accurate debugging
@@ -42,9 +42,11 @@ function createRetriggerVitePlugin(options = {}) {
         '**/.vite/**',
         '**/*.log',
         '**/.*',
-        ...((options.watchOptions && options.watchOptions.exclude_patterns) || []),
+        ...((options.watchOptions && options.watchOptions.exclude_patterns) ||
+          []),
       ],
-      include_patterns: options.watchOptions && options.watchOptions.include_patterns,
+      include_patterns:
+        options.watchOptions && options.watchOptions.include_patterns,
       enable_hashing: options.watchOptions?.enable_hashing ?? true,
       hash_block_size: options.watchOptions?.hash_block_size || 4096,
       ...options.watchOptions,
@@ -75,19 +77,23 @@ function createRetriggerVitePlugin(options = {}) {
 
   return {
     name: 'retrigger',
-    
+
     // Configure development server
     configureServer(server) {
       viteServer = server;
-      
+
       if (pluginOptions.verbose) {
-        console.log('[Retrigger] Configuring enhanced Vite server with advanced HMR');
+        console.log(
+          '[Retrigger] Configuring enhanced Vite server with advanced HMR'
+        );
       }
 
       // Initialize SharedArrayBuffer communication
       if (pluginOptions.useSharedBuffer) {
         const SharedBufferCommunicator = getSharedBufferCommunicator();
-        sharedComm = new SharedBufferCommunicator(pluginOptions.sharedBufferSize);
+        sharedComm = new SharedBufferCommunicator(
+          pluginOptions.sharedBufferSize
+        );
       }
 
       // Initialize advanced HMR manager
@@ -117,20 +123,25 @@ function createRetriggerVitePlugin(options = {}) {
       });
 
       // HMR performance endpoint
-      server.middlewares.use('/__retrigger_hmr_stats', async (req, res, next) => {
-        if (req.method === 'GET') {
-          const hmrStats = hmrManager ? hmrManager.getPerformanceStats() : null;
-          const combinedStats = {
-            performance: performanceMetrics,
-            hmr: hmrStats,
-            sharedBuffer: sharedComm ? sharedComm.getStats() : null,
-          };
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify(combinedStats, null, 2));
-        } else {
-          next();
+      server.middlewares.use(
+        '/__retrigger_hmr_stats',
+        async (req, res, next) => {
+          if (req.method === 'GET') {
+            const hmrStats = hmrManager
+              ? hmrManager.getPerformanceStats()
+              : null;
+            const combinedStats = {
+              performance: performanceMetrics,
+              hmr: hmrStats,
+              sharedBuffer: sharedComm ? sharedComm.getStats() : null,
+            };
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify(combinedStats, null, 2));
+          } else {
+            next();
+          }
         }
-      });
+      );
     },
 
     // Build start hook
@@ -162,7 +173,9 @@ function createRetriggerVitePlugin(options = {}) {
     // Skip native watching if disabled
     if (!pluginOptions.enableNativeWatching) {
       if (pluginOptions.verbose) {
-        console.log('[Retrigger] Native watching disabled, using Vite default watching');
+        console.log(
+          '[Retrigger] Native watching disabled, using Vite default watching'
+        );
       }
       isWatching = true;
       return;
@@ -176,7 +189,7 @@ function createRetriggerVitePlugin(options = {}) {
       // Initialize SharedArrayBuffer communication
       if (sharedComm) {
         await sharedComm.initializeAsMain();
-        
+
         sharedComm.on('file-event', async (event) => {
           await handleSharedBufferEvent(event);
         });
@@ -185,7 +198,7 @@ function createRetriggerVitePlugin(options = {}) {
       // Initialize HMR manager
       if (hmrManager) {
         await hmrManager.initialize('vite', viteServer);
-        
+
         hmrManager.on('update-complete', (result) => {
           performanceMetrics.hmrUpdates++;
           performanceMetrics.lastUpdateTime = Date.now();
@@ -198,10 +211,12 @@ function createRetriggerVitePlugin(options = {}) {
 
       // Determine paths to watch
       const watchPaths = getWatchPaths();
-      
+
       if (pluginOptions.verbose) {
-        console.log(`[Retrigger] Enhanced Vite plugin watching ${watchPaths.length} directories:`);
-        watchPaths.forEach(p => console.log(`  - ${p}`));
+        console.log(
+          `[Retrigger] Enhanced Vite plugin watching ${watchPaths.length} directories:`
+        );
+        watchPaths.forEach((p) => console.log(`  - ${p}`));
       }
 
       // Watch directories
@@ -218,14 +233,24 @@ function createRetriggerVitePlugin(options = {}) {
       if (pluginOptions.verbose) {
         const stats = await watcher.getStats();
         const simdLevel = watcher.getSimdLevel();
-        console.log(`[Retrigger] Enhanced Vite integration started with SIMD: ${simdLevel}`);
-        console.log(`[Retrigger] Watching ${stats.watched_directories} directories`);
-        console.log(`[Retrigger] Advanced HMR: ${hmrManager ? 'enabled' : 'disabled'}`);
-        console.log(`[Retrigger] SharedArrayBuffer: ${sharedComm ? 'enabled' : 'disabled'}`);
+        console.log(
+          `[Retrigger] Enhanced Vite integration started with SIMD: ${simdLevel}`
+        );
+        console.log(
+          `[Retrigger] Watching ${stats.watched_directories} directories`
+        );
+        console.log(
+          `[Retrigger] Advanced HMR: ${hmrManager ? 'enabled' : 'disabled'}`
+        );
+        console.log(
+          `[Retrigger] SharedArrayBuffer: ${sharedComm ? 'enabled' : 'disabled'}`
+        );
       }
-
     } catch (error) {
-      console.error('[Retrigger] Failed to start enhanced Vite watching:', error);
+      console.error(
+        '[Retrigger] Failed to start enhanced Vite watching:',
+        error
+      );
       isWatching = false;
       throw error;
     }
@@ -239,7 +264,7 @@ function createRetriggerVitePlugin(options = {}) {
       watcher.stop();
       watcher = null;
       isWatching = false;
-      
+
       if (debounceTimer) {
         clearTimeout(debounceTimer);
         debounceTimer = null;
@@ -256,9 +281,11 @@ function createRetriggerVitePlugin(options = {}) {
         hmrManager.destroy();
         hmrManager = null;
       }
-      
+
       if (pluginOptions.verbose) {
-        console.log('[Retrigger] Stopped enhanced Vite watching and cleaned up resources');
+        console.log(
+          '[Retrigger] Stopped enhanced Vite watching and cleaned up resources'
+        );
       }
     }
   }
@@ -269,32 +296,32 @@ function createRetriggerVitePlugin(options = {}) {
    */
   function getWatchPaths() {
     const paths = new Set();
-    
+
     // Add explicitly configured paths
-    pluginOptions.watchPaths.forEach(p => paths.add(path.resolve(p)));
-    
+    pluginOptions.watchPaths.forEach((p) => paths.add(path.resolve(p)));
+
     // Add Vite root
     if (viteServer.config.root) {
       paths.add(path.resolve(viteServer.config.root));
     }
-    
+
     // Add source directories from Vite config
     if (viteServer.config.build?.rollupOptions?.input) {
       const inputs = viteServer.config.build.rollupOptions.input;
       const inputArray = Array.isArray(inputs) ? inputs : Object.values(inputs);
-      
-      inputArray.forEach(input => {
+
+      inputArray.forEach((input) => {
         if (typeof input === 'string') {
           paths.add(path.dirname(path.resolve(input)));
         }
       });
     }
-    
+
     // Default to current working directory
     if (paths.size === 0) {
       paths.add(process.cwd());
     }
-    
+
     return Array.from(paths);
   }
 
@@ -315,7 +342,9 @@ function createRetriggerVitePlugin(options = {}) {
     // Log stats periodically
     if (pluginOptions.verbose) {
       watcher.on('stats', (stats) => {
-        console.log(`[Retrigger] Vite stats - Pending: ${stats.pending_events}`);
+        console.log(
+          `[Retrigger] Vite stats - Pending: ${stats.pending_events}`
+        );
       });
     }
   }
@@ -337,7 +366,7 @@ function createRetriggerVitePlugin(options = {}) {
       try {
         // Skip performance tracking in hot path for better responsiveness
         const updateResult = await hmrManager.processFileChange(event);
-        
+
         // Update metrics asynchronously to avoid blocking
         setImmediate(() => {
           performanceMetrics.hmrUpdates++;
@@ -347,7 +376,9 @@ function createRetriggerVitePlugin(options = {}) {
         // Only log in verbose mode and don't block on it
         if (pluginOptions.verbose && updateResult.type === 'hmr-update') {
           setImmediate(() => {
-            console.log(`[Retrigger] HMR update for ${event.path} (${updateResult.affectedModules.length} modules)`);
+            console.log(
+              `[Retrigger] HMR update for ${event.path} (${updateResult.affectedModules.length} modules)`
+            );
           });
         }
 
@@ -356,7 +387,10 @@ function createRetriggerVitePlugin(options = {}) {
         // Async error logging to avoid blocking
         if (pluginOptions.verbose) {
           setImmediate(() => {
-            console.error('[Retrigger] Advanced HMR failed, using fallback:', error.message);
+            console.error(
+              '[Retrigger] Advanced HMR failed, using fallback:',
+              error.message
+            );
           });
         }
         // Fall through to standard HMR
@@ -366,22 +400,26 @@ function createRetriggerVitePlugin(options = {}) {
     // Optimized standard HMR path
     const normalizedPath = path.relative(viteServer.config.root, event.path);
     const module = viteServer.moduleGraph.getModuleById(normalizedPath);
-    
+
     if (module) {
       // Direct invalidation without complex batching
       viteServer.moduleGraph.invalidateModule(module);
-      
+
       // Send HMR update immediately for better responsiveness
-      const updateType = event.path.endsWith('.css') ? 'css-update' : 'js-update';
-      
+      const updateType = event.path.endsWith('.css')
+        ? 'css-update'
+        : 'js-update';
+
       viteServer.ws.send({
         type: 'update',
-        updates: [{
-          type: updateType,
-          path: normalizedPath,
-          acceptedPath: normalizedPath,
-          timestamp: Date.now(),
-        }],
+        updates: [
+          {
+            type: updateType,
+            path: normalizedPath,
+            acceptedPath: normalizedPath,
+            timestamp: Date.now(),
+          },
+        ],
       });
 
       // Update metrics asynchronously
@@ -407,19 +445,21 @@ function createRetriggerVitePlugin(options = {}) {
     // Ultra-fast path: Skip all intermediate processing
     const normalizedPath = path.relative(viteServer.config.root, event.path);
     const module = viteServer.moduleGraph.getModuleById(normalizedPath);
-    
+
     if (module) {
       // Immediate invalidation and update
       viteServer.moduleGraph.invalidateModule(module);
-      
+
       viteServer.ws.send({
         type: 'update',
-        updates: [{
-          type: event.path.endsWith('.css') ? 'css-update' : 'js-update',
-          path: normalizedPath,
-          acceptedPath: normalizedPath,
-          timestamp: Date.now(),
-        }],
+        updates: [
+          {
+            type: event.path.endsWith('.css') ? 'css-update' : 'js-update',
+            path: normalizedPath,
+            acceptedPath: normalizedPath,
+            timestamp: Date.now(),
+          },
+        ],
       });
     } else {
       // Immediate full reload
@@ -437,20 +477,22 @@ function createRetriggerVitePlugin(options = {}) {
     try {
       const normalizedPath = path.relative(viteServer.config.root, event.path);
       const module = viteServer.moduleGraph.getModuleById(normalizedPath);
-      
+
       if (module) {
         // Invalidate module
         viteServer.moduleGraph.invalidateModule(module);
-        
+
         // Send immediate HMR update
         viteServer.ws.send({
           type: 'update',
-          updates: [{
-            type: event.path.endsWith('.css') ? 'css-update' : 'js-update',
-            path: normalizedPath,
-            acceptedPath: normalizedPath,
-            timestamp: Date.now(),
-          }],
+          updates: [
+            {
+              type: event.path.endsWith('.css') ? 'css-update' : 'js-update',
+              path: normalizedPath,
+              acceptedPath: normalizedPath,
+              timestamp: Date.now(),
+            },
+          ],
         });
 
         performanceMetrics.hmrUpdates++;
@@ -468,9 +510,20 @@ function createRetriggerVitePlugin(options = {}) {
   function shouldProcessFile(filePath) {
     // Vite handles these file types well
     const supportedExtensions = [
-      '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte',
-      '.css', '.scss', '.sass', '.less', '.styl',
-      '.html', '.json', '.md',
+      '.js',
+      '.jsx',
+      '.ts',
+      '.tsx',
+      '.vue',
+      '.svelte',
+      '.css',
+      '.scss',
+      '.sass',
+      '.less',
+      '.styl',
+      '.html',
+      '.json',
+      '.md',
     ];
 
     // Skip non-source files
@@ -485,14 +538,14 @@ function createRetriggerVitePlugin(options = {}) {
     ];
 
     const ext = path.extname(filePath);
-    
+
     // Check if supported extension
     if (!supportedExtensions.includes(ext)) {
       return false;
     }
 
     // Check skip patterns
-    if (skipPatterns.some(pattern => pattern.test(filePath))) {
+    if (skipPatterns.some((pattern) => pattern.test(filePath))) {
       return false;
     }
 
@@ -511,24 +564,26 @@ function createRetriggerVitePlugin(options = {}) {
     changeBuffer.clear();
 
     if (pluginOptions.verbose) {
-      console.log(`[Retrigger] Triggering Vite HMR for ${changes.length} changes`);
+      console.log(
+        `[Retrigger] Triggering Vite HMR for ${changes.length} changes`
+      );
     }
 
     // Process each changed file
     changes.forEach(({ event }) => {
       const filePath = event.path;
-      
+
       try {
         // Normalize path for Vite
         const normalizedPath = path.relative(viteServer.config.root, filePath);
-        
+
         // Get module graph node
         const module = viteServer.moduleGraph.getModuleById(normalizedPath);
-        
+
         if (module) {
           // Invalidate module
           viteServer.moduleGraph.invalidateModule(module);
-          
+
           // Send HMR update
           if (event.event_type === 'deleted') {
             // Handle file deletion
@@ -540,15 +595,17 @@ function createRetriggerVitePlugin(options = {}) {
             // Handle file modification/creation
             viteServer.ws.send({
               type: 'update',
-              updates: [{
-                type: 'js-update',
-                path: normalizedPath,
-                acceptedPath: normalizedPath,
-                timestamp: Date.now(),
-              }],
+              updates: [
+                {
+                  type: 'js-update',
+                  path: normalizedPath,
+                  acceptedPath: normalizedPath,
+                  timestamp: Date.now(),
+                },
+              ],
             });
           }
-          
+
           if (pluginOptions.verbose) {
             console.log(`[Retrigger] HMR update sent for: ${normalizedPath}`);
           }
@@ -557,13 +614,18 @@ function createRetriggerVitePlugin(options = {}) {
           viteServer.ws.send({
             type: 'full-reload',
           });
-          
+
           if (pluginOptions.verbose) {
-            console.log(`[Retrigger] Full reload triggered for: ${normalizedPath}`);
+            console.log(
+              `[Retrigger] Full reload triggered for: ${normalizedPath}`
+            );
           }
         }
       } catch (error) {
-        console.error(`[Retrigger] Error processing HMR for ${filePath}:`, error);
+        console.error(
+          `[Retrigger] Error processing HMR for ${filePath}:`,
+          error
+        );
       }
     });
   }
@@ -588,7 +650,7 @@ function createRetriggerVitePlugin(options = {}) {
       pending_events: stats.pending_events,
       total_events: parseInt(stats.total_events),
       dropped_events: parseInt(stats.dropped_events),
-      
+
       // HMR Statistics
       hmr: {
         enabled: !!hmrManager,
@@ -616,7 +678,7 @@ function createRetriggerVitePlugin(options = {}) {
       // Buffer State
       change_buffer_size: changeBuffer.size,
       is_watching: isWatching,
-      
+
       // Performance Metrics
       performance: {
         memory_usage: process.memoryUsage(),
