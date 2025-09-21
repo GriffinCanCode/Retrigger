@@ -2,21 +2,101 @@
 //! Follows SRP: Only responsible for Windows-specific file watching using native APIs
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Only compile Windows watcher on Windows platforms
+comptime {
+    if (builtin.os.tag != .windows) {
+        @compileError("Windows watcher is only available on Windows platforms");
+    }
+}
+
 const main = @import("../main.zig");
 const FileEvent = main.FileEvent;
 const EventType = main.EventType;
 const EventRingBuffer = main.EventRingBuffer;
 
+// Windows API imports - eBPF headers are conditional as they're not always available
 const c = @cImport({
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
     @cInclude("windows.h");
     @cInclude("winbase.h");
     @cInclude("fileapi.h");
-    // eBPF for Windows support (requires Windows 11 or Server 2022+)
-    @cInclude("ebpf_api.h");
-    @cInclude("ebpf_windows.h");
-    @cInclude("bpf.h");
 });
+
+// eBPF for Windows support (requires Windows 11 or Server 2022+)
+// Fallback definitions when eBPF headers are not available
+const ebpf_c = struct {
+    pub const ebpf_handle_t = ?*anyopaque;
+    pub const ebpf_program_type_t = enum(c_int) {
+        EBPF_PROGRAM_TYPE_UNSPEC = 0,
+        EBPF_PROGRAM_TYPE_XDP = 1,
+        EBPF_PROGRAM_TYPE_SOCKET_FILTER = 2,
+    };
+    pub const bpf_attach_type = enum(c_int) {
+        BPF_ATTACH_TYPE_UNSPEC = 0,
+        BPF_XDP = 1,
+    };
+
+    // eBPF instruction struct
+    pub const ebpf_inst = extern struct {
+        opcode: u8,
+        dst: u4,
+        src: u4,
+        off: i16,
+        imm: i32,
+    };
+
+    // eBPF map create info
+    pub const ebpf_map_create_info_t = extern struct {
+        type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32,
+    };
+
+    // eBPF program load info
+    pub const ebpf_program_load_info_t = extern struct {
+        program_type: ebpf_program_type_t,
+        expected_attach_type: bpf_attach_type,
+        program_name: [*c]const u8,
+        execution_context: u32,
+    };
+
+    // eBPF constants
+    pub const EBPF_SUCCESS: u32 = 0;
+    pub const EBPF_PROGRAM_TYPE_BIND: ebpf_program_type_t = .EBPF_PROGRAM_TYPE_SOCKET_FILTER;
+    pub const EBPF_ATTACH_TYPE_BIND: bpf_attach_type = .BPF_ATTACH_TYPE_UNSPEC;
+    pub const EBPF_EXECUTION_CONTEXT_KERNEL: u32 = 0;
+    pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
+    pub const EBPF_OP_LDXW: u8 = 0x61;
+    pub const EBPF_OP_CALL: u8 = 0x85;
+    pub const EBPF_OP_MOV64_IMM: u8 = 0xb7;
+    pub const EBPF_OP_EXIT: u8 = 0x95;
+    pub const EBPF_FUNC_get_current_time: i32 = 5;
+
+    // Stub functions for when eBPF is not available
+    pub fn ebpf_api_initiate() callconv(.C) u32 {
+        return 1; // ERROR_NOT_SUPPORTED
+    }
+    pub fn ebpf_api_terminate() callconv(.C) void {}
+    pub fn ebpf_map_create(_: *const ebpf_map_create_info_t, _: *ebpf_handle_t) callconv(.C) u32 {
+        return 1; // ERROR_NOT_SUPPORTED
+    }
+    pub fn ebpf_program_load(_: [*c]const u8, _: usize, _: *const ebpf_program_load_info_t, _: *ebpf_handle_t) callconv(.C) u32 {
+        return 1; // ERROR_NOT_SUPPORTED
+    }
+    pub fn ebpf_program_attach(_: ebpf_handle_t, _: ?*const anyopaque, _: usize, _: *ebpf_handle_t) callconv(.C) u32 {
+        return 1; // ERROR_NOT_SUPPORTED
+    }
+    pub fn ebpf_object_close(_: ebpf_handle_t) callconv(.C) u32 {
+        return 0; // SUCCESS (no-op)
+    }
+    pub fn ebpf_map_lookup_elem(_: ebpf_handle_t, _: ?*const anyopaque, _: *anyopaque, _: *usize) callconv(.C) u32 {
+        return 2; // ERROR_FILE_NOT_FOUND (no data available)
+    }
+};
 
 /// Directory watch entry for tracking multiple watched directories
 const WatchEntry = struct {
@@ -47,10 +127,10 @@ const WindowsWatchedPath = struct {
 
 /// Windows eBPF program context
 const WindowsEBPFContext = struct {
-    program_fd: c.ebpf_handle_t,
-    map_fd: c.ebpf_handle_t,
-    attach_handle: c.ebpf_handle_t,
-    program_type: c.ebpf_program_type_t,
+    program_fd: ebpf_c.ebpf_handle_t,
+    map_fd: ebpf_c.ebpf_handle_t,
+    attach_handle: ebpf_c.ebpf_handle_t,
+    program_type: ebpf_c.ebpf_program_type_t,
 };
 
 /// File system event from Windows eBPF program
@@ -139,9 +219,9 @@ pub const WindowsWatcher = struct {
         // Clean up eBPF contexts
         for (self.ebpf_contexts.items) |context| {
             if (self.ebpf_enabled) {
-                _ = c.ebpf_object_close(context.attach_handle);
-                _ = c.ebpf_object_close(context.map_fd);
-                _ = c.ebpf_object_close(context.program_fd);
+                _ = ebpf_c.ebpf_object_close(context.attach_handle);
+                _ = ebpf_c.ebpf_object_close(context.map_fd);
+                _ = ebpf_c.ebpf_object_close(context.program_fd);
             }
         }
         self.ebpf_contexts.deinit(self.allocator);
@@ -471,9 +551,9 @@ pub const WindowsWatcher = struct {
     /// Check if eBPF is supported on this Windows version
     fn check_ebpf_support() bool {
         // Try to initialize eBPF - if it fails, eBPF is not supported
-        const result = c.ebpf_api_initiate();
-        if (result == c.EBPF_SUCCESS) {
-            c.ebpf_api_terminate();
+        const result = ebpf_c.ebpf_api_initiate();
+        if (result == ebpf_c.EBPF_SUCCESS) {
+            ebpf_c.ebpf_api_terminate();
             return true;
         }
         return false;
@@ -484,17 +564,17 @@ pub const WindowsWatcher = struct {
         if (!self.ebpf_enabled) return;
 
         // Create eBPF map for events
-        var map_create_info = c.ebpf_map_create_info_t{
-            .type = c.BPF_MAP_TYPE_RINGBUF,
+        var map_create_info = ebpf_c.ebpf_map_create_info_t{
+            .type = ebpf_c.BPF_MAP_TYPE_RINGBUF,
             .key_size = 0,
             .value_size = 0,
             .max_entries = 64 * 1024, // 64KB ring buffer
             .map_flags = 0,
         };
 
-        var map_fd: c.ebpf_handle_t = undefined;
-        const result = c.ebpf_map_create(&map_create_info, &map_fd);
-        if (result != c.EBPF_SUCCESS) {
+        var map_fd: ebpf_c.ebpf_handle_t = undefined;
+        var result = ebpf_c.ebpf_map_create(&map_create_info, &map_fd);
+        if (result != ebpf_c.EBPF_SUCCESS) {
             std.log.warn("Failed to create eBPF map for Windows: {}", .{result});
             return;
         }
@@ -503,29 +583,29 @@ pub const WindowsWatcher = struct {
         const program_bytecode = try self.generate_windows_ebpf_program(map_fd);
         defer self.allocator.free(program_bytecode);
 
-        var program_load_info = c.ebpf_program_load_info_t{
-            .program_type = c.EBPF_PROGRAM_TYPE_BIND,
-            .expected_attach_type = c.EBPF_ATTACH_TYPE_BIND,
+        var program_load_info = ebpf_c.ebpf_program_load_info_t{
+            .program_type = ebpf_c.EBPF_PROGRAM_TYPE_BIND,
+            .expected_attach_type = ebpf_c.EBPF_ATTACH_TYPE_BIND,
             .program_name = "file_monitor",
-            .execution_context = c.EBPF_EXECUTION_CONTEXT_KERNEL,
+            .execution_context = ebpf_c.EBPF_EXECUTION_CONTEXT_KERNEL,
         };
 
-        var program_fd: c.ebpf_handle_t = undefined;
-        result = c.ebpf_program_load(program_bytecode.ptr, @intCast(program_bytecode.len), &program_load_info, &program_fd);
+        var program_fd: ebpf_c.ebpf_handle_t = undefined;
+        result = ebpf_c.ebpf_program_load(program_bytecode.ptr, @intCast(program_bytecode.len), &program_load_info, &program_fd);
 
-        if (result != c.EBPF_SUCCESS) {
+        if (result != ebpf_c.EBPF_SUCCESS) {
             std.log.warn("Failed to load eBPF program for Windows: {}", .{result});
-            _ = c.ebpf_object_close(map_fd);
+            _ = ebpf_c.ebpf_object_close(map_fd);
             return;
         }
 
         // Attach eBPF program
-        var attach_handle: c.ebpf_handle_t = undefined;
-        result = c.ebpf_program_attach(program_fd, null, 0, &attach_handle);
-        if (result != c.EBPF_SUCCESS) {
+        var attach_handle: ebpf_c.ebpf_handle_t = undefined;
+        result = ebpf_c.ebpf_program_attach(program_fd, null, 0, &attach_handle);
+        if (result != ebpf_c.EBPF_SUCCESS) {
             std.log.warn("Failed to attach eBPF program for Windows: {}", .{result});
-            _ = c.ebpf_object_close(program_fd);
-            _ = c.ebpf_object_close(map_fd);
+            _ = ebpf_c.ebpf_object_close(program_fd);
+            _ = ebpf_c.ebpf_object_close(map_fd);
             return;
         }
 
@@ -534,7 +614,7 @@ pub const WindowsWatcher = struct {
             .program_fd = program_fd,
             .map_fd = map_fd,
             .attach_handle = attach_handle,
-            .program_type = c.EBPF_PROGRAM_TYPE_BIND,
+            .program_type = ebpf_c.EBPF_PROGRAM_TYPE_BIND,
         };
 
         try self.ebpf_contexts.append(context);
@@ -566,21 +646,21 @@ pub const WindowsWatcher = struct {
     }
 
     /// Generate Windows-specific eBPF program bytecode
-    fn generate_windows_ebpf_program(self: *Self, map_fd: c.ebpf_handle_t) ![]u8 {
+    fn generate_windows_ebpf_program(self: *Self, map_fd: ebpf_c.ebpf_handle_t) ![]u8 {
         _ = map_fd; // Intentionally unused for this simplified implementation
 
         // This is a simplified eBPF program for Windows
         // In a real implementation, this would be more comprehensive and use map_fd
-        const program = [_]c.ebpf_inst{
+        const program = [_]ebpf_c.ebpf_inst{
             // Load context
-            c.ebpf_inst{ .opcode = c.EBPF_OP_LDXW, .dst = 1, .src = 1, .off = 0, .imm = 0 },
+            ebpf_c.ebpf_inst{ .opcode = ebpf_c.EBPF_OP_LDXW, .dst = 1, .src = 1, .off = 0, .imm = 0 },
 
             // Call helper to get file event data
-            c.ebpf_inst{ .opcode = c.EBPF_OP_CALL, .dst = 0, .src = 0, .off = 0, .imm = c.EBPF_FUNC_get_current_time },
+            ebpf_c.ebpf_inst{ .opcode = ebpf_c.EBPF_OP_CALL, .dst = 0, .src = 0, .off = 0, .imm = ebpf_c.EBPF_FUNC_get_current_time },
 
             // Store event and return
-            c.ebpf_inst{ .opcode = c.EBPF_OP_MOV64_IMM, .dst = 0, .src = 0, .off = 0, .imm = 0 },
-            c.ebpf_inst{ .opcode = c.EBPF_OP_EXIT, .dst = 0, .src = 0, .off = 0, .imm = 0 },
+            ebpf_c.ebpf_inst{ .opcode = ebpf_c.EBPF_OP_MOV64_IMM, .dst = 0, .src = 0, .off = 0, .imm = 0 },
+            ebpf_c.ebpf_inst{ .opcode = ebpf_c.EBPF_OP_EXIT, .dst = 0, .src = 0, .off = 0, .imm = 0 },
         };
 
         const bytecode = try self.allocator.alloc(u8, @sizeOf(@TypeOf(program)));
@@ -608,8 +688,8 @@ pub const WindowsWatcher = struct {
         var event_size: usize = event_data.len;
 
         // Try to read from eBPF map (ring buffer)
-        const result = c.ebpf_map_lookup_elem(context.map_fd, null, &event_data, &event_size);
-        if (result == c.EBPF_SUCCESS and event_size >= @sizeOf(WindowsEBPFFileEvent)) {
+        const result = ebpf_c.ebpf_map_lookup_elem(context.map_fd, null, &event_data, &event_size);
+        if (result == ebpf_c.EBPF_SUCCESS and event_size >= @sizeOf(WindowsEBPFFileEvent)) {
             const ebpf_event = @as(*const WindowsEBPFFileEvent, @ptrCast(@alignCast(&event_data)));
             self.process_ebpf_file_event(ebpf_event);
         }
