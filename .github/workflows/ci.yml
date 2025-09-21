@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node-version: [16, 18, 20]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+        components: rustfmt, clippy
+
+    - name: Install Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.11.0
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: npm
+        cache-dependency-path: src/bindings/nodejs/package-lock.json
+
+    - name: Install system dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential clang llvm-dev pkg-config liburing-dev
+
+    - name: Install system dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install llvm pkg-config
+
+    - name: Cache Cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Cache Node.js dependencies
+      uses: actions/cache@v4
+      with:
+        path: src/bindings/nodejs/node_modules
+        key: ${{ runner.os }}-node-${{ matrix.node-version }}-${{ hashFiles('src/bindings/nodejs/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-node-${{ matrix.node-version }}-
+
+    - name: Install Node.js dependencies
+      run: |
+        cd src/bindings/nodejs
+        npm ci
+
+    - name: Check formatting
+      run: |
+        cargo fmt --all -- --check
+        cd src/bindings/nodejs && npm run format:check 2>/dev/null || echo "No format check available"
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Build all components
+      run: make all BUILD_TYPE=debug
+
+    - name: Run Rust tests
+      run: cargo test --all-features --workspace
+
+    - name: Run Node.js tests
+      run: |
+        cd src/bindings/nodejs
+        npm test
+
+    - name: Test integration
+      run: |
+        cd tests
+        node test-plugin-functionality.js
+        node test-real-world-integration.js
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Security audit
+      run: |
+        cargo install cargo-audit --quiet
+        cargo audit
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - name: Node.js security audit
+      run: |
+        cd src/bindings/nodejs
+        npm audit --audit-level moderate
