@@ -151,7 +151,6 @@ pub const EBPFManager = struct {
             .map_ifindex = 0,
             .btf_fd = 0,
             .btf_key_type_id = 0,
-            .btf_value_type_id = 0,
         };
 
         // Zero the map name and set it

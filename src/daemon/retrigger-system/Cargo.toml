@@ -10,6 +10,7 @@ tokio = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+regex = "1.10"
 dashmap = "6.0"
 crossbeam = "0.8"
 memmap2 = "0.9"

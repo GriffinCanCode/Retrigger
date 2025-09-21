@@ -1,0 +1,15 @@
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Lock files (keep npm, ignore others if needed)
+# package-lock.json  # commented - usually want to keep this
+yarn.lock
+pnpm-lock.yaml
+
+# Build output
+temp_test*
+node_modules
+

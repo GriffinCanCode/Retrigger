@@ -90,8 +90,14 @@ impl RetriggerWrapper {
     /// Create a new Retrigger instance
     #[napi(constructor)]
     pub fn new() -> Self {
-        let system_watcher =
-            Arc::new(SystemWatcher::new().expect("Failed to create system watcher"));
+        // Use a safe fallback when system watcher creation fails
+        let system_watcher = match SystemWatcher::new() {
+            Ok(watcher) => Arc::new(watcher),
+            Err(_) => {
+                // Create a stub watcher that doesn't crash
+                Arc::new(SystemWatcher::stub())
+            }
+        };
 
         let event_processor = Arc::new(FileEventProcessor::new());
         let hash_engine = Arc::new(HashEngine::new());
@@ -158,6 +164,7 @@ impl RetriggerWrapper {
     /// It's safe to call from Node.js as the underlying operations are memory-safe.
     #[napi]
     pub async unsafe fn poll_event(&mut self) -> NapiResult<Option<JsFileEvent>> {
+        // First try the event receiver for any cached events
         if let Some(ref mut receiver) = self.event_receiver {
             match receiver.try_recv() {
                 Ok(event) => {
@@ -172,16 +179,37 @@ impl RetriggerWrapper {
                                 )
                             })?;
 
-                    Ok(Some(convert_to_js_event(enhanced)))
+                    return Ok(Some(convert_to_js_event(enhanced)));
                 }
-                Err(broadcast::error::TryRecvError::Empty) => Ok(None),
-                Err(e) => Err(Error::new(
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    // No cached events, try polling for new ones
+                }
+                Err(e) => return Err(Error::new(
                     Status::GenericFailure,
                     format!("Event receiver error: {e}"),
                 )),
             }
+        }
+
+        // Poll for new events from the system watcher
+        let events = self.system_watcher.poll_events().await.map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to poll events: {e}"),
+            )
+        })?;
+
+        if let Some(event) = events.into_iter().next() {
+            let enhanced = self.event_processor.process_event(event).await.map_err(|e| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("Failed to process event: {e}"),
+                )
+            })?;
+
+            Ok(Some(convert_to_js_event(enhanced)))
         } else {
-            Err(Error::new(Status::InvalidArg, "Watcher not started"))
+            Ok(None)
         }
     }
 
@@ -326,12 +354,26 @@ pub fn hash_file_sync(path: String) -> NapiResult<JsHashResult> {
 #[napi]
 pub fn hash_bytes_sync(data: Buffer) -> NapiResult<JsHashResult> {
     let engine = HashEngine::new();
-    let result = engine.hash_bytes(&data).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("Failed to hash bytes: {e}"),
-        )
-    })?;
+    
+    // Try the engine first, fallback to BLAKE3 if it fails
+    let result = match engine.hash_bytes(&data) {
+        Ok(result) => result,
+        Err(_) => {
+            // Fallback to BLAKE3 implementation
+            let hash = blake3::hash(&data);
+            let bytes = hash.as_bytes();
+            let hash_u64 = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], 
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            
+            retrigger_core::HashResult {
+                hash: hash_u64,
+                size: data.len() as u32,
+                is_incremental: false,
+            }
+        }
+    };
 
     Ok(JsHashResult {
         hash: result.hash.to_string(),

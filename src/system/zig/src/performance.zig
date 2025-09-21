@@ -269,9 +269,10 @@ pub const PerformanceOptimizer = struct {
 
         switch (builtin.os.tag) {
             .linux, .macos => {
-                if (linux.setpriority(linux.PRIO.PROCESS, 0, priority) != 0) {
+                // Use std.posix.setpriority instead of linux.setpriority
+                std.posix.setpriority(std.posix.PRIO.PROCESS, 0, priority) catch {
                     return error.SetPriorityFailed;
-                }
+                };
             },
             else => {},
         }
@@ -285,7 +286,8 @@ pub const PerformanceOptimizer = struct {
         if (builtin.os.tag != .linux) return;
 
         // Lock all current and future pages
-        if (linux.mlockall(linux.MCL.CURRENT | linux.MCL.FUTURE) != 0) {
+        // MCL_CURRENT = 1, MCL_FUTURE = 2
+        if (linux.mlockall(1 | 2) != 0) {
             return error.MemoryLockFailed;
         }
 

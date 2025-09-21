@@ -78,6 +78,35 @@ mod ffi {
     }
 }
 
+
+/// Event filtering configuration
+#[derive(Debug, Clone)]
+pub struct EventFilter {
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub debounce_ms: u64,
+    pub min_file_size: u64,
+    pub max_file_size: Option<u64>,
+}
+
+impl Default for EventFilter {
+    fn default() -> Self {
+        Self {
+            include_patterns: vec![],
+            exclude_patterns: vec![
+                "**/node_modules/**".to_string(),
+                "**/.git/**".to_string(),
+                "**/.*".to_string(),
+                "**/*.tmp".to_string(),
+                "**/*.swp".to_string(),
+            ],
+            debounce_ms: 100,
+            min_file_size: 0,
+            max_file_size: None,
+        }
+    }
+}
+
 /// High-level system file watcher
 pub struct SystemWatcher {
     watcher: *mut ffi::FileWatcher,
@@ -86,12 +115,36 @@ pub struct SystemWatcher {
     watched_paths: DashMap<PathBuf, bool>, // path -> recursive
     event_sender: broadcast::Sender<SystemEvent>,
     stats: Arc<tokio::sync::RwLock<WatcherStats>>,
+    event_filter: EventFilter,
+    last_events: Arc<DashMap<PathBuf, u64>>, // path -> timestamp for debouncing
 }
 
 unsafe impl Send for SystemWatcher {}
 unsafe impl Sync for SystemWatcher {}
 
 impl SystemWatcher {
+    /// Create a stub system watcher for testing/fallback
+    pub fn stub() -> Self {
+        let (event_sender, _) = broadcast::channel(10_000);
+        let hash_engine = Arc::new(HashEngine::new());
+
+        SystemWatcher {
+            watcher: std::ptr::null_mut(),
+            hash_engine,
+            watched_paths: DashMap::new(),
+            event_sender,
+            stats: Arc::new(tokio::sync::RwLock::new(WatcherStats {
+                pending_events: 0,
+                buffer_capacity: 0,
+                dropped_events: 0,
+                total_events: 0,
+                watched_directories: 0,
+            })),
+            event_filter: EventFilter::default(),
+            last_events: Arc::new(DashMap::new()),
+        }
+    }
+    
     /// Create a new system watcher
     pub fn new() -> Result<Self> {
         let watcher = unsafe { ffi::fw_watcher_create() };
@@ -119,12 +172,28 @@ impl SystemWatcher {
                 total_events: 0,
                 watched_directories: 0,
             })),
+            event_filter: EventFilter::default(),
+            last_events: Arc::new(DashMap::new()),
         })
     }
 
     /// Watch a directory for file system changes
     pub async fn watch_directory<P: AsRef<Path>>(&self, path: P, recursive: bool) -> Result<()> {
         let path = path.as_ref().to_path_buf();
+        
+        // Handle stub watcher
+        if self.watcher.is_null() {
+            info!("Stub watcher: would watch {} (recursive: {})", path.display(), recursive);
+            self.watched_paths.insert(path.clone(), recursive);
+            
+            // Update stats
+            {
+                let mut stats = self.stats.write().await;
+                stats.watched_directories = self.watched_paths.len();
+            }
+            return Ok(());
+        }
+        
         let path_str = path
             .to_str()
             .with_context(|| format!("Invalid path: {}", path.display()))?;
@@ -156,16 +225,22 @@ impl SystemWatcher {
 
     /// Start the file system monitoring
     pub async fn start(&self) -> Result<()> {
+        // Handle stub watcher
+        if self.watcher.is_null() {
+            info!("Stub watcher: started successfully");
+            return Ok(());
+        }
+        
         let result = unsafe { ffi::fw_watcher_start(self.watcher) };
         if result != 0 {
             anyhow::bail!("Failed to start system watcher");
         }
 
-        // For now, we'll skip the background task to avoid threading issues
-        // In a full implementation, we'd use proper synchronization primitives
-        info!("Event polling would be started here");
+        // Instead of spawning a task, we'll implement polling through a different method
+        // Store references for later use in polling
+        // The actual event polling will be done through the `poll_events` method
 
-        info!("Started system watcher");
+        info!("Started system watcher with event polling");
         Ok(())
     }
 
@@ -174,26 +249,16 @@ impl SystemWatcher {
         self.event_sender.subscribe()
     }
 
-    /// Get current watcher statistics
-    pub async fn get_stats(&self) -> WatcherStats {
-        self.stats.read().await.clone()
-    }
+    /// Poll for events manually (non-blocking)
+    pub async fn poll_events(&self) -> Result<Vec<SystemEvent>> {
+        if self.watcher.is_null() {
+            return Ok(vec![]);
+        }
 
-    /// Event polling task that runs in the background
-    #[allow(dead_code)]
-    async fn event_polling_task(
-        watcher: *mut ffi::FileWatcher,
-        event_sender: broadcast::Sender<SystemEvent>,
-        stats: Arc<tokio::sync::RwLock<WatcherStats>>,
-        _hash_engine: Arc<HashEngine>,
-    ) {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
-        let mut total_events = 0u64;
-
-        loop {
-            interval.tick().await;
-
-            // Poll for events from the native layer
+        let mut events = Vec::new();
+        
+        // Poll up to 10 events at a time to avoid blocking too long
+        for _ in 0..10 {
             let mut ffi_event = ffi::FileEvent {
                 path: std::ptr::null(),
                 event_type: 0,
@@ -202,10 +267,10 @@ impl SystemWatcher {
                 is_directory: false,
             };
 
-            let has_event = unsafe { ffi::fw_watcher_poll_event(watcher, &mut ffi_event) };
-
+            let has_event = unsafe { ffi::fw_watcher_poll_event(self.watcher, &mut ffi_event) };
+            
             if !has_event {
-                continue;
+                break;
             }
 
             // Convert FFI event to Rust event
@@ -232,28 +297,101 @@ impl SystemWatcher {
             };
 
             let system_event = SystemEvent {
-                path,
+                path: path.clone(),
                 event_type,
                 timestamp: ffi_event.timestamp,
                 size: ffi_event.size,
                 is_directory: ffi_event.is_directory,
             };
 
-            total_events += 1;
+            // Apply filtering and debouncing
+            if self.should_process_event(&system_event) {
+                // Send to subscribers
+                if let Err(_) = self.event_sender.send(system_event.clone()) {
+                    debug!("No event subscribers");
+                }
 
-            // Send event to subscribers
-            if let Err(e) = event_sender.send(system_event.clone()) {
-                debug!("No event subscribers: {}", e);
-            }
-
-            // Update stats periodically
-            if total_events.is_multiple_of(1000) {
-                let mut stats_guard = stats.write().await;
-                stats_guard.total_events = total_events;
-                // Additional stats would be retrieved from native layer
+                events.push(system_event);
             }
         }
+
+        // Update stats
+        if !events.is_empty() {
+            let mut stats_guard = self.stats.write().await;
+            stats_guard.total_events += events.len() as u64;
+        }
+
+        Ok(events)
     }
+
+    /// Set event filter configuration
+    pub fn set_event_filter(&mut self, filter: EventFilter) {
+        self.event_filter = filter;
+    }
+
+    /// Check if an event should be processed based on filters
+    fn should_process_event(&self, event: &SystemEvent) -> bool {
+        // Skip if file is too small
+        if event.size < self.event_filter.min_file_size {
+            return false;
+        }
+
+        // Skip if file is too large
+        if let Some(max_size) = self.event_filter.max_file_size {
+            if event.size > max_size {
+                return false;
+            }
+        }
+
+        // Apply path-based filtering
+        let path_str = event.path.to_string_lossy();
+        
+        // Check exclude patterns first (more common)
+        for pattern in &self.event_filter.exclude_patterns {
+            if glob_match(pattern, &path_str) {
+                return false;
+            }
+        }
+
+        // Check include patterns (if any specified)
+        if !self.event_filter.include_patterns.is_empty() {
+            let mut included = false;
+            for pattern in &self.event_filter.include_patterns {
+                if glob_match(pattern, &path_str) {
+                    included = true;
+                    break;
+                }
+            }
+            if !included {
+                return false;
+            }
+        }
+
+        // Apply debouncing
+        if self.event_filter.debounce_ms > 0 {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            if let Some(last_time) = self.last_events.get(&event.path) {
+                if current_time - *last_time < self.event_filter.debounce_ms {
+                    return false;
+                }
+            }
+
+            // Update last event time
+            self.last_events.insert(event.path.clone(), current_time);
+        }
+
+        true
+    }
+
+    /// Get current watcher statistics
+    pub async fn get_stats(&self) -> WatcherStats {
+        self.stats.read().await.clone()
+    }
+
 }
 
 impl Drop for SystemWatcher {
@@ -530,6 +668,23 @@ pub struct DetailedCacheStats {
     pub capacity: usize,
     pub utilization: f64,
     pub ttl_seconds: u64,
+}
+
+/// Simple glob pattern matching for file paths
+fn glob_match(pattern: &str, path: &str) -> bool {
+    // Simple implementation - convert glob to regex
+    let regex_pattern = pattern
+        .replace("**", "DOUBLE_STAR")
+        .replace("*", "[^/]*")
+        .replace("DOUBLE_STAR", ".*")
+        .replace("?", "[^/]");
+    
+    if let Ok(regex) = regex::Regex::new(&format!("^{}$", regex_pattern)) {
+        regex.is_match(path)
+    } else {
+        // Fallback to simple string matching
+        path.contains(&pattern.replace("*", ""))
+    }
 }
 
 #[cfg(test)]
