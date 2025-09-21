@@ -23,8 +23,18 @@ LDFLAGS := -shared
 ifeq ($(BUILD_TYPE),release)
     CFLAGS += -O3 -DNDEBUG -march=native -mtune=native
 else
-    CFLAGS += -O0 -g -DDEBUG -fsanitize=address
-    LDFLAGS += -fsanitize=address
+    CFLAGS += -O0 -g -DDEBUG
+    # AddressSanitizer is not available on MinGW/Windows
+    ifneq ($(findstring mingw,$(TARGET)),mingw)
+    ifneq ($(findstring msys,$(TARGET)),msys)
+        # Check if AddressSanitizer is available
+        ASAN_SUPPORT := $(shell $(CC) -fsanitize=address -E -dM - < /dev/null 2>/dev/null && echo 1 || echo 0)
+        ifeq ($(ASAN_SUPPORT),1)
+            CFLAGS += -fsanitize=address
+            LDFLAGS += -fsanitize=address
+        endif
+    endif
+    endif
 endif
 
 # Platform-specific flags
