@@ -68,10 +68,10 @@ pub const EBPFManager = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
             .allocator = allocator,
-            .prog_fds = std.ArrayList(i32).init(allocator),
-            .map_fds = std.ArrayList(i32).init(allocator),
-            .perf_fds = std.ArrayList(i32).init(allocator),
-            .perf_buffers = std.ArrayList([]align(4096) u8).init(allocator),
+            .prog_fds = std.ArrayList(i32){},
+            .map_fds = std.ArrayList(i32){},
+            .perf_fds = std.ArrayList(i32){},
+            .perf_buffers = std.ArrayList([]align(4096) u8){},
             .event_buffer = null,
             .events_processed = std.atomic.Value(u64).init(0),
             .events_dropped = std.atomic.Value(u64).init(0),
@@ -439,7 +439,7 @@ pub const EBPFManager = struct {
             const perf_fd = linux.perf_event_open(&perf_attr, -1, @intCast(cpu), -1, 0);
             if (perf_fd < 0) continue;
 
-            try self.perf_fds.append(self.allocator, @intCast(perf_fd));
+            try self.perf_fds.append(@intCast(perf_fd));
 
             // Memory map the perf buffer
             const mmap_size = 8 * 4096; // 8 pages: 1 metadata + 7 data

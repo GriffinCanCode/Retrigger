@@ -99,7 +99,7 @@ pub const LinuxWatcher = struct {
         const ebpf_manager = ebpf.EBPFManager.init(allocator);
         const ebpf_enabled = true; // Could be configurable
 
-        const self = Self{
+        var self = Self{
             .inotify_fd = @intCast(inotify_fd),
             .fanotify_fd = @intCast(fanotify_fd),
             .epoll_fd = @intCast(epoll_fd),
@@ -211,7 +211,10 @@ pub const LinuxWatcher = struct {
                 var path_buffer: [c.PATH_MAX]u8 = undefined;
                 const full_path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ base_path, entry.name });
 
-                const wd = linux.inotify_add_watch(self.inotify_fd, full_path.ptr, mask);
+                // Create null-terminated string for inotify_add_watch
+                const full_path_z = try self.path_allocator.dupeZ(u8, full_path);
+                defer self.path_allocator.free(full_path_z);
+                const wd = linux.inotify_add_watch(self.inotify_fd, full_path_z.ptr, mask);
                 if (wd >= 0) {
                     const owned_path = try self.path_allocator.dupe(u8, full_path);
                     try self.watch_descriptors.put(owned_path, @intCast(wd));

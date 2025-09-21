@@ -220,9 +220,9 @@ pub const PerformanceOptimizer = struct {
             }
         }
 
-        if (linux.sched_setaffinity(0, @sizeOf(linux.cpu_set_t), &cpu_set) != 0) {
+        linux.sched_setaffinity(0, &cpu_set) catch {
             return error.SetAffinityFailed;
-        }
+        };
 
         std.log.info("CPU affinity set successfully", .{});
     }
@@ -245,7 +245,7 @@ pub const PerformanceOptimizer = struct {
             }
         }
 
-        _ = linux.sched_setaffinity(0, @sizeOf(linux.cpu_set_t), &cpu_set);
+        _ = linux.sched_setaffinity(0, &cpu_set) catch {};
     }
 
     /// Set real-time FIFO scheduler (requires root privileges)
@@ -255,7 +255,7 @@ pub const PerformanceOptimizer = struct {
 
         var param: linux.sched_param = std.mem.zeroes(linux.sched_param);
         param.priority = 50; // High RT priority
-        if (linux.sched_setscheduler(0, linux.SCHED.FIFO, &param) != 0) {
+        if (linux.sched_setscheduler(0, 1, &param) != 0) { // SCHED_FIFO = 1
             return error.SetSchedulerFailed;
         }
 
