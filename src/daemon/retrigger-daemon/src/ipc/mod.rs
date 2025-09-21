@@ -588,7 +588,7 @@ impl Drop for ZeroCopyRing {
         self.shutdown();
 
         // Close eventfd if open
-        if let Some(_fd) = self.notifications_fd {
+        if let Some(fd) = self.notifications_fd {
             #[cfg(target_os = "linux")]
             unsafe {
                 if libc::close(fd) != 0 {
