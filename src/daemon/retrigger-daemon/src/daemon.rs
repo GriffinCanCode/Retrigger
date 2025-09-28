@@ -61,8 +61,15 @@ impl Daemon {
         let config = config_manager.get_config().await;
 
         // Initialize core components
-        let system_watcher =
-            Arc::new(SystemWatcher::new().with_context(|| "Failed to create system watcher")?);
+        let mut system_watcher =
+            SystemWatcher::new().with_context(|| "Failed to create system watcher")?;
+
+        // Apply config patterns to system watcher
+        system_watcher.update_event_filter(
+            config.patterns.include.clone(),
+            config.patterns.exclude.clone(),
+        );
+        let system_watcher = Arc::new(system_watcher);
 
         // Initialize enhanced event processor with hierarchical caching built-in
         let event_processor = Arc::new(FileEventProcessor::new());

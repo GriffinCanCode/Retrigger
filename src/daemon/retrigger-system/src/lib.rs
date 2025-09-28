@@ -520,6 +520,13 @@ impl SystemWatcher {
         self.event_sender.subscribe()
     }
 
+    /// Update event filter from config patterns
+    pub fn update_event_filter(&mut self, include_patterns: Vec<String>, exclude_patterns: Vec<String>) {
+        info!("SystemWatcher: Updating event filters - include: {:?}, exclude: {:?}", include_patterns, exclude_patterns);
+        self.event_filter.include_patterns = include_patterns;
+        self.event_filter.exclude_patterns = exclude_patterns;
+    }
+
     /// Poll for events manually (non-blocking)
     pub async fn poll_events(&self) -> Result<Vec<SystemEvent>> {
         if self.watcher.is_null() {
