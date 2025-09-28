@@ -1,6 +1,6 @@
 {
   "name": "@retrigger/core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Ultra-fast file system watcher with native performance for Node.js development tools",
   "main": "index.js",
   "types": "types/index.d.ts",

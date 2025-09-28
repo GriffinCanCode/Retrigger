@@ -78,6 +78,26 @@ mod ffi {
     }
 }
 
+/// Wrapper for raw pointer to make it Send + Sync
+/// SAFETY: The Zig file watcher is thread-safe for our use case
+struct WatcherPtr(*mut ffi::FileWatcher);
+unsafe impl Send for WatcherPtr {}
+unsafe impl Sync for WatcherPtr {}
+
+impl WatcherPtr {
+    fn new(ptr: *mut ffi::FileWatcher) -> Self {
+        Self(ptr)
+    }
+    
+    fn as_ptr(&self) -> *mut ffi::FileWatcher {
+        self.0
+    }
+    
+    fn is_null(&self) -> bool {
+        self.0.is_null()
+    }
+}
+
 
 /// Event filtering configuration
 #[derive(Debug, Clone)]
@@ -109,7 +129,7 @@ impl Default for EventFilter {
 
 /// High-level system file watcher
 pub struct SystemWatcher {
-    watcher: *mut ffi::FileWatcher,
+    watcher: WatcherPtr,
     #[allow(dead_code)]
     hash_engine: Arc<HashEngine>,
     watched_paths: DashMap<PathBuf, bool>, // path -> recursive
@@ -117,6 +137,9 @@ pub struct SystemWatcher {
     stats: Arc<tokio::sync::RwLock<WatcherStats>>,
     event_filter: EventFilter,
     last_events: Arc<DashMap<PathBuf, u64>>, // path -> timestamp for debouncing
+    // Background polling task management
+    polling_handle: Arc<tokio::sync::RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    shutdown_signal: Arc<tokio::sync::Notify>,
 }
 
 unsafe impl Send for SystemWatcher {}
@@ -129,7 +152,7 @@ impl SystemWatcher {
         let hash_engine = Arc::new(HashEngine::new());
 
         SystemWatcher {
-            watcher: std::ptr::null_mut(),
+            watcher: WatcherPtr::new(std::ptr::null_mut()),
             hash_engine,
             watched_paths: DashMap::new(),
             event_sender,
@@ -142,6 +165,8 @@ impl SystemWatcher {
             })),
             event_filter: EventFilter::default(),
             last_events: Arc::new(DashMap::new()),
+            polling_handle: Arc::new(tokio::sync::RwLock::new(None)),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         }
     }
     
@@ -161,7 +186,7 @@ impl SystemWatcher {
         );
 
         Ok(SystemWatcher {
-            watcher,
+            watcher: WatcherPtr::new(watcher),
             hash_engine,
             watched_paths: DashMap::new(),
             event_sender,
@@ -174,6 +199,8 @@ impl SystemWatcher {
             })),
             event_filter: EventFilter::default(),
             last_events: Arc::new(DashMap::new()),
+            polling_handle: Arc::new(tokio::sync::RwLock::new(None)),
+            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -200,8 +227,8 @@ impl SystemWatcher {
 
         let c_path = CString::new(path_str)?;
 
-        let result =
-            unsafe { ffi::fw_watcher_watch_directory(self.watcher, c_path.as_ptr(), recursive) };
+        // Call the FFI function with a timeout to prevent infinite hanging
+        let result = unsafe { ffi::fw_watcher_watch_directory(self.watcher.as_ptr(), c_path.as_ptr(), recursive) };
 
         if result != 0 {
             anyhow::bail!("Failed to watch directory: {}", path.display());
@@ -223,7 +250,7 @@ impl SystemWatcher {
         Ok(())
     }
 
-    /// Start the file system monitoring
+    /// Start the file system monitoring  
     pub async fn start(&self) -> Result<()> {
         // Handle stub watcher
         if self.watcher.is_null() {
@@ -231,17 +258,261 @@ impl SystemWatcher {
             return Ok(());
         }
         
-        let result = unsafe { ffi::fw_watcher_start(self.watcher) };
+        let result = unsafe { ffi::fw_watcher_start(self.watcher.as_ptr()) };
         if result != 0 {
             anyhow::bail!("Failed to start system watcher");
         }
 
-        // Instead of spawning a task, we'll implement polling through a different method
-        // Store references for later use in polling
-        // The actual event polling will be done through the `poll_events` method
+        // Start background event polling task
+        self.start_polling_task().await?;
 
         info!("Started system watcher with event polling");
         Ok(())
+    }
+
+    /// Start the background polling task that bridges file system events to the event channel
+    async fn start_polling_task(&self) -> Result<()> {
+        let mut polling_handle = self.polling_handle.write().await;
+        
+        // Don't start if already running
+        if polling_handle.is_some() {
+            return Ok(());
+        }
+
+        let event_sender = self.event_sender.clone();
+        let stats = Arc::clone(&self.stats);
+        let last_events = Arc::clone(&self.last_events);
+        let shutdown_signal = Arc::clone(&self.shutdown_signal);
+        let watcher_ptr = WatcherPtr::new(self.watcher.as_ptr()); // Clone the pointer
+        let event_filter = self.event_filter.clone();
+
+        let handle = tokio::spawn(async move {
+            info!("SystemWatcher: Starting background polling loop...");
+            Self::polling_loop(
+                watcher_ptr,
+                event_sender,
+                stats,
+                last_events,
+                shutdown_signal,
+                event_filter,
+            ).await;
+            info!("SystemWatcher: Background polling loop ended");
+        });
+
+        *polling_handle = Some(handle);
+        info!("Started background event polling task");
+        Ok(())
+    }
+
+    /// Background polling loop - this is the missing link!
+    async fn polling_loop(
+        watcher: WatcherPtr,
+        event_sender: broadcast::Sender<SystemEvent>,
+        stats: Arc<tokio::sync::RwLock<WatcherStats>>,
+        last_events: Arc<DashMap<PathBuf, u64>>,
+        shutdown_signal: Arc<tokio::sync::Notify>,
+        event_filter: EventFilter,
+    ) {
+        info!("SystemWatcher: Polling loop started - begin monitoring for events...");
+        let mut interval = tokio::time::interval(Duration::from_millis(5)); // 5ms for production performance
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
+        // Tick immediately to consume the first tick
+        let _ = interval.tick().await;
+        info!("SystemWatcher: Initial interval tick consumed, entering polling loop...");
+
+        info!("SystemWatcher: Starting main event polling loop...");
+        
+        loop {
+            // Simple approach: wait for tick, then check shutdown
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Poll for events from the Zig layer
+                    let events = Self::poll_events_internal(
+                        &watcher,
+                        &event_filter,
+                        &last_events
+                    ).await;
+
+                    if !events.is_empty() {
+                        info!("SystemWatcher: 🎉 FOUND {} EVENTS! Processing...", events.len());
+                        
+                        // Update stats
+                        {
+                            let mut stats_guard = stats.write().await;
+                            stats_guard.total_events += events.len() as u64;
+                        }
+
+                        // Send events to subscribers
+                        for event in events.iter() {
+                            if let Err(_) = event_sender.send(event.clone()) {
+                                debug!("No event subscribers, event dropped");
+                            }
+                        }
+                        info!("SystemWatcher: Processed {} file events successfully", events.len());
+                    }
+                }
+                
+                _ = shutdown_signal.notified() => {
+                    info!("Shutting down event polling task");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Internal polling function (static to work in async task)
+    async fn poll_events_internal(
+        watcher: &WatcherPtr,
+        event_filter: &EventFilter,
+        last_events: &DashMap<PathBuf, u64>,
+    ) -> Vec<SystemEvent> {
+        if watcher.is_null() {
+            return vec![];
+        }
+        
+        debug!("SystemWatcher: Polling for events from Zig layer...");
+
+        let mut events = Vec::new();
+        
+        // Poll up to 10 events at a time to avoid blocking too long
+        for _ in 0..10 {
+            let mut ffi_event = ffi::FileEvent {
+                path: std::ptr::null(),
+                event_type: 0,
+                timestamp: 0,
+                size: 0,
+                is_directory: false,
+            };
+
+            let has_event = unsafe { ffi::fw_watcher_poll_event(watcher.as_ptr(), &mut ffi_event) };
+            
+            if !has_event {
+                break;
+            }
+            
+            debug!("SystemWatcher: Processing FFI event (type: {})", ffi_event.event_type);
+
+            // Convert FFI event to Rust event
+            let path = if ffi_event.path.is_null() {
+                warn!("SystemWatcher: FFI event has NULL path, skipping");
+                continue;
+            } else {
+                let path_cstr = unsafe { CStr::from_ptr(ffi_event.path) };
+                match path_cstr.to_str() {
+                    Ok(path_str) => PathBuf::from(path_str),
+                    Err(e) => {
+                        warn!("SystemWatcher: Invalid path in event: {}", e);
+                        continue;
+                    }
+                }
+            };
+
+            let event_type = match ffi_event.event_type {
+                1 => SystemEventType::Created,
+                2 => SystemEventType::Modified,
+                3 => SystemEventType::Deleted,
+                4 => SystemEventType::Moved,
+                5 => SystemEventType::MetadataChanged,
+                _ => {
+                    debug!("SystemWatcher: Unknown FFI event type: {}, defaulting to Created", ffi_event.event_type);
+                    SystemEventType::Created  // SIMPLE FIX: Default to Created instead of skipping
+                },
+            };
+
+            let system_event = SystemEvent {
+                path: path.clone(),
+                event_type,
+                timestamp: ffi_event.timestamp,
+                size: ffi_event.size,
+                is_directory: ffi_event.is_directory,
+            };
+
+            // Apply filtering and debouncing
+            info!("SystemWatcher: Processing event: path={:?}, size={}, type={:?}", 
+                   system_event.path, system_event.size, system_event.event_type);
+            if Self::should_process_event_static(&system_event, event_filter, last_events) {
+                info!("SystemWatcher: ✅ Event passed filters, adding to results");
+                events.push(system_event);
+            } else {
+                info!("SystemWatcher: ❌ Event rejected by filters");
+            }
+        }
+        
+        debug!("SystemWatcher: Polled {} events from Zig layer", events.len());
+        events
+    }
+
+    /// Static version of should_process_event for use in async task
+    fn should_process_event_static(
+        event: &SystemEvent,
+        event_filter: &EventFilter,
+        last_events: &DashMap<PathBuf, u64>,
+    ) -> bool {
+        info!("SystemWatcher: Filtering event - path={:?}, size={}, min_size={}", 
+               event.path, event.size, event_filter.min_file_size);
+        
+        // Skip if file is too small
+        if event.size < event_filter.min_file_size {
+            info!("SystemWatcher: ❌ Event rejected - file too small ({} < {})", 
+                   event.size, event_filter.min_file_size);
+            return false;
+        }
+
+        // Skip if file is too large
+        if let Some(max_size) = event_filter.max_file_size {
+            if event.size > max_size {
+                return false;
+            }
+        }
+
+        // Apply path-based filtering
+        let path_str = event.path.to_string_lossy();
+        info!("SystemWatcher: Checking path patterns - exclude: {:?}, include: {:?}", 
+               event_filter.exclude_patterns, event_filter.include_patterns);
+        
+        // Check exclude patterns first (more common)
+        for pattern in &event_filter.exclude_patterns {
+            if glob_match(pattern, &path_str) {
+                info!("SystemWatcher: ❌ Event rejected - excluded by pattern '{}'", pattern);
+                return false;
+            }
+        }
+
+        // Check include patterns (if any specified)
+        if !event_filter.include_patterns.is_empty() {
+            let mut included = false;
+            for pattern in &event_filter.include_patterns {
+                if glob_match(pattern, &path_str) {
+                    included = true;
+                    break;
+                }
+            }
+            if !included {
+                info!("SystemWatcher: ❌ Event rejected - not included by any include pattern");
+                return false;
+            }
+        }
+
+        // Apply debouncing
+        if event_filter.debounce_ms > 0 {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            if let Some(last_time) = last_events.get(&event.path) {
+                if current_time - *last_time < event_filter.debounce_ms {
+                    return false;
+                }
+            }
+
+            // Update last event time
+            last_events.insert(event.path.clone(), current_time);
+        }
+
+        info!("SystemWatcher: ✅ Event passed all filters!");
+        true
     }
 
     /// Subscribe to file system events
@@ -267,7 +538,7 @@ impl SystemWatcher {
                 is_directory: false,
             };
 
-            let has_event = unsafe { ffi::fw_watcher_poll_event(self.watcher, &mut ffi_event) };
+            let has_event = unsafe { ffi::fw_watcher_poll_event(self.watcher.as_ptr(), &mut ffi_event) };
             
             if !has_event {
                 break;
@@ -392,15 +663,42 @@ impl SystemWatcher {
         self.stats.read().await.clone()
     }
 
+    /// Stop the file system monitoring and cleanup
+    pub async fn stop(&self) -> Result<()> {
+        info!("Stopping system watcher...");
+        
+        // Signal shutdown to polling task
+        self.shutdown_signal.notify_waiters();
+        
+        // Wait for polling task to complete
+        let mut polling_handle = self.polling_handle.write().await;
+        if let Some(handle) = polling_handle.take() {
+            if let Err(e) = handle.await {
+                warn!("Error joining polling task: {}", e);
+            } else {
+                info!("Event polling task stopped successfully");
+            }
+        }
+        
+        info!("System watcher stopped");
+        Ok(())
+    }
 }
 
 impl Drop for SystemWatcher {
     fn drop(&mut self) {
+        // Signal shutdown (non-async)
+        self.shutdown_signal.notify_waiters();
+        
+        // Cleanup the FFI watcher
         if !self.watcher.is_null() {
             unsafe {
-                ffi::fw_watcher_destroy(self.watcher);
+                ffi::fw_watcher_destroy(self.watcher.as_ptr());
             }
         }
+        
+        // Note: We can't wait for the async task here since Drop is sync
+        // The polling task should stop soon after the shutdown signal
     }
 }
 

@@ -72,6 +72,9 @@ pub const LinuxWatcher = struct {
     monitor_thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
 
+    // Event buffer reference
+    event_buffer: ?*EventRingBuffer,
+
     pub fn init(allocator: std.mem.Allocator) !Self {
         // Initialize inotify
         const inotify_fd = linux.inotify_init1(linux.IN.CLOEXEC | linux.IN.NONBLOCK);
@@ -113,6 +116,7 @@ pub const LinuxWatcher = struct {
             .total_events = std.atomic.Value(u64).init(0),
             .monitor_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
+            .event_buffer = null,
         };
 
         // Add file descriptors to epoll
@@ -164,6 +168,8 @@ pub const LinuxWatcher = struct {
     }
 
     pub fn watch_directory(self: *Self, path: []const u8, recursive: bool, event_buffer: *EventRingBuffer) !void {
+        // Store reference to event buffer for use in event processing
+        self.event_buffer = event_buffer;
         // Use inotify for directory watching
         const mask = linux.IN.CREATE | linux.IN.DELETE | linux.IN.MODIFY |
             linux.IN.MOVED_FROM | linux.IN.MOVED_TO | linux.IN.ATTRIB;
@@ -246,7 +252,12 @@ pub const LinuxWatcher = struct {
             };
         }
 
-        self.monitor_thread = try std.Thread.spawn(.{}, monitor_thread_fn, .{self});
+        // For now, just mark as ready to monitor - actual monitoring happens via polling
+        // This prevents blocking the Rust async runtime
+        std.log.info("Linux monitoring setup completed (polling mode)", .{});
+
+        // TODO: Implement background thread monitoring if needed
+        // self.monitor_thread = try std.Thread.spawn(.{}, monitor_thread_fn, .{self});
     }
 
     pub fn stop_monitoring(self: *Self) void {
@@ -411,11 +422,21 @@ pub const LinuxWatcher = struct {
             .is_directory = is_directory,
         };
 
-        // Try to emit to ring buffer
-        // Note: In a real implementation, we'd need access to the event buffer
-        // For now, just count the event
-        _ = event;
-        self.total_events.fetchAdd(1, .acq_rel);
+        // Push event to ring buffer for Rust consumption
+        if (self.event_buffer) |buffer| {
+            if (buffer.push(event)) {
+                self.total_events.fetchAdd(1, .acq_rel);
+            } else {
+                // Buffer full - count as dropped
+                self.dropped_events.fetchAdd(1, .acq_rel);
+                // Free the allocated path since event wasn't consumed
+                self.path_allocator.free(event.path);
+            }
+        } else {
+            // No buffer available - count as dropped
+            self.dropped_events.fetchAdd(1, .acq_rel);
+            self.path_allocator.free(event.path);
+        }
     }
 
     /// Process individual fanotify file event
@@ -471,9 +492,21 @@ pub const LinuxWatcher = struct {
             .is_directory = is_directory,
         };
 
-        // Emit to ring buffer (would need access to event buffer)
-        _ = event;
-        self.total_events.fetchAdd(1, .acq_rel);
+        // Push event to ring buffer for Rust consumption
+        if (self.event_buffer) |buffer| {
+            if (buffer.push(event)) {
+                self.total_events.fetchAdd(1, .acq_rel);
+            } else {
+                // Buffer full - count as dropped
+                self.dropped_events.fetchAdd(1, .acq_rel);
+                // Free the allocated path since event wasn't consumed
+                self.path_allocator.free(event.path);
+            }
+        } else {
+            // No buffer available - count as dropped
+            self.dropped_events.fetchAdd(1, .acq_rel);
+            self.path_allocator.free(event.path);
+        }
     }
 
     /// Get file size asynchronously using io_uring with zero-copy optimization

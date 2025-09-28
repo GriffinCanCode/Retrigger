@@ -1,0 +1,147 @@
+{
+  "timestamp": "2025-09-21T22:21:10.751Z",
+  "hashResults": {
+    "success": true,
+    "simdLevel": "Neon",
+    "testedSizes": [
+      1024,
+      10240,
+      102400,
+      1024000
+    ]
+  },
+  "watcherResults": {
+    "small": {
+      "chokidar": {
+        "success": true,
+        "eventsReceived": 20,
+        "expectedEvents": 20,
+        "totalTimeMs": 0.8448749999999947,
+        "firstEventLatencyMs": 0.482999999999997,
+        "avgLatencyMs": 0.04224374999999973,
+        "eventsPerSecond": 23672.1408492382,
+        "avgMemoryMB": 0,
+        "peakMemoryMB": 0,
+        "samples": 0
+      },
+      "parcel-watcher": {
+        "success": true,
+        "eventsReceived": 20,
+        "expectedEvents": 20,
+        "totalTimeMs": 3.15625,
+        "firstEventLatencyMs": 3.1458749999999895,
+        "avgLatencyMs": 0.1578125,
+        "eventsPerSecond": 6336.633663366336,
+        "avgMemoryMB": 57.95703125,
+        "peakMemoryMB": 57.96875,
+        "samples": 4
+      },
+      "node-fs-watch": {
+        "success": true,
+        "eventsReceived": 20,
+        "expectedEvents": 20,
+        "totalTimeMs": 0.9458750000000009,
+        "firstEventLatencyMs": 0.8530420000000163,
+        "avgLatencyMs": 0.047293750000000044,
+        "eventsPerSecond": 21144.44297608033,
+        "avgMemoryMB": 58.0546875,
+        "peakMemoryMB": 58.0625,
+        "samples": 2
+      }
+    },
+    "medium": {
+      "chokidar": {
+        "success": true,
+        "eventsReceived": 20,
+        "expectedEvents": 20,
+        "totalTimeMs": 0.6384160000000065,
+        "firstEventLatencyMs": 0.3285830000000374,
+        "avgLatencyMs": 0.031920800000000325,
+        "eventsPerSecond": 31327.535650735248,
+        "avgMemoryMB": 0,
+        "peakMemoryMB": 0,
+        "samples": 0
+      },
+      "parcel-watcher": {
+        "success": true,
+        "eventsReceived": 20,
+        "expectedEvents": 20,
+        "totalTimeMs": 58.03595800000005,
+        "firstEventLatencyMs": 58.033041000000026,
+        "avgLatencyMs": 2.9017979000000027,
+        "eventsPerSecond": 344.61393744891717,
+        "avgMemoryMB": 73.05,
+        "peakMemoryMB": 73.109375,
+        "samples": 5
+      },
+      "node-fs-watch": {
+        "success": true,
+        "eventsReceived": 20,
+        "expectedEvents": 20,
+        "totalTimeMs": 0.43716700000004494,
+        "firstEventLatencyMs": 0.30262500000003456,
+        "avgLatencyMs": 0.021858350000002247,
+        "eventsPerSecond": 45749.10732053871,
+        "avgMemoryMB": 73.03125,
+        "peakMemoryMB": 73.03125,
+        "samples": 2
+      }
+    },
+    "large": {
+      "chokidar": {
+        "success": true,
+        "eventsReceived": 20,
+        "expectedEvents": 20,
+        "totalTimeMs": 0.3710829999999987,
+        "firstEventLatencyMs": 0.20166700000004312,
+        "avgLatencyMs": 0.018554149999999936,
+        "eventsPerSecond": 53896.29813276294,
+        "avgMemoryMB": 104.953125,
+        "peakMemoryMB": 104.953125,
+        "samples": 1
+      },
+      "parcel-watcher": {
+        "success": true,
+        "eventsReceived": 38,
+        "expectedEvents": 20,
+        "totalTimeMs": 56.20445800000016,
+        "firstEventLatencyMs": -54.038249999999834,
+        "avgLatencyMs": 1.4790646842105304,
+        "eventsPerSecond": 676.1029525451503,
+        "avgMemoryMB": 105.35625,
+        "peakMemoryMB": 105.375,
+        "samples": 5
+      },
+      "node-fs-watch": {
+        "success": true,
+        "eventsReceived": 20,
+        "expectedEvents": 20,
+        "totalTimeMs": 0.3890409999999065,
+        "firstEventLatencyMs": 0.2268749999998363,
+        "avgLatencyMs": 0.019452049999995325,
+        "eventsPerSecond": 51408.46337533784,
+        "avgMemoryMB": 105.34375,
+        "peakMemoryMB": 105.34375,
+        "samples": 2
+      }
+    }
+  },
+  "summary": {
+    "retriggerFileWatcherWorking": false,
+    "hashEngineWorking": true,
+    "competitorLatencies": {
+      "chokidar": {
+        "firstMs": 0.482999999999997,
+        "avgMs": 0.04224374999999973
+      },
+      "parcel-watcher": {
+        "firstMs": 3.1458749999999895,
+        "avgMs": 0.1578125
+      },
+      "node-fs-watch": {
+        "firstMs": 0.8530420000000163,
+        "avgMs": 0.047293750000000044
+      }
+    }
+  }
+}

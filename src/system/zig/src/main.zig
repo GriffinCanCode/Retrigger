@@ -69,21 +69,31 @@ pub const EventRingBuffer = struct {
     pub fn push(self: *EventRingBuffer, event: FileEvent) bool {
         const current_write = self.write_pos.load(.acquire);
         const next_write = (current_write + 1) % MAX_EVENTS;
+        const current_read = self.read_pos.load(.acquire);
+
+        std.log.info("EventRingBuffer: push attempt - write_pos={}, read_pos={}, next_write={}", .{ current_write, current_read, next_write });
 
         // Check if buffer is full
-        if (next_write == self.read_pos.load(.acquire)) {
+        if (next_write == current_read) {
+            std.log.warn("EventRingBuffer: BUFFER FULL - cannot push event", .{});
             return false; // Buffer full
         }
 
         self.events[current_write] = event;
         self.write_pos.store(next_write, .release);
+        std.log.info("EventRingBuffer: ✅ Successfully pushed event, new write_pos={}", .{next_write});
         return true;
     }
 
     /// Lock-free pop (consumer)
     pub fn pop(self: *EventRingBuffer) ?FileEvent {
         const current_read = self.read_pos.load(.acquire);
-        if (current_read == self.write_pos.load(.acquire)) {
+        const current_write = self.write_pos.load(.acquire);
+
+        std.log.info("EventRingBuffer: pop attempt - read_pos={}, write_pos={}", .{ current_read, current_write });
+
+        if (current_read == current_write) {
+            std.log.info("EventRingBuffer: ❌ Buffer is empty, no events to pop", .{});
             return null; // Buffer empty
         }
 
@@ -91,6 +101,7 @@ pub const EventRingBuffer = struct {
         const next_read = (current_read + 1) % MAX_EVENTS;
         self.read_pos.store(next_read, .release);
 
+        std.log.info("EventRingBuffer: ✅ Successfully popped event, new read_pos={}", .{next_read});
         return event;
     }
 
@@ -348,8 +359,8 @@ pub const FileWatcher = struct {
 
 /// C API for integration with Rust
 export fn fw_watcher_create() ?*FileWatcher {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    // Use a page allocator instead of GPA to avoid potential issues
+    const allocator = std.heap.page_allocator;
 
     const watcher = allocator.create(FileWatcher) catch return null;
     watcher.* = FileWatcher.init(allocator) catch {
@@ -379,9 +390,11 @@ export fn fw_watcher_start(watcher: *FileWatcher) c_int {
 
 export fn fw_watcher_poll_event(watcher: *FileWatcher, out_event: *FileEvent) bool {
     if (watcher.poll_event()) |event| {
+        std.log.info("fw_watcher_poll_event: ✅ Returning event to Rust: path={s}, type={}, size={}", .{ event.path, event.event_type, event.size });
         out_event.* = event;
         return true;
     }
+    std.log.info("fw_watcher_poll_event: ❌ No event available for Rust", .{});
     return false;
 }
 
@@ -401,7 +414,7 @@ test "EventRingBuffer basic operations" {
     const event = FileEvent{
         .path = test_path,
         .event_type = .created,
-        .timestamp = std.time.nanoTimestamp(),
+        .timestamp = @intCast(std.time.nanoTimestamp()),
         .size = 1024,
         .is_directory = false,
     };

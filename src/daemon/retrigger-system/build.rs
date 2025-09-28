@@ -39,7 +39,7 @@ fn main() {
     // Link the Zig library
     let zig_lib_dir = zig_dir.join("zig-out/lib");
     println!("cargo:rustc-link-search=native={}", zig_lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=retrigger_system");
+    println!("cargo:rustc-link-lib=static=retrigger_system");
 
     // Platform-specific libraries
     if cfg!(target_os = "linux") {

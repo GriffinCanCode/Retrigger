@@ -119,29 +119,39 @@ impl Daemon {
         let config = self.config_manager.get_config().await;
 
         // Setup initial watch directories
+        info!("Setting up {} watch directories", config.watcher.watch_paths.len());
         for watch_path in &config.watcher.watch_paths {
             if watch_path.enabled {
+                info!("Watching directory: {} (recursive: {})", watch_path.path.display(), watch_path.recursive);
                 self.system_watcher
                     .watch_directory(&watch_path.path, watch_path.recursive)
                     .await
                     .with_context(|| {
                         format!("Failed to watch directory: {}", watch_path.path.display())
                     })?;
+                info!("Successfully watching: {}", watch_path.path.display());
             }
         }
+        info!("Completed watch directory setup");
 
         // Start core services
+        info!("Starting core services...");
         self.start_event_processor().await?;
         self.start_metrics_collector().await?;
         self.start_config_monitor().await?;
         self.start_cache_maintenance().await?;
+        info!("Core services started");
 
         // Start system watcher
+        info!("Starting system watcher...");
         self.system_watcher.start().await?;
+        info!("System watcher started");
 
         // Start gRPC server
         if let Some(ref mut grpc_server) = self.grpc_server {
+            info!("Starting gRPC server...");
             grpc_server.start().await?;
+            info!("gRPC server started");
         }
 
         info!("Retrigger daemon started successfully");
@@ -166,14 +176,20 @@ impl Daemon {
 
     /// Start the event processing pipeline
     async fn start_event_processor(&self) -> Result<()> {
+        info!("🔄 Starting event processor - subscribing to SystemWatcher events...");
         let system_events = self.system_watcher.subscribe();
+        info!("🔄 Successfully subscribed to SystemWatcher event channel");
+        
         let event_processor = Arc::clone(&self.event_processor);
         let enhanced_sender = self.enhanced_event_sender.clone();
         let metrics = Arc::clone(&self.metrics_collector);
         let patterns = self.config_manager.get_patterns().await;
         let ipc_ring = self.ipc_ring.clone();
+        
+        info!("🔄 IPC ring buffer available: {}", ipc_ring.is_some());
 
         tokio::spawn(async move {
+            info!("🔄 Event processing task spawned - starting event loop...");
             Self::event_processing_loop(
                 system_events,
                 event_processor,
@@ -183,6 +199,7 @@ impl Daemon {
                 ipc_ring,
             )
             .await;
+            warn!("🔄 Event processing loop ended unexpectedly!");
         });
 
         info!("Started event processing pipeline");
@@ -198,20 +215,31 @@ impl Daemon {
         patterns: CompiledPatterns,
         ipc_ring: Option<Arc<ZeroCopyRing>>,
     ) {
+        info!("🔄 Event processing loop started - waiting for SystemWatcher events...");
         let mut batch = Vec::new();
         let batch_size = 100;
         let batch_timeout = Duration::from_millis(10);
 
         let mut interval = tokio::time::interval(batch_timeout);
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(2));
 
         loop {
             tokio::select! {
+                // Heartbeat to prove loop is alive
+                _ = heartbeat_interval.tick() => {
+                    info!("🔄 Event processing loop: HEARTBEAT - loop is alive and waiting for events");
+                }
+                
                 // Collect events into batch
                 event_result = system_events.recv() => {
+                    info!("🔄 Event processing loop: Trying to receive from SystemWatcher...");
                     match event_result {
                         Ok(event) => {
+                            info!("🎯 Event processing loop: ✅ RECEIVED SystemWatcher event: {:?}", event.path);
+                            
                             // Check if file should be processed based on patterns
                             if patterns.should_watch(&event.path) {
+                                info!("🎯 Event processing loop: Event APPROVED by patterns, adding to batch");
                                 batch.push(event);
 
                                 // Process batch if full
@@ -237,6 +265,7 @@ impl Daemon {
                 // Process batch on timeout
                 _ = interval.tick() => {
                     if !batch.is_empty() {
+                        info!("🎯 Event processing loop: BATCH TIMEOUT - processing {} events", batch.len());
                         Self::process_event_batch(
                             &batch,
                             &event_processor,
@@ -244,6 +273,7 @@ impl Daemon {
                             &metrics,
                             &ipc_ring,
                         ).await;
+                        info!("🎯 Event processing loop: BATCH PROCESSED - {} events sent to IPC", batch.len());
                         batch.clear();
                     }
                 }
@@ -266,9 +296,13 @@ impl Daemon {
                 Ok(enhanced_event) => {
                     // Send via zero-copy IPC if available
                     if let Some(ring) = ipc_ring.as_ref() {
-                        if !ring.push(&enhanced_event) {
-                            debug!("IPC ring buffer full, event dropped");
+                        if ring.push(&enhanced_event) {
+                            info!("🚀 Event processing: PUSHED to IPC ring buffer: {:?}", enhanced_event.system_event.path);
+                        } else {
+                            warn!("IPC ring buffer full, event dropped");
                         }
+                    } else {
+                        warn!("No IPC ring buffer available - events not delivered to external clients");
                     }
 
                     metrics.record_event(&enhanced_event);
@@ -395,6 +429,11 @@ impl Daemon {
 
         // Send shutdown signal to all components
         let _ = self.shutdown_sender.send(());
+
+        // Stop system watcher first
+        if let Err(e) = self.system_watcher.stop().await {
+            warn!("Error stopping system watcher: {}", e);
+        }
 
         // Stop gRPC server
         if let Some(grpc_server) = self.grpc_server {

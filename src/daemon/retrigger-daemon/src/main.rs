@@ -160,9 +160,10 @@ async fn start_daemon(args: StartArgs) -> Result<()> {
     ConfigManager::validate(&config)?;
 
     // Start hot-reload if config file exists
-    if args.config.exists() {
-        config_manager.start_hot_reload().await?;
-    }
+    // TEMPORARY: Disable hot-reload to debug startup hang
+    // if args.config.exists() {
+    //     config_manager.start_hot_reload().await?;
+    // }
 
     // Initialize metrics
     if config.server.enable_metrics {

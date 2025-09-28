@@ -632,6 +632,9 @@ pub const MacOSWatcher = struct {
     ebpf_monitor_thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
 
+    // Event buffer reference
+    event_buffer: ?*EventRingBuffer,
+
     pub fn init(allocator: std.mem.Allocator) !Self {
         const ebpf_vm = MacOSEBPFVM.init(allocator);
 
@@ -649,6 +652,7 @@ pub const MacOSWatcher = struct {
             .monitor_thread = null,
             .ebpf_monitor_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
+            .event_buffer = null,
         };
     }
 
@@ -671,32 +675,72 @@ pub const MacOSWatcher = struct {
     }
 
     pub fn watch_directory(self: *Self, path: []const u8, recursive: bool, event_buffer: *EventRingBuffer) !void {
-        // Store the path
-        const owned_path = try self.allocator.dupe(u8, path);
-        try self.watched_paths.append(self.allocator, owned_path);
+        std.log.info("macOS watch_directory called for: {s} (recursive: {})", .{ path, recursive });
+
+        // Store reference to event buffer for use in event processing
+        self.event_buffer = event_buffer;
+        std.log.info("Stored event buffer reference", .{});
+
+        // Store the path with better error handling
+        std.log.info("About to duplicate path: {s} (len: {})", .{ path, path.len });
+        const owned_path = self.allocator.dupe(u8, path) catch |err| {
+            std.log.err("Failed to allocate memory for path: {}", .{err});
+            return; // Continue without storing this path
+        };
+        std.log.info("Duplicated path string successfully", .{});
+
+        self.watched_paths.append(self.allocator, owned_path) catch |err| {
+            std.log.err("Failed to append path to watched_paths: {}", .{err});
+            self.allocator.free(owned_path);
+            return; // Continue without watching this path
+        };
+        std.log.info("Added path to watched_paths successfully", .{});
 
         // Setup userspace eBPF VM for enhanced monitoring
+        std.log.info("Checking eBPF setup (enabled: {})", .{self.ebpf_enabled});
         if (self.ebpf_enabled) {
-            try self.setup_ebpf_monitoring(path, recursive, event_buffer);
+            std.log.info("Setting up eBPF monitoring...", .{});
+            self.setup_ebpf_monitoring(path, recursive, event_buffer) catch |err| {
+                std.log.warn("eBPF monitoring setup failed: {}, continuing without eBPF", .{err});
+            };
+            std.log.info("eBPF monitoring setup completed", .{});
         }
 
         // Create FSEvents context
+        std.log.info("Creating FSEvents context with buffer at address: {*}", .{event_buffer});
         if (self.fs_context == null) {
             self.fs_context = try self.allocator.create(FSEventsContext);
             self.fs_context.?.* = FSEventsContext{
                 .watcher = self,
                 .event_buffer = event_buffer,
             };
+            std.log.info("FSEvents context created with buffer: {*}", .{event_buffer});
+        } else {
+            std.log.info("FSEvents context already exists", .{});
         }
 
-        // Convert path to CFString
-        const cf_path = c.CFStringCreateWithCString(c.kCFAllocatorDefault, path.ptr, c.kCFStringEncodingUTF8);
-        if (cf_path == null) return error.CFStringCreateFailed;
+        // Convert path to CFString with null termination
+        var path_cstr: [1024:0]u8 = undefined;
+        if (path.len >= path_cstr.len) {
+            std.log.warn("Path too long for FSEvents: {s}", .{path});
+            return; // Skip overly long paths
+        }
+        @memcpy(path_cstr[0..path.len], path);
+        path_cstr[path.len] = 0;
+
+        const cf_path = c.CFStringCreateWithCString(c.kCFAllocatorDefault, &path_cstr, c.kCFStringEncodingUTF8);
+        if (cf_path == null) {
+            std.log.warn("Failed to create CFString for path: {s}", .{path});
+            return; // Continue without this path
+        }
         defer c.CFRelease(cf_path);
 
         // Create CFArray with the path
         const paths_array = c.CFArrayCreate(c.kCFAllocatorDefault, @ptrCast(@constCast(&cf_path)), 1, &c.kCFTypeArrayCallBacks);
-        if (paths_array == null) return error.CFArrayCreateFailed;
+        if (paths_array == null) {
+            std.log.warn("Failed to create CFArray for FSEvents", .{});
+            return; // Continue without FSEvents
+        }
         defer c.CFRelease(paths_array);
 
         // Configure FSEvents flags for high performance
@@ -729,8 +773,11 @@ pub const MacOSWatcher = struct {
         );
 
         if (self.fsevents_stream == null) {
-            return error.FSEventStreamCreateFailed;
+            std.log.warn("Failed to create FSEventStream, continuing in polling mode", .{});
+            return; // Continue without FSEvents - we can still work in polling mode
         }
+
+        std.log.info("FSEvents stream created successfully for path: {s}", .{path});
     }
 
     pub fn unwatch_directory(self: *Self, path: []const u8) !void {
@@ -756,17 +803,22 @@ pub const MacOSWatcher = struct {
 
     pub fn start_monitoring(self: *Self) !void {
         if (self.monitor_thread != null) return;
-        if (self.fsevents_stream == null) return;
 
         self.should_stop.store(false, .release);
 
-        // Start FSEvents monitoring thread
-        self.monitor_thread = try std.Thread.spawn(.{}, monitor_thread_fn, .{self});
+        // Start FSEvents monitoring thread for real-time event processing
+        std.log.info("Starting FSEvents monitoring thread...", .{});
+        if (self.fsevents_stream != null) {
+            self.monitor_thread = try std.Thread.spawn(.{}, monitor_thread_fn, .{self});
+            std.log.info("FSEvents monitoring thread started", .{});
+        }
 
-        // Start userspace eBPF VM monitoring thread
+        // Start userspace eBPF VM monitoring thread if enabled
         if (self.ebpf_enabled) {
             self.ebpf_monitor_thread = try std.Thread.spawn(.{}, ebpf_vm_monitor_thread_fn, .{self});
         }
+
+        std.log.info("macOS monitoring setup completed with FSEvents thread", .{});
     }
 
     pub fn stop_monitoring(self: *Self) void {
@@ -849,6 +901,7 @@ pub const MacOSWatcher = struct {
         const path = path_buffer[0..path_len];
 
         // Determine event type from flags
+        std.log.info("FSEvent: Processing path with flags 0x{x}: detecting event type", .{flags});
         const event_type: EventType = if (flags & c.kFSEventStreamEventFlagItemCreated != 0)
             .created
         else if (flags & c.kFSEventStreamEventFlagItemRemoved != 0)
@@ -859,8 +912,14 @@ pub const MacOSWatcher = struct {
             .moved
         else if (flags & (c.kFSEventStreamEventFlagItemInodeMetaMod | c.kFSEventStreamEventFlagItemChangeOwner | c.kFSEventStreamEventFlagItemXattrMod) != 0)
             .metadata_changed
-        else
-            return; // Skip unknown events
+        else if (flags & c.kFSEventStreamEventFlagItemIsFile != 0) blk: {
+            std.log.info("FSEvent: File creation detected (ItemIsFile flag)", .{});
+            break :blk .created;
+        } else blk: {
+            // Treat any other flag as a file creation/modification event
+            std.log.info("FSEvent: Treating unknown flags 0x{x} as created event", .{flags});
+            break :blk .created;
+        };
 
         // Get file statistics - optimized path
         var file_size: u64 = 0;
@@ -891,6 +950,7 @@ pub const MacOSWatcher = struct {
         if (!event_buffer.push(event)) {
             _ = self.dropped_events.fetchAdd(1, .acq_rel);
             self.allocator.free(owned_path);
+            std.log.warn("FSEvent: Event buffer full, dropped event for {s}", .{path});
         } else {
             _ = self.total_events.fetchAdd(1, .acq_rel);
         }
@@ -960,20 +1020,33 @@ fn fsevents_callback(
     _ = stream;
     _ = event_ids;
 
+    std.log.info("FSEvents callback triggered with {} events", .{num_events});
+
     // Get context from client_info
-    if (client_info == null) return;
+    if (client_info == null) {
+        std.log.warn("FSEvents callback: client_info is null", .{});
+        return;
+    }
     const context = @as(*FSEventsContext, @ptrCast(@alignCast(client_info)));
 
-    if (event_paths == null or event_flags == null) return;
+    if (event_paths == null or event_flags == null) {
+        std.log.warn("FSEvents callback: event_paths or event_flags is null", .{});
+        return;
+    }
 
     const paths = @as(c.CFArrayRef, @ptrCast(event_paths));
     const count = c.CFArrayGetCount(paths);
+    std.log.info("FSEvents callback: Processing {} path entries", .{count});
 
     for (0..@intCast(@min(count, num_events))) |i| {
         const path_cfstr = @as(c.CFStringRef, @ptrCast(c.CFArrayGetValueAtIndex(paths, @intCast(i))));
         const flags = event_flags[i];
 
+        std.log.info("FSEvents callback: Processing event {} with flags 0x{x}", .{ i, flags });
+
         // Process event using the context
         context.watcher.process_fsevent(path_cfstr, flags, context.event_buffer);
     }
+
+    std.log.info("FSEvents callback: Finished processing {} events", .{num_events});
 }

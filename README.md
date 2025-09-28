@@ -2,28 +2,32 @@
 
 **High-Performance File System Watcher for Modern Development Workflows**
 
-Retrigger is a native file system monitoring daemon designed to eliminate the performance bottlenecks in development tooling. By replacing slow JavaScript-based file watchers with a multi-language native implementation, Retrigger delivers 100-160x faster hot reload times for modern web development workflows.
+⚠️ **PROJECT STATUS**: Retrigger is an ambitious file system monitoring project with a working hash engine but currently broken file watching functionality. The performance claims below are theoretical and cannot be verified with the current implementation.
 
-## What Retrigger Does
+## What Retrigger Aims to Do
 
-Retrigger monitors your project files and instantly detects changes with sub-millisecond latency. When you save a file, the system:
+Retrigger aims to monitor project files and detect changes with sub-millisecond latency. The intended workflow:
 
-- Detects the change through kernel-level file system events
-- Computes optimized hashes using SIMD-accelerated algorithms
-- Maintains an in-memory cache of file states
-- Notifies development tools (webpack, Vite, etc.) through zero-copy IPC
-- Triggers rebuilds in under 5ms instead of the typical 500-2000ms
+- ❌ Detect changes through kernel-level file system events (currently broken)
+- ✅ Compute optimized hashes using SIMD-accelerated algorithms (working)
+- ❌ Maintain an in-memory cache of file states (not functional)
+- ❌ Notify development tools (webpack, Vite, etc.) through zero-copy IPC (broken)
+- ❌ Trigger rebuilds in under 5ms (cannot test - file watching broken)
+
+**Current Reality**: The hash engine works well, but core file watching is non-functional.
 
 ## Why I Built Retrigger
 
-Modern development workflows suffer from a fundamental performance problem: file watching. JavaScript-based watchers like Chokidar are convenient but prohibitively slow on large codebases. When working with projects containing 10,000+ files, developers experience:
+The original motivation was to improve file watching performance for large projects. However, benchmarking reveals that current tools are already quite efficient:
 
-- Hot reload delays of 1-2 seconds per change
-- High CPU usage from constant polling
-- Development workflow interruptions
-- Reduced productivity and developer satisfaction
+**Actual Performance of Existing Tools:**
+- Chokidar (webpack/vite default): 0.3-0.7ms first event latency
+- @parcel/watcher: 4-56ms first event latency  
+- Native fs.watch: 0.8-2.2ms first event latency
 
-Retrigger solves this by leveraging native system capabilities and advanced algorithms that JavaScript cannot access efficiently. The result is a development experience that feels instant rather than sluggish.
+**Reality Check**: The premise that JavaScript watchers are "prohibitively slow" doesn't match current measurements. Modern file watchers already achieve sub-10ms latencies, making the claimed 100-400x improvements mathematically questionable.
+
+**Current Status**: While the hash engine shows promise with SIMD optimization, the core file watching implementation needs to be completed and tested against realistic benchmarks.
 
 ## System Architecture
 
@@ -86,55 +90,77 @@ Retrigger solves this by leveraging native system capabilities and advanced algo
 
 ## Performance Benchmarks
 
-| Metric | JavaScript Watchers | Retrigger | Improvement |
-|--------|-------------------|-----------|-------------|
-| Hot reload latency | 500-2000ms | <5ms | 100-400x |
-| CPU usage (idle) | 5-15% | <1% | 5-15x |
-| Memory usage | 50-200MB | 10-30MB | 2-7x |
-| File scan time (50K files) | 5-10s | <200ms | 25-50x |
+⚠️ **IMPORTANT: Core file watching functionality is currently broken. The statistics below show what competitors actually achieve, not Retrigger performance.**
+
+### Verified Performance (Tested September 2025)
+
+| Component | Status | Performance |
+|-----------|--------|-------------|
+| Hash Engine | ✅ Working | SIMD-accelerated (Neon), 11GB/s throughput |
+| File Watching | ❌ Broken | Cannot measure - implementation issues |
+| Memory Usage | ✅ Lower | Minimal overhead compared to alternatives |
+
+### Actual Webpack/Vite File Watcher Performance
+
+| Watcher | First Event Latency | Average Latency | Memory Usage | Status |
+|---------|-------------------|-----------------|--------------|---------|
+| chokidar (webpack/vite default) | 0.3-0.7ms | 0.02-0.04ms | Low | ✅ Fast |
+| @parcel/watcher | 4-56ms | 2.8-3.4ms | 58-106MB | ✅ Functional |  
+| node fs.watch | 0.8-2.2ms | 0.05-0.13ms | 58-106MB | ✅ Lightweight |
+| **Retrigger** | ❌ Cannot test | ❌ Cannot test | ❌ Cannot test | ❌ Broken |
+
+### File Scan Performance (Large Projects)
+
+| File Count | Chokidar Ready Time | Parcel Watcher Ready | 
+|-----------|-------------------|---------------------|
+| 1,000 files | 33ms | 0ms |
+| 5,000 files | 152ms | 50ms |
+| 10,000 files | 341ms | 29ms |
+| 25,000 files | 858ms | 14ms |
+
+**Current Reality**: Existing tools are already quite fast. Claims of 100-400x improvement appear unrealistic.
 
 ## Getting Started
 
-### Installation
+⚠️ **WARNING: Retrigger is not ready for production use. Core file watching functionality is broken.**
+
+### Current Status
+
+- ✅ Hash engine can be built and tested
+- ❌ File watching daemon crashes
+- ❌ Node.js bindings for file watching don't work
+- ❌ Webpack/Vite plugins are non-functional
+
+### Testing the Hash Engine (What Works)
 
 ```bash
-# Install the daemon
-cargo install retrigger-daemon
+# Build the project
+cd src/bindings/nodejs
+cargo build --release
 
-# Install Node.js bindings
-npm install @retrigger/webpack-plugin
+# Test hash functionality only
+node -e "
+const { hashBytesSync, getSimdSupport } = require('./index.js');
+console.log('SIMD:', getSimdSupport());
+console.log('Hash test:', hashBytesSync(Buffer.from('hello world')));
+"
 ```
 
-### Configuration
-
-```javascript
-// webpack.config.js
-const RetriggerPlugin = require('@retrigger/webpack-plugin');
-
-module.exports = {
-  plugins: [
-    new RetriggerPlugin({
-      // Plugin automatically connects to running daemon
-    })
-  ]
-};
-```
-
-### Running the Daemon
+### Running Benchmarks
 
 ```bash
-# Start the daemon
-retrigger start --config retrigger.toml
+cd tools/benchmarks
 
-# Generate default configuration
-retrigger config --output retrigger.toml
+# Test what actually works vs alternatives
+node working_components_benchmark.js
 
-# Check daemon status
-retrigger status
-
-# Run performance benchmarks
-retrigger benchmark --files 10000
+# Results will show:
+# - Hash engine performance (working)
+# - Competitor file watcher performance
+# - Verification of README claims
 ```
+
+**Recommendation**: Use existing tools like chokidar or @parcel/watcher for production webpack/Vite setups until Retrigger's file watching is fixed.
 
 ## Technical Implementation
 
@@ -145,7 +171,42 @@ Retrigger implements a multi-layer architecture optimized for performance:
 3. **Daemon Logic (Rust)**: Async runtime with tokio, concurrent hash caching, gRPC server
 4. **Node.js Bindings**: NAPI-RS based bindings with SharedArrayBuffer communication
 
-The system maintains compatibility with existing development tools while providing dramatic performance improvements through native optimization and advanced system programming techniques.
+**Note**: The system architecture is well-designed in theory, but the implementation is incomplete. The hash engine works and shows promise, but file watching components need significant debugging and fixes.
+
+## Benchmark Results Summary (September 2025)
+
+This README has been updated with **actual verified performance data**. Here's what testing revealed:
+
+### ✅ What Works
+- **Hash Engine**: SIMD-accelerated (Neon on M1), achieving ~11GB/s throughput
+- **Build System**: Project compiles successfully on macOS ARM64
+- **Basic Bindings**: Can load and call hash functions from Node.js
+
+### ❌ What's Broken  
+- **File Watching**: Core functionality crashes - cannot detect file changes
+- **IPC Communication**: Event polling fails
+- **Performance Claims**: Cannot verify any file watching performance claims
+- **Plugin Integration**: Webpack/Vite plugins don't work
+
+### 📊 Competitor Reality Check
+Current webpack/Vite alternatives perform much better than originally claimed:
+
+| Tool | First Event | Average | Memory |
+|------|------------|---------|---------|
+| chokidar | 0.3-0.7ms | 0.02-0.04ms | Low |
+| @parcel/watcher | 4-56ms | 2.8-3.4ms | 58-106MB |
+| Node fs.watch | 0.8-2.2ms | 0.05-0.13ms | 58-106MB |
+
+**Conclusion**: Claims of 100-400x improvement over "slow" JavaScript watchers appear to be based on outdated assumptions. Modern file watchers are already quite fast.
+
+### 🎯 Path Forward
+1. Fix core file watching implementation
+2. Get daemon and IPC working reliably  
+3. Run proper benchmarks against working implementation
+4. Revise performance claims based on actual measurements
+5. Compare against real-world webpack/Vite usage patterns
+
+---
 
 ## License
 
@@ -153,4 +214,4 @@ MIT License - see LICENSE file for details.
 
 ## Contributing
 
-Contributions are welcome. Please read CONTRIBUTING.md for guidelines on submitting pull requests and reporting issues.
+**Current Priority**: Fix core file watching functionality before adding features. The hash engine foundation is solid, but the main value proposition depends on reliable file system monitoring.
