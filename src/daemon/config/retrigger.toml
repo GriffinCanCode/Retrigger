@@ -1,0 +1,105 @@
+# Retrigger Daemon Configuration
+# High-performance file system watcher for development tools
+
+[server]
+# Network configuration
+bind_address = "127.0.0.1"
+port = 50051
+enable_metrics = true
+metrics_port = 9090
+
+# Request limits
+max_connections = 100
+request_timeout_ms = 5000
+
+[watcher]
+# Event processing
+event_buffer_size = 10000
+debounce_ms = 50
+recursive = true
+
+# Performance tuning
+worker_threads = 4
+batch_size = 200
+max_events_per_batch = 1000
+
+[patterns]
+# File patterns to include (supports glob patterns)
+include = [
+  "**/*.js",
+  "**/*.jsx", 
+  "**/*.ts",
+  "**/*.tsx",
+  "**/*.vue",
+  "**/*.svelte",
+  "**/*.css",
+  "**/*.scss",
+  "**/*.sass",
+  "**/*.less",
+  "**/*.json",
+  "**/*.md",
+  "**/*.html"
+]
+
+# File patterns to exclude
+exclude = [
+  "**/node_modules/**",
+  "**/.git/**",
+  "**/dist/**",
+  "**/build/**",
+  "**/coverage/**",
+  "**/.next/**",
+  "**/.nuxt/**",
+  "**/.vscode/**",
+  "**/.idea/**",
+  "**/target/**",
+  "**/*.log",
+  "**/*.tmp",
+  "**/.DS_Store"
+]
+
+[ipc]
+# Zero-copy IPC configuration
+enable_zero_copy = true
+mmap_path = "/tmp/retrigger-ipc.mmap"
+ring_buffer_size = 2097152  # 2MB
+max_consumers = 4
+
+# Fallback shared memory
+fallback_to_shared_memory = true
+shared_buffer_size = 1048576  # 1MB
+
+[performance]
+# CPU optimization
+enable_simd = true
+hash_algorithm = "blake3"
+hash_block_size = 4096
+
+# Memory optimization
+cache_size = 100000
+cache_ttl_ms = 300000  # 5 minutes
+
+# I/O optimization
+use_direct_io = false
+prefetch_enabled = true
+prefetch_size = 65536  # 64KB
+
+[logging]
+# Logging configuration
+level = "info"
+format = "json"
+output = "stdout"
+
+# Log rotation (when output is file)
+max_size_mb = 100
+max_files = 5
+
+[security]
+# Security settings
+enable_auth = false
+api_key = ""
+allowed_origins = ["http://localhost:*"]
+
+# Rate limiting
+rate_limit_requests = 1000
+rate_limit_window_ms = 60000  # 1 minute
