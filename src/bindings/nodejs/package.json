@@ -1,6 +1,6 @@
 {
   "name": "@retrigger/core",
-  "version": "0.1.1",
+  "version": "1.0.4",
   "description": "Ultra-fast file system watcher with native performance for Node.js development tools",
   "main": "index.js",
   "types": "types/index.d.ts",
@@ -56,7 +56,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/GriffinCanCode/Retrigger.git",
+    "url": "git+https://github.com/GriffinCanCode/Retrigger.git",
     "directory": "src/bindings/nodejs"
   },
   "keywords": [
@@ -84,14 +84,19 @@
     "access": "public"
   },
   "optionalDependencies": {
-    "@retrigger/core-win32-x64-msvc": "0.1.0",
-    "@retrigger/core-darwin-x64": "0.1.0",
-    "@retrigger/core-linux-x64-gnu": "0.1.0",
-    "@retrigger/core-linux-x64-musl": "0.1.0",
-    "@retrigger/core-darwin-arm64": "0.1.0",
-    "@retrigger/core-linux-arm64-gnu": "0.1.0",
-    "@retrigger/core-linux-arm64-musl": "0.1.0",
-    "@retrigger/core-win32-arm64-msvc": "0.1.0",
-    "@retrigger/core-linux-arm-gnueabihf": "0.1.0"
-  }
+    "@retrigger/core-win32-x64-msvc": "1.0.4",
+    "@retrigger/core-darwin-x64": "1.0.4",
+    "@retrigger/core-linux-x64-gnu": "1.0.4",
+    "@retrigger/core-linux-x64-musl": "1.0.4",
+    "@retrigger/core-darwin-arm64": "1.0.4",
+    "@retrigger/core-linux-arm64-gnu": "1.0.4",
+    "@retrigger/core-linux-arm64-musl": "1.0.4",
+    "@retrigger/core-win32-arm64-msvc": "1.0.4",
+    "@retrigger/core-linux-arm-gnueabihf": "1.0.4"
+  },
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/GriffinCanCode/Retrigger/issues"
+  },
+  "homepage": "https://github.com/GriffinCanCode/Retrigger#readme"
 }

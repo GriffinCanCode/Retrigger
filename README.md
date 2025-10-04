@@ -1,5 +1,7 @@
 # Retrigger
 
+![Retrigger Project](assets/retrigger-project.png)
+
 **High-Performance File System Watcher for Modern Development Workflows**
 
 ## Why I Built Retrigger
@@ -106,23 +108,104 @@ The original motivation was to improve file watching performance for large proje
 
 ## Getting Started
 
-### Testing Core Functionality
+### Quick Installation
 
+Retrigger is distributed as two complementary npm packages:
+
+**For Node.js Development Integration:**
 ```bash
-# Build the project
-cargo build --release
+# Install both packages
+npm install @retrigger/core @retrigger/daemon
 
-# Test hash functionality
-cd src/bindings/nodejs
-node -e "
-const { hashBytesSync, benchmarkHash, getSimdSupport } = require('./index.js');
-console.log('SIMD:', getSimdSupport());
+# Or install daemon globally for system-wide access
+npm install -g @retrigger/daemon
+npm install @retrigger/core
+```
+
+**Package Overview:**
+- **`@retrigger/core`**: Node.js bindings, webpack/Vite plugins, TypeScript definitions
+- **`@retrigger/daemon`**: Native Rust daemon service with high-performance file watching
+
+### 🛠️ Setup & Usage
+
+#### 1. Start the Daemon
+```bash
+# Start the high-performance daemon
+npx retrigger start
+
+# Or with global installation
+retrigger start
+
+# Generate default configuration
+retrigger config --output retrigger.toml
+
+# Run performance benchmarks
+retrigger benchmark --files 1000
+```
+
+#### 2. Integrate with Your Build Tools
+
+**Webpack:**
+```javascript
+// webpack.config.js
+const { RetriggerWebpackPlugin } = require('@retrigger/core');
+
+module.exports = {
+  plugins: [
+    new RetriggerWebpackPlugin({
+      watchPaths: ['./src', './config'],
+      verbose: process.env.NODE_ENV === 'development',
+    }),
+  ],
+};
+```
+
+**Vite:**
+```javascript
+// vite.config.js
+import { createRetriggerVitePlugin } from '@retrigger/core';
+
+export default {
+  plugins: [
+    createRetriggerVitePlugin({
+      watchPaths: ['./src'],
+      enableAdvancedHMR: true,
+    }),
+  ],
+};
+```
+
+#### 3. Node.js API Usage
+
+```javascript
+const { RetriggerWrapper, hashBytesSync, benchmarkHash, getSimdSupport } = require('@retrigger/core');
+
+// Test SIMD acceleration
+console.log('SIMD Support:', getSimdSupport());
+
+// Hash operations
 console.log('Hash test:', hashBytesSync(Buffer.from('hello world')));
+
+// Performance benchmarking
 benchmarkHash(1024*1024).then(stats => {
   console.log('Throughput:', stats.throughput_mbps.toFixed(1), 'MB/s');
 });
-"
+
+// File watching with daemon connection
+const watcher = new RetriggerWrapper();
+// (Additional API usage examples in package documentation)
 ```
+
+### 📦 Package Information
+
+| Package | Description | Size | Installation |
+|---------|-------------|------|--------------|
+| **@retrigger/core** | Node.js integration, plugins, TypeScript definitions | 1.2MB | `npm install @retrigger/core` |
+| **@retrigger/daemon** | Native daemon service with Rust performance | 3.1MB | `npm install @retrigger/daemon` |
+
+**Repository URLs:**
+- Core: https://www.npmjs.com/package/@retrigger/core
+- Daemon: https://www.npmjs.com/package/@retrigger/daemon
 
 ### Running Comprehensive Benchmarks
 
