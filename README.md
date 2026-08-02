@@ -1,285 +1,282 @@
-# Retrigger
+# Retrigger: A File System Watcher for Node.js
 
-![Retrigger Project](assets/retrigger-project.png)
+[![npm version](https://img.shields.io/npm/v/@retrigger/core.svg)](https://www.npmjs.com/package/@retrigger/core)
+[![downloads](https://img.shields.io/npm/dm/@retrigger/core.svg)](https://www.npmjs.com/package/@retrigger/core)
+[![install size](https://packagephobia.com/badge?p=@retrigger/core)](https://packagephobia.com/result?p=@retrigger/core)
+[![node](https://img.shields.io/node/v/@retrigger/core.svg)](https://nodejs.org)
+[![license](https://img.shields.io/npm/l/@retrigger/core.svg)](LICENSE)
 
-**High-Performance File System Watcher for Modern Development Workflows**
+![Retrigger — a fast file system watcher for Node.js, webpack and Vite](assets/retrigger-project.png)
 
-## Why I Built Retrigger
+A fast file system watcher for Node.js, webpack and Vite dev servers. It watches through
+the platform's own backend — inotify, FSEvents, `ReadDirectoryChangesW` — and hashes every
+changed file with a native XXH3-64 engine, so a rebuild can be skipped when the bytes did
+not actually change.
 
-The original motivation was to improve file watching performance for large projects. However, benchmarking reveals that current tools are already quite efficient:
+A pure-JavaScript fallback takes over where no native binary exists, so that `require()`
+works on every platform.
 
-**Actual Performance Comparison:**
-- Chokidar (webpack/vite default): 0.3-0.7ms first event latency
-- @parcel/watcher: 4-56ms first event latency  
-- Native fs.watch: 0.8-2.2ms first event latency
-- **Retrigger**: Sub-millisecond hash operations, competitive event latency
+Install it from npm.
 
-**Current Status**: Retrigger's core systems are functional and performant. The hash engine delivers exceptional SIMD-optimized performance (5GB/s+), daemon startup is reliable, and Node.js bindings provide full API access. Main development focus is on optimizing the complete file watching pipeline for production deployments.
-
-## System Architecture
-
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   File System   │    │  Retrigger      │    │  Development    │
-│    Changes      │    │    Daemon       │    │     Tools       │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         │ inotify/FSEvents      │                       │
-         ├──────────────────────►│                       │
-         │                       │                       │
-         │                    ┌──▼──────────────────┐    │
-         │                    │  System Watcher     │    │
-         │                    │  (Zig/C)           │    │
-         │                    └──┬──────────────────┘    │
-         │                       │                       │
-         │                    ┌──▼──────────────────┐    │
-         │                    │  Hash Engine        │    │
-         │                    │  (SIMD-optimized)   │    │
-         │                    └──┬──────────────────┘    │
-         │                       │                       │
-         │                    ┌──▼──────────────────┐    │
-         │                    │  Cache & IPC        │    │
-         │                    │  (Rust daemon)      │    │
-         │                    └──┬──────────────────┘    │
-         │                       │                       │
-         │                    ┌──▼──────────────────┐    │
-         │                    │  Node.js Bindings   │    │
-         │                    │  (Zero-copy IPC)    │    │
-         │                    └──┬──────────────────┘    │
-         │                       │                       │
-         │                       │ Plugin Interface      │
-         │                       ├──────────────────────►│
-         │                       │                       │
-         │                   <5ms latency              webpack
-         │                                             Vite
-         │                                             Rspack
-```
-
-## Key Features
-
-**Performance**
-- Sub-5ms file change detection and notification
-- SIMD-accelerated hashing (AVX-512, AVX2, NEON)
-- Zero-copy IPC using shared memory
-- Incremental hashing for partial file updates
-
-**System Integration**
-- Native kernel integration (inotify, FSEvents, ReadDirectoryChangesW)
-- eBPF support for advanced filtering
-- io_uring for zero-copy file operations on Linux
-- Hot-reloadable configuration without daemon restart
-
-**Developer Experience**
-- Drop-in webpack/Vite plugin integration
-- TypeScript definitions included
-- Comprehensive metrics and monitoring
-- Cross-platform support (Linux, macOS, Windows)
-
-## Performance Benchmarks
-
-### Verified Performance (Tested September 2025)
-
-| Component | Status | Performance |
-|-----------|--------|-------------|
-| Hash Engine | ✅ Working | SIMD-accelerated (Neon), 5GB/s+ throughput |
-| Build System | ✅ Working | Clean compilation, no errors |
-| Node.js Bindings | ✅ Working | Full API access, sub-ms operations |
-| Daemon Startup | ✅ Working | Reliable initialization and shutdown |
-
-### File Watcher Performance Comparison
-
-| Watcher | First Event Latency | Average Latency | Memory Usage | Status |
-|---------|-------------------|-----------------|--------------|---------|
-| chokidar (webpack/vite default) | 0.3-0.7ms | 0.02-0.04ms | Low | ✅ Fast |
-| @parcel/watcher | 4-66ms | 0.2-3.3ms | 58-106MB | ✅ Functional |  
-| node fs.watch | 0.8-1.1ms | 0.05-0.08ms | 58-106MB | ✅ Lightweight |
-| **Retrigger Hash** | <0.02ms | <0.02ms | Low | ✅ Excellent |
-
-### File Scan Performance (Large Projects)
-
-| File Count | Chokidar Ready Time | Parcel Watcher Ready | 
-|-----------|-------------------|---------------------|
-| 1,000 files | 33ms | 0ms |
-| 5,000 files | 152ms | 50ms |
-| 10,000 files | 341ms | 29ms |
-| 25,000 files | 858ms | 14ms |
-
-**Current Reality**: Retrigger delivers competitive performance with excellent hash engine optimization.
-
-## Getting Started
-
-### Quick Installation
-
-Retrigger is distributed as two complementary npm packages:
-
-**For Node.js Development Integration:**
 ```bash
-# Install both packages
-npm install @retrigger/core @retrigger/daemon
-
-# Or install daemon globally for system-wide access
-npm install -g @retrigger/daemon
 npm install @retrigger/core
 ```
 
-**Package Overview:**
-- **`@retrigger/core`**: Node.js bindings, webpack/Vite plugins, TypeScript definitions
-- **`@retrigger/daemon`**: Native Rust daemon service with high-performance file watching
+## Contents
 
-### 🛠️ Setup & Usage
+- [Architecture](#architecture)
+- [Usage](#usage)
+- [Installation](#installation)
+- [Measured Performance](#measured-performance)
+- [Verification](#verification)
+- [The Optional Daemon](#the-optional-daemon)
+- [Building from Source](#building-from-source)
+- [Platform Support](#platform-support)
+- [Who Should Not Be Here](#who-should-not-be-here)
+- [Reporting a Problem](#reporting-a-problem)
+- [License](#license)
 
-#### 1. Start the Daemon
-```bash
-# Start the high-performance daemon
-npx retrigger start
+## Architecture
 
-# Or with global installation
-retrigger start
+Each layer below does one job.
 
-# Generate default configuration
-retrigger config --output retrigger.toml
+- **`src/core`** — C implementing XXH3-64 with runtime SIMD dispatch across AVX2, SSE2,
+  NEON and scalar.
+- **`src/daemon/retrigger-core`** — Rust wrapping the C engine in FFI, with layout
+  assertions on both sides.
+- **`src/daemon/retrigger-system`** — Rust carrying the watcher itself, reaching inotify,
+  FSEvents and `ReadDirectoryChangesW` through `notify`.
+- **`src/daemon/retrigger-daemon`** — Rust for the optional standalone daemon, which
+  speaks HTTP/JSON and SSE.
+- **`src/bindings/nodejs`** — Rust and JavaScript together, carrying the N-API addon, the
+  bundler plugins, and the JavaScript fallback engine.
 
-# Run performance benchmarks
-retrigger benchmark --files 1000
-```
+Watching happens in-process by default.
 
-#### 2. Integrate with Your Build Tools
+The daemon exists only for sharing one watcher between several processes; nothing requires
+it, and the npm package does not install it.
 
-**Webpack:**
-```javascript
-// webpack.config.js
-const { RetriggerWebpackPlugin } = require('@retrigger/core');
+## Usage
 
-module.exports = {
-  plugins: [
-    new RetriggerWebpackPlugin({
-      watchPaths: ['./src', './config'],
-      verbose: process.env.NODE_ENV === 'development',
-    }),
-  ],
-};
-```
-
-**Vite:**
-```javascript
-// vite.config.js
-import { createRetriggerVitePlugin } from '@retrigger/core';
-
-export default {
-  plugins: [
-    createRetriggerVitePlugin({
-      watchPaths: ['./src'],
-      enableAdvancedHMR: true,
-    }),
-  ],
-};
-```
-
-#### 3. Node.js API Usage
+Construct a watcher, subscribe to the events worth acting on, and start it.
 
 ```javascript
-const { RetriggerWrapper, hashBytesSync, benchmarkHash, getSimdSupport } = require('@retrigger/core');
+const { Retrigger } = require('@retrigger/core');
 
-// Test SIMD acceleration
-console.log('SIMD Support:', getSimdSupport());
-
-// Hash operations
-console.log('Hash test:', hashBytesSync(Buffer.from('hello world')));
-
-// Performance benchmarking
-benchmarkHash(1024*1024).then(stats => {
-  console.log('Throughput:', stats.throughput_mbps.toFixed(1), 'MB/s');
+const watcher = new Retrigger({
+  paths: ['./src'],
+  include: ['**/*.{ts,tsx,js}'],
+  exclude: ['**/node_modules/**'],
+  debounceMs: 10,
 });
 
-// File watching with daemon connection
-const watcher = new RetriggerWrapper();
-// (Additional API usage examples in package documentation)
+watcher.on('add', (path) => console.log('added', path));
+watcher.on('change', (path) => console.log('changed', path));
+watcher.on('unlink', (path) => console.log('removed', path));
+
+watcher.start();
 ```
 
-### 📦 Package Information
+Hashing is exposed directly, and is the same engine the watcher uses.
 
-| Package | Description | Size | Installation |
-|---------|-------------|------|--------------|
-| **@retrigger/core** | Node.js integration, plugins, TypeScript definitions | 1.2MB | `npm install @retrigger/core` |
-| **@retrigger/daemon** | Native daemon service with Rust performance | 3.1MB | `npm install @retrigger/daemon` |
+```javascript
+const {
+  hashFileSync,
+  hashBytesSync,
+  getEngineInfo,
+} = require('@retrigger/core');
 
-**Repository URLs:**
-- Core: https://www.npmjs.com/package/@retrigger/core
-- Daemon: https://www.npmjs.com/package/@retrigger/daemon
+hashBytesSync(Buffer.from('abc')); // '78af5f94892f3950'  (canonical XXH3-64)
+hashFileSync('./src/index.ts'); // { hash: '…', size: 1234 }
+getEngineInfo(); // which engine loaded, and why
+```
 
-### Running Comprehensive Benchmarks
+### Bundler Plugins
+
+webpack takes the plugin as a constructor from the `@retrigger/core/webpack` subpath.
+
+```javascript
+// webpack.config.js
+const { RetriggerWebpackPlugin } = require('@retrigger/core/webpack');
+module.exports = {
+  plugins: [new RetriggerWebpackPlugin({ watchPaths: ['./src'] })],
+};
+```
+
+Vite takes it as a factory from the `@retrigger/core/vite` subpath.
+
+```javascript
+// vite.config.js
+import { createRetriggerVitePlugin } from '@retrigger/core/vite';
+export default {
+  plugins: [createRetriggerVitePlugin({ watchPaths: ['./src'] })],
+};
+```
+
+## Installation
+
+The failure mode this package works hardest to avoid is an install that throws.
+
+- **`require()` never throws** — if no native binary matches the platform, the JavaScript
+  engine (`fs.watch` and BLAKE2b-64) takes over, prints one warning line, and keeps going.
+  `RETRIGGER_SILENT=1` suppresses it, and `getEngineInfo().nativeAttempts` explains what
+  was tried and why each candidate was rejected.
+- **No runtime dependencies** — the published tarball is 38.4 KiB across 20 entries and
+  contains no native binary. The addon arrives through one of nine platform packages
+  listed as `optionalDependencies`, so a platform without one degrades instead of failing.
+- **Both engines are held to one test suite** — the JavaScript fallback, a mock addon, and
+  the real compiled addon each run the same parity suite, so the fallback is a substitute
+  rather than an aspiration.
+
+`npm run test:pack` performs the whole thing end to end: pack the tarball, install it into
+an empty directory, require it in a clean subprocess, watch a file, and confirm the process
+still exits on its own.
+
+## Measured Performance
+
+Every number below was produced by a command in this repository on one machine — an Apple
+M4 Max running macOS 26.5.1 and Node 22.12 — with a warm page cache.
+
+They are not projections, and no comparison against other watchers is claimed here because
+none was measured in the same run.
+
+### In-Memory Hashing
+
+`make -C src/core bench` measures XXH3-64 through NEON.
+
+- **64 B** — 15,624 MiB/s.
+- **1 KiB** — 36,784 MiB/s.
+- **64 KiB** — 32,058 MiB/s.
+- **16 MiB** — 31,378 MiB/s.
+
+### End-to-End File Hashing
+
+The shipped Node API counts `open` and `read` inside every figure below.
+
+- **1 KiB** — 11.4 µs per file, 86 MiB/s.
+- **16 KiB** — 11.9 µs per file, 1,317 MiB/s.
+- **256 KiB** — 25.0 µs per file, 10,013 MiB/s.
+- **4 MiB** — 240 µs per file, 16,643 MiB/s.
+
+The ~11 µs floor is syscall overhead, and it is the number that matters for a watcher:
+below roughly 16 KiB, hashing a file costs about as much as opening it.
+
+### Watcher Latency
+
+`cargo bench -p retrigger-system` measures FSEvents.
+
+- **Single event, change to delivery** — 1.7 ms median, across a 1.07–2.68 ms range.
+- **200 creations in a burst** — 16.0 ms.
+- **2,000 files moved into a watched tree** — 13.7 ms.
+- **Include/exclude decision** — 187 ns allowed, 88 ns excluded.
+
+First-event latency is dominated by the platform backend, not by this code: on macOS,
+FSEvents coalesces and delivers on its own schedule. Retrigger is not meaningfully quicker
+than any other FSEvents consumer at noticing a change.
+
+What it adds is content hashing fast enough to run on every event, so a rebuild can be
+skipped when a file was rewritten with identical bytes, and bounded memory under churn.
+
+## Verification
+
+`make verify` runs the whole gate: lint, every test suite, the C engine under ASan/UBSan,
+the fuzz targets' type check, the packaged-install proof, and a build from a pristine copy
+of the tree.
+
+Linux is proven from a macOS workstation rather than taken on faith, on both architectures.
 
 ```bash
-cd tools/benchmarks
-
-# Compare against alternatives
-node working_components_benchmark.js
-
-# Production validation
-cd ../..
-node FINAL_PRODUCTION_VALIDATION.js
-
-# Results show:
-# - Excellent hash engine performance (5GB/s+)
-# - Competitive file watcher latencies  
-# - Reliable daemon operation
-# - Complete Node.js API access
+docker build --platform linux/arm64 -f deploy/docker/Dockerfile.test -t retrigger-test .
+docker run --rm --platform linux/arm64 retrigger-test
 ```
 
-**Status**: Retrigger provides excellent hash performance and reliable core functionality. Suitable for development use and performance-critical hashing applications.
+The build context excludes host build outputs, so nothing that passes inside the container
+can be a macOS artifact that rode along. Every suite currently passes on both `linux/arm64`
+and `linux/x86-64`.
 
-## Technical Implementation
+- **C hash engine** — passes under NEON on arm64 and under AVX2 on x86-64.
+- **C under ASan/UBSan** — passes on both.
+- **Rust workspace** — passes on both.
+- **Native addon artifact** — passes on both.
+- **JavaScript, 267 tests** — passes on both.
+- **Packaged install, 12 checks** — passes on both.
 
-Retrigger implements a multi-layer architecture optimized for performance:
+The C suite runs a differential test that hashes the same inputs through every SIMD level
+the CPU offers and compares them against scalar, so "AVX2 is enabled" is a measurement
+rather than an assumption.
 
-1. **Core Hash Engine (C)**: SIMD-optimized XXH3 implementation with AVX-512/NEON support
-2. **System Integration (Zig)**: Zero-overhead bindings to kernel file system APIs
-3. **Daemon Logic (Rust)**: Async runtime with tokio, concurrent hash caching, gRPC server
-4. **Node.js Bindings**: NAPI-RS based bindings with SharedArrayBuffer communication
+Published XXH3-64 vectors are checked from C, from Rust, from the Node addon, and from the
+JavaScript fallback.
 
-**Note**: The system architecture is well-designed in theory, but the implementation is incomplete. The hash engine works and shows promise, but file watching components need significant debugging and fixes.
+## The Optional Daemon
 
-## Benchmark Results Summary (September 2025)
+The daemon installs separately and is driven from the command line.
 
-This README has been updated with **actual verified performance data**. Here's what testing revealed:
+```bash
+npm install -g @retrigger/daemon
+retrigger config --output retrigger.toml
+retrigger start
+```
 
-### ✅ What Works Excellently
-- **Hash Engine**: SIMD-accelerated (Neon on M1), achieving 5GB/s+ throughput
-- **Build System**: Clean compilation across all platforms and components  
-- **Node.js Bindings**: Complete API access with sub-millisecond operations
-- **Daemon Core**: Reliable startup, initialization, and graceful shutdown
-- **Performance**: Competitive with established tools, superior hash performance
+It speaks HTTP with JSON bodies and streams events over SSE.
 
-### 🔄 Development Areas
-- **File Watching Pipeline**: Core components working, end-to-end integration being optimized
-- **Plugin Integration**: Basic functionality available, production polish in progress
-- **Documentation**: Comprehensive guides and examples being expanded
+`retrigger validate` checks a config file before the daemon tries to run it, and
+`retrigger status` reports on a running one.
 
-### 📊 Performance Validation
-Retrigger delivers competitive performance with standout hash optimization:
+The npm package ships a launcher that resolves the binary from a platform package, and
+explains how to build from source when none exists rather than failing the install.
 
-| Tool | Hash Performance | Event Latency | Memory Usage |
-|------|------------------|---------------|--------------|
-| **Retrigger** | **5GB/s+** | **<0.02ms** | **Low** |
-| chokidar | N/A | 0.3-0.7ms | Low |
-| @parcel/watcher | N/A | 4-66ms | 58-106MB |
-| Node fs.watch | N/A | 0.8-1.1ms | 58-106MB |
+## Building from Source
 
-**Conclusion**: Retrigger provides exceptional hash performance while maintaining competitive file watching capabilities. The SIMD-optimized architecture delivers measurable improvements for performance-critical applications.
+Three targets cover the build, the tests, and the full gate.
 
-### 🎯 Next Steps
-1. ✅ **Core Systems**: Hash engine, daemon, and bindings working excellently
-2. 🔄 **File Watching Integration**: Optimize end-to-end event pipeline for production
-3. 🔄 **Plugin Development**: Enhance webpack/Vite integration for seamless adoption
-4. 📈 **Performance Optimization**: Fine-tune for large-scale project deployments
-5. 📚 **Documentation**: Expand guides and real-world usage examples
+```bash
+make all      # C engine, Rust workspace, Node addon
+make test     # every suite
+make verify   # the full gate
+```
 
----
+Building requires a C compiler, Rust 1.88 or newer, and Node 18.17 or newer.
+
+`libclang` is deliberately not required — the FFI declarations are hand-written and guarded
+by layout assertions on both sides, so building does not depend on `bindgen`.
+
+## Platform Support
+
+Retrigger runs wherever Node does, though not every platform gets a native binary.
+
+- **Linux x64 and arm64, gnu and musl** — inotify, with the full suite verified.
+- **macOS arm64 and x64** — FSEvents, with the full suite verified.
+- **Windows x64 and arm64** — `ReadDirectoryChangesW`, in the CI matrix but not verified in
+  this run.
+- **Anywhere else** — the `fs.watch` fallback, degraded but never broken.
+
+## Who Should Not Be Here
+
+This repository is the source, and most readers want the published package instead.
+
+- **Using Retrigger in an application** — install `@retrigger/core` and read
+  [the package README](src/bindings/nodejs/README.md), which carries the full API, the
+  options, and the differences between the two engines.
+- **Sharing one watcher between several processes** — read
+  [the daemon README](src/daemon/README.md), because nothing else needs the daemon.
+- **Comparing watchers** — no comparison against other watchers is claimed here, because
+  none was measured in the same run.
+
+## Reporting a Problem
+
+Everything published out of this repository is tracked in one place.
+
+- **A bug in any package** — open an issue on
+  [the issue tracker](https://github.com/GriffinCanCode/Retrigger/issues), since
+  `@retrigger/core`, `@retrigger/daemon` and the platform packages are all built from this
+  tree.
+- **A vulnerability** — follow [the security policy](.github/SECURITY.md), which reports
+  privately through GitHub Security Advisories rather than the issue tracker, and sets out
+  what is in scope.
+- **Slow first-event delivery** — that is usually the platform backend rather than
+  Retrigger, as the measurements above set out.
 
 ## License
 
-MIT License - see LICENSE file for details.
-
-## Contributing
-
-**Current Focus**: Retrigger's core architecture is solid and performant. Contributions welcome in optimizing the file watching pipeline, enhancing plugin integrations, and expanding platform support. The foundation is strong—let's build great things on it!
+MIT, in [LICENSE](LICENSE).

@@ -1,49 +1,66 @@
 {
   "name": "@retrigger/daemon",
-  "version": "1.0.4",
-  "description": "High-performance file system watcher daemon service for ultra-fast development tools",
+  "version": "2.0.0",
+  "description": "Standalone file watcher daemon: one inotify/FSEvents watcher and one XXH3 content hash shared by several processes over an HTTP/JSON API with server-sent events and Prometheus metrics. Optional — @retrigger/core watches in-process without it.",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
   "bin": {
-    "retrigger": "bin/retrigger"
+    "retrigger": "bin/retrigger.js"
   },
   "files": [
-    "bin/",
+    "index.js",
+    "bin/retrigger.js",
     "config/",
     "scripts/",
     "README.md",
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   },
   "scripts": {
     "postinstall": "node scripts/post-install.js",
-    "test": "node scripts/test-daemon.js",
-    "start": "retrigger start",
-    "stop": "retrigger stop",
-    "status": "retrigger status",
-    "benchmark": "retrigger benchmark"
+    "test": "node scripts/test-daemon.js"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/GriffinCanCode/Retrigger.git",
+    "url": "git+https://github.com/GriffinCanCode/Retrigger.git",
     "directory": "src/daemon"
+  },
+  "homepage": "https://github.com/GriffinCanCode/Retrigger#readme",
+  "bugs": {
+    "url": "https://github.com/GriffinCanCode/Retrigger/issues"
   },
   "keywords": [
     "file-watcher",
-    "daemon",
-    "service",
-    "native",
-    "rust",
-    "performance",
-    "development-tools",
-    "build-tools",
-    "fast",
+    "file-watching",
     "watcher",
+    "watch-files",
+    "daemon",
+    "filesystem",
     "file-system",
-    "grpc",
-    "ipc",
-    "zero-copy"
+    "inotify",
+    "fsevents",
+    "watchman",
+    "chokidar",
+    "cli",
+    "http-api",
+    "sse",
+    "server-sent-events",
+    "prometheus",
+    "metrics",
+    "xxhash",
+    "xxh3",
+    "content-hash",
+    "hot-reload",
+    "dev-server",
+    "development-tools",
+    "rust",
+    "native",
+    "cross-platform"
   ],
   "author": "Griffin Strier",
   "license": "MIT",
@@ -61,15 +78,19 @@
     "arm64"
   ],
   "optionalDependencies": {
-    "@retrigger/daemon-win32-x64": "1.0.4",
-    "@retrigger/daemon-darwin-x64": "1.0.4", 
-    "@retrigger/daemon-linux-x64": "1.0.4",
-    "@retrigger/daemon-darwin-arm64": "1.0.4",
-    "@retrigger/daemon-linux-arm64": "1.0.4",
-    "@retrigger/daemon-win32-arm64": "1.0.4",
-    "@retrigger/daemon-linux-arm": "1.0.4"
+    "@retrigger/daemon-darwin-arm64": "2.0.0",
+    "@retrigger/daemon-darwin-x64": "2.0.0",
+    "@retrigger/daemon-linux-arm64": "2.0.0",
+    "@retrigger/daemon-linux-x64": "2.0.0",
+    "@retrigger/daemon-win32-arm64": "2.0.0",
+    "@retrigger/daemon-win32-x64": "2.0.0"
   },
   "peerDependencies": {
-    "@retrigger/core": "^1.0.4"
+    "@retrigger/core": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@retrigger/core": {
+      "optional": true
+    }
   }
 }

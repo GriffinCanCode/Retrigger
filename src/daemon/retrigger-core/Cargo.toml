@@ -1,17 +1,26 @@
 [package]
 name = "retrigger-core"
-version = "0.1.0"
-edition = "2021"
-description = "Core abstractions and interfaces for Retrigger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "XXH3-64 hashing engine for Retrigger, with runtime SIMD dispatch"
+keywords = ["xxhash", "xxh3", "hash", "simd", "checksum"]
+categories = ["algorithms", "development-tools::ffi", "filesystem"]
 
 [dependencies]
 serde = { workspace = true }
-thiserror = "1.0"
-bytes = "1.5"
-blake3 = "1.5"
-wide = "0.7"
-cfg-if = "1.0"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
+# bindgen was removed deliberately: it drags libclang onto every machine that
+# builds from source, and the FFI surface here is small enough to declare by
+# hand with matching layout assertions on both sides of the boundary.
 cc = "1.0"
-bindgen = "0.69"
