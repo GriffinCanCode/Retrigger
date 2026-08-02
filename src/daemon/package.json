@@ -15,8 +15,7 @@
     "bin/retrigger.js",
     "config/",
     "scripts/",
-    "README.md",
-    "CHANGELOG.md"
+    "README.md"
   ],
   "engines": {
     "node": ">=18.0.0"

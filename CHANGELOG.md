@@ -73,6 +73,11 @@ machine it was built on.
   back. The release now publishes the platform packages and then installs the
   result from the registry on every supported OS, failing if the native engine
   is not the one that loads.
+- `@retrigger/core` and `@retrigger/daemon` are released in step. The daemon
+  peer-depends on the core line, so a release that moved core's major and left
+  the daemon behind would make `npm install` of the two together fail outright
+  with `ERESOLVE`. One tag now publishes both, and the release proves a default
+  install of the pair before it finishes.
 - Linux delivered no events at all — the old Zig watcher never armed its inotify
   thread — and the paths that did arrive were corrupt, because `FileEvent` used
   a fat pointer where Rust read a thin one.

@@ -30,7 +30,10 @@ jobs:
       # The tag is the only input this workflow takes, but `npm publish` ships
       # whatever version package.json declares and never looks at it. When the
       # two disagree the tag names one release and the registry gets another.
-      - name: Tag must match the version that will be published
+      # Both published packages are checked, because one tag releases both and
+      # @retrigger/daemon peer-depends on the exact @retrigger/core line this
+      # workflow is about to publish.
+      - name: Tag must match the versions that will be published
         shell: bash
         run: |
           if [ "$GITHUB_REF_TYPE" != tag ]; then
@@ -38,12 +41,38 @@ jobs:
             exit 0
           fi
           tagged="${GITHUB_REF_NAME#v}"
-          declared=$(node -p "require('./$NODE_DIR/package.json').version")
-          echo "tag: $tagged / package.json: $declared"
-          if [ "$tagged" != "$declared" ]; then
-            echo "::error::tag $GITHUB_REF_NAME would publish version $declared"
-            exit 1
-          fi
+          status=0
+          for manifest in "$NODE_DIR/package.json" src/daemon/package.json; do
+            declared=$(node -p "require('./$manifest').version")
+            name=$(node -p "require('./$manifest').name")
+            echo "tag: $tagged / $name: $declared"
+            if [ "$tagged" != "$declared" ]; then
+              echo "::error::tag $GITHUB_REF_NAME would publish $name@$declared"
+              status=1
+            fi
+          done
+          exit $status
+
+      # @retrigger/daemon declares the core line it works with. A release that
+      # moved core's major without moving that range would publish a pair that
+      # npm refuses to install together -- which is exactly what shipping core
+      # 2.0.0 against the 1.0.4 daemon would have done.
+      - name: The daemon must accept the core version being published
+        shell: bash
+        run: |
+          node -e '
+            const core = require(`./${process.env.NODE_DIR}/package.json`).version;
+            const range = require("./src/daemon/package.json").peerDependencies["@retrigger/core"];
+            const wanted = core.split(".")[0];
+            // Deliberately permissive about range syntax and strict about the
+            // only thing that has ever been wrong here: the major.
+            const named = [...range.matchAll(/(\d+)\.\d+\.\d+/g)].map((m) => m[1]);
+            if (!named.includes(wanted)) {
+              console.error(`::error::daemon peer range "${range}" does not admit core ${core}`);
+              process.exit(1);
+            }
+            console.log(`daemon accepts core ${core} via "${range}"`);
+          '
 
       # Releases are cut from tags, and CI runs on branches and pull requests --
       # so nothing in this repository previously established that the commit
@@ -293,6 +322,47 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  # @retrigger/daemon is a pure-JavaScript shim -- it has no artifact of its own
+  # to build here, because the per-platform Rust binaries it looks for are not
+  # published yet and it is written to degrade politely when they are absent.
+  # It still has to be released in step with core: it peer-depends on the core
+  # line, so leaving it a major version behind makes `npm install` of the two
+  # together fail outright with ERESOLVE.
+  #
+  # It goes after core rather than beside it, so the peer it names already
+  # exists on the registry by the time anyone can install it.
+  publish-daemon:
+    name: Publish the daemon package
+    runs-on: ubuntu-latest
+    needs: publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      # The shim, the shipped config, and the documented no-binary degradation.
+      # Cheap, and it is the whole package.
+      - name: Smoke test the shim
+        run: node scripts/test-daemon.js
+        working-directory: src/daemon
+
+      - name: Show what would be published
+        run: npm pack --dry-run
+        working-directory: src/daemon
+
+      - name: Publish
+        if: github.event_name == 'push' || inputs.dry_run == false
+        run: npm publish --access public --provenance
+        working-directory: src/daemon
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
   # Installs the just-published package from the real registry on every OS and
   # confirms it works there. Until this passes, a release is not proven; it is
   # only uploaded.
@@ -372,10 +442,42 @@ jobs:
             console.log('ok');
           "
 
+  # The two packages are released together because npm resolves them together.
+  # A default `npm install` of both is the exact command that fails with
+  # ERESOLVE when the daemon's peer range trails core's major, so it is the
+  # command that proves the pair -- no --force, no --legacy-peer-deps.
+  verify-published-pair:
+    name: Verify install / core + daemon
+    runs-on: ubuntu-latest
+    needs: publish-daemon
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+
+      - name: Wait for registry propagation
+        run: sleep 45
+
+      - name: Install both from the registry
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pair" && cd "$RUNNER_TEMP/pair"
+          npm init -y >/dev/null
+          version="${GITHUB_REF_NAME#v}"
+          npm install "@retrigger/core@$version" "@retrigger/daemon@$version"
+          node -e "
+            const core = require('@retrigger/core');
+            require('@retrigger/daemon');
+            if (core.getEngineInfo().engine !== 'native') {
+              throw new Error('expected the native engine alongside the daemon');
+            }
+            console.log('ok');
+          "
+
   github-release:
     name: GitHub release
     runs-on: ubuntu-latest
-    needs: [build, build-musl, publish]
+    needs: [build, build-musl, publish, publish-daemon]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
