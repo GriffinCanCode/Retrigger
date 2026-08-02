@@ -73,11 +73,22 @@
 //! event that follows a change in whether the path exists — collapsing either would change what
 //! the stream means rather than how often it fires.
 //!
-//! [`notify-debouncer-full`] was evaluated and deliberately not used: it debounces on the
-//! trailing edge, which taxes *every* change with the full window before the consumer hears about
-//! it, and it re-derives its own rename/delete model on top of the backend's, which is precisely
-//! the layer of guesswork this crate is meant to remove. It is also, at the time of writing, only
-//! published as a release candidate.
+//! Dropping the repeats is only honest if what was dropped is eventually restated, so a path whose
+//! window swallowed an event is **corrected** with one [`Modified`](EventKind::Modified) once that
+//! window closes. Without it, a burst that *ends* inside the window leaves the consumer holding
+//! whatever the file said when it was first woken — an ordinary large save, where the backend
+//! fires on the first chunk and the write that completes the file lands milliseconds later and is
+//! swallowed. A burst therefore costs two wake-ups rather than one, and the second carries the
+//! file's final state. See the `flush` module for the bound on that work list and what happens
+//! when it saturates.
+//!
+//! Note what is *not* being claimed: no change waits on the window to be reported. The window is
+//! only ever added to a correction. [`notify-debouncer-full`] was evaluated and deliberately not
+//! used for exactly that reason — it debounces on the trailing edge alone, which taxes *every*
+//! change with the full window before the consumer hears about it, and it re-derives its own
+//! rename/delete model on top of the backend's, which is precisely the layer of guesswork this
+//! crate is meant to remove. It is also, at the time of writing, only published as a release
+//! candidate.
 //!
 //! # Platform notes
 //!
@@ -124,6 +135,7 @@ mod config;
 mod error;
 mod event;
 mod filter;
+mod flush;
 mod hash;
 mod processor;
 mod queue;

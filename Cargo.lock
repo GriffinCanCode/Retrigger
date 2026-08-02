@@ -1098,6 +1098,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "proptest",
  "retrigger-core",
  "retrigger-system",
  "serde",

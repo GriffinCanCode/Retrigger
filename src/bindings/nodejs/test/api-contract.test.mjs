@@ -162,6 +162,36 @@ describe('package manifest', () => {
     }
   });
 
+  // The two lists are one fact written twice: napi.targets is what the release
+  // workflow builds, optionalDependencies is what an install will try to fetch.
+  // They drifted apart once -- three platforms were declared for a year that no
+  // job ever built, so those installs silently fell back to the JavaScript
+  // engine -- and nothing failed, because nothing compared them.
+  it('declares exactly the platforms it builds', () => {
+    // The same mapping napi applies when it names a platform package. Spelled
+    // out rather than parsed, so an unrecognised triple fails here instead of
+    // being silently turned into a package name nobody publishes.
+    const PACKAGE_FOR_TRIPLE = {
+      'x86_64-apple-darwin': 'darwin-x64',
+      'aarch64-apple-darwin': 'darwin-arm64',
+      'x86_64-pc-windows-msvc': 'win32-x64-msvc',
+      'aarch64-pc-windows-msvc': 'win32-arm64-msvc',
+      'x86_64-unknown-linux-gnu': 'linux-x64-gnu',
+      'aarch64-unknown-linux-gnu': 'linux-arm64-gnu',
+      'x86_64-unknown-linux-musl': 'linux-x64-musl',
+      'aarch64-unknown-linux-musl': 'linux-arm64-musl',
+      'armv7-unknown-linux-gnueabihf': 'linux-arm-gnueabihf',
+    };
+
+    const built = pkg.napi.targets.map((triple) => {
+      const suffix = PACKAGE_FOR_TRIPLE[triple];
+      expect(suffix, `unknown target triple ${triple}`).toBeDefined();
+      return `${pkg.name}-${suffix}`;
+    });
+
+    expect(built.sort()).toEqual(Object.keys(pkg.optionalDependencies).sort());
+  });
+
   it('points every script at something that exists', () => {
     for (const [name, command] of Object.entries(pkg.scripts)) {
       // `node -e '...'` evaluates inline and names no file, so the first

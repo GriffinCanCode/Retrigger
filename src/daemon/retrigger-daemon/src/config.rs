@@ -624,3 +624,141 @@ hash_cache_ttl_secs = 9
         Ok(())
     }
 }
+
+/// Generated round-trip and rejection properties.
+///
+/// The example tests above pin the shapes that matter to a human reader; these assert the same
+/// contract holds across the whole space of legal files — any valid configuration renders to a
+/// file that parses back to itself, and every documented rejection holds no matter what else the
+/// configuration says.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Only literal IPs, because a host name is a validation failure by design and would just be
+    /// noise in the round-trip property.
+    fn valid_ip() -> impl Strategy<Value = String> {
+        prop_oneof![
+            (any::<u8>(), any::<u8>(), any::<u8>(), any::<u8>())
+                .prop_map(|(a, b, c, d)| format!("{a}.{b}.{c}.{d}")),
+            Just("::1".to_owned()),
+            Just("::".to_owned()),
+        ]
+    }
+
+    /// ASCII paths only: the property is about the configuration schema, not about the filesystem's
+    /// tolerance for exotic bytes, and every character here survives a TOML string round-trip.
+    fn safe_path() -> impl Strategy<Value = PathBuf> {
+        "[a-zA-Z0-9_./-]{1,32}".prop_map(PathBuf::from)
+    }
+
+    /// A pool of globs that all compile, so a generated config is rejected for the reason under
+    /// test rather than for an accidental unclosed class.
+    fn valid_glob() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("**/*.rs".to_owned()),
+            Just("src/**".to_owned()),
+            Just("*.txt".to_owned()),
+            Just("**/node_modules/**".to_owned()),
+            Just("logs/*.log".to_owned()),
+        ]
+    }
+
+    fn log_level() -> impl Strategy<Value = LogLevel> {
+        prop_oneof![
+            Just(LogLevel::Error),
+            Just(LogLevel::Warn),
+            Just(LogLevel::Info),
+            Just(LogLevel::Debug),
+            Just(LogLevel::Trace),
+        ]
+    }
+
+    fn log_format() -> impl Strategy<Value = LogFormat> {
+        prop_oneof![
+            Just(LogFormat::Compact),
+            Just(LogFormat::Pretty),
+            Just(LogFormat::Json),
+        ]
+    }
+
+    prop_compose! {
+        // Sizes stay within i64 range because TOML integers are signed 64-bit; a value the format
+        // cannot represent would be a TOML limitation surfacing as a false failure, not a bug here.
+        fn valid_config()(
+            bind_address in valid_ip(),
+            port in any::<u16>(),
+            queue_capacity in 1_usize..=100_000,
+            debounce_ms in 0_u64..=10_000,
+            follow_symlinks in any::<bool>(),
+            hash_cache_size in 1_usize..=100_000,
+            hash_cache_ttl_secs in 0_u64..=1_000_000,
+            paths in prop::collection::vec((safe_path(), any::<bool>()), 0..4),
+            include in prop::collection::vec(valid_glob(), 0..3),
+            exclude in prop::collection::vec(valid_glob(), 0..3),
+            level in log_level(),
+            format in log_format(),
+        ) -> DaemonConfig {
+            DaemonConfig {
+                server: ServerConfig { bind_address, port },
+                watcher: WatchConfig {
+                    queue_capacity,
+                    debounce_ms,
+                    follow_symlinks,
+                    hash_cache_size,
+                    hash_cache_ttl_secs,
+                    paths: paths
+                        .into_iter()
+                        .map(|(path, recursive)| WatchPath { path, recursive })
+                        .collect(),
+                },
+                patterns: PatternConfig { include, exclude },
+                logging: LoggingConfig { level, format },
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn any_valid_config_round_trips_through_toml(config in valid_config()) {
+            config
+                .validate()
+                .map_err(|e| TestCaseError::fail(format!("generated config failed validation: {e:#}")))?;
+            let rendered = config
+                .to_toml()
+                .map_err(|e| TestCaseError::fail(format!("could not serialize: {e:#}")))?;
+            let parsed = DaemonConfig::parse(&rendered)
+                .map_err(|e| TestCaseError::fail(format!("could not reparse: {e:#}")))?;
+            prop_assert_eq!(parsed, config, "a rendered config must parse back to itself");
+        }
+
+        #[test]
+        fn a_zero_queue_capacity_is_always_rejected(mut config in valid_config()) {
+            config.watcher.queue_capacity = 0;
+            prop_assert!(config.validate().is_err());
+        }
+
+        #[test]
+        fn a_zero_cache_size_is_always_rejected(mut config in valid_config()) {
+            config.watcher.hash_cache_size = 0;
+            prop_assert!(config.validate().is_err());
+        }
+
+        #[test]
+        fn an_empty_watch_path_is_always_rejected(mut config in valid_config()) {
+            config.watcher.paths.push(WatchPath { path: PathBuf::new(), recursive: true });
+            prop_assert!(config.validate().is_err());
+        }
+
+        #[test]
+        fn a_non_ip_bind_address_is_always_rejected(
+            mut config in valid_config(),
+            host in "[a-z][a-z0-9.-]{0,20}",
+        ) {
+            prop_assume!(host.parse::<std::net::IpAddr>().is_err());
+            config.server.bind_address = host;
+            prop_assert!(config.validate().is_err());
+        }
+    }
+}

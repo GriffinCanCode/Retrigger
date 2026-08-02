@@ -15,25 +15,72 @@ env:
   NODE_DIR: src/bindings/nodejs
 
 jobs:
+  # Both of these are cheap, and both catch a mistake that cannot be undone
+  # afterwards: npm refuses to republish a version, and a tag that has already
+  # been consumed by a release is awkward to retract.
+  guard:
+    name: Release preconditions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # The tag is the only input this workflow takes, but `npm publish` ships
+      # whatever version package.json declares and never looks at it. When the
+      # two disagree the tag names one release and the registry gets another.
+      - name: Tag must match the version that will be published
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "Not a tag build, so there is no tag to disagree with."
+            exit 0
+          fi
+          tagged="${GITHUB_REF_NAME#v}"
+          declared=$(node -p "require('./$NODE_DIR/package.json').version")
+          echo "tag: $tagged / package.json: $declared"
+          if [ "$tagged" != "$declared" ]; then
+            echo "::error::tag $GITHUB_REF_NAME would publish version $declared"
+            exit 1
+          fi
+
+      # Releases are cut from tags, and CI runs on branches and pull requests --
+      # so nothing in this repository previously established that the commit
+      # being published had ever passed its own test suite. Rather than re-run
+      # the matrix here, require the result that already exists for this exact
+      # commit.
+      - name: The commit being released must have passed CI
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs" \
+            --jq '.check_runs[] | select(.name == "CI passed") | .conclusion' | head -n1)
+          if [ "$conclusion" = success ]; then
+            echo "CI passed on $GITHUB_SHA."
+            exit 0
+          fi
+          echo "::error::no successful 'CI passed' check on $GITHUB_SHA (found: ${conclusion:-none}). Push the commit to a branch, let CI finish, then tag it."
+          exit 1
+
   # Every target is built on a runner of that same OS and architecture rather
   # than cross-compiled. That costs a few more runners and buys two things:
   # the C hash engine needs no cross toolchain, and — more importantly — each
   # artifact can be executed on its real platform before it is published.
   # Publishing a binary nobody ever ran is how "works on my machine" ships.
   #
-  # This matrix and package.json#napi.targets must list the same six targets.
+  # This matrix plus `build-musl` must cover exactly package.json#napi.targets.
   # `napi artifacts` in CLI v3 fails on a configured target with no binary
   # rather than skipping it the way v2 did, so a target added in one place and
   # not the other breaks the release instead of silently shipping nothing.
-  #
-  # The three platforms in optionalDependencies that are absent here --
-  # x86_64/aarch64 musl and armv7 -- have never been built, so those packages
-  # have never been published and the loader falls back to the JavaScript
-  # engine there. Adding them needs alpine-container build jobs (the pattern
-  # CI's test-musl job already uses) rather than a line in this matrix.
+  # api-contract.test.mjs holds napi.targets and optionalDependencies together
+  # from the other side, so the three lists cannot drift apart unnoticed.
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.host }}
+    needs: guard
     strategy:
       fail-fast: false
       matrix:
@@ -94,10 +141,78 @@ jobs:
           path: ${{ env.NODE_DIR }}/*.node
           if-no-files-found: error
 
+  # musl gets its own job because it is built *inside* Alpine rather than
+  # cross-compiled: the addon is then linked against the same libc it will be
+  # loaded with, and — the reason this is worth a separate job at all — it can
+  # be executed on the spot, so a musl binary is proven before it is published
+  # exactly like every other native target.
+  #
+  # Two details are load-bearing and were each found the hard way:
+  #
+  #   * `-C target-feature=-crt-static`. Rust's musl targets default to static
+  #     linking, which is right for an executable and fatal for a `cdylib`: the
+  #     addon has to resolve symbols from the Node process that dlopens it.
+  #     Without this the build succeeds and produces a `.node` that cannot load.
+  #   * No `--target` flag. The container is already musl, so this is a native
+  #     build and `napi build --platform` names the artifact `*-musl.node` on
+  #     its own. Passing the triple instead asks Alpine's system rustc for a
+  #     std it does not ship.
+  build-musl:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
+    container: node:22-alpine
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { host: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { host: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+
+    env:
+      RUSTFLAGS: '-C target-feature=-crt-static'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: apk add --no-cache build-base clang clang-dev llvm-dev rust cargo make bash python3 git
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: ${{ env.NODE_DIR }}
+
+      - name: Build the C hash engine
+        run: make build-core BUILD_TYPE=release
+
+      - name: Build native addon
+        run: npm run build
+        working-directory: ${{ env.NODE_DIR }}
+
+      # The whole point of building in Alpine instead of cross-compiling.
+      - name: Verify the artifact loads and computes
+        run: node scripts/verify-artifact.js
+        working-directory: ${{ env.NODE_DIR }}
+
+      # A native build is named by the host, so this is also the check that the
+      # runner really was musl and not a glibc image that quietly stood in.
+      - name: Confirm the artifact is the musl one
+        shell: sh
+        run: |
+          cd "$NODE_DIR"
+          ls *.node
+          test -f retrigger-nodejs-bindings.$(node -p "process.arch === 'x64' ? 'linux-x64-musl' : 'linux-arm64-musl'").node
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.target }}
+          path: ${{ env.NODE_DIR }}/*.node
+          if-no-files-found: error
+
   publish:
     name: Publish
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-musl]
     permissions:
       contents: write
       id-token: write
@@ -194,10 +309,47 @@ jobs:
             console.log('ok');
           "
 
+  # The same proof as above on musl, which is the platform this release exists
+  # to fix: before the musl packages were built, an Alpine install resolved to
+  # no native package and degraded to the JavaScript engine without complaining.
+  # Asserting `engine === 'native'` here is what makes that regression loud.
+  verify-published-musl:
+    name: Verify install / alpine-${{ matrix.arch }}
+    runs-on: ${{ matrix.host }}
+    container: node:22-alpine
+    needs: publish
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { host: ubuntu-latest,    arch: x64 }
+          - { host: ubuntu-24.04-arm, arch: arm64 }
+    steps:
+      - name: Wait for registry propagation
+        run: sleep 45
+
+      - name: Install from the registry and require it
+        shell: sh
+        run: |
+          mkdir -p /tmp/verify && cd /tmp/verify
+          npm init -y >/dev/null
+          npm install "@retrigger/core@${GITHUB_REF_NAME#v}"
+          node -e "
+            const r = require('@retrigger/core');
+            const info = r.getEngineInfo();
+            console.log('engine:', JSON.stringify(info));
+            if (!r.hashBytesSync(Buffer.from('retrigger'))) throw new Error('hash failed');
+            if (info.engine !== 'native') {
+              throw new Error('expected the native engine on musl, got ' + info.engine);
+            }
+            console.log('ok');
+          "
+
   github-release:
     name: GitHub release
     runs-on: ubuntu-latest
-    needs: [build, publish]
+    needs: [build, build-musl, publish]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write

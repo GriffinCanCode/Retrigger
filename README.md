@@ -222,7 +222,7 @@ and `linux/x86-64`.
 - **C under ASan/UBSan** — passes on both.
 - **Rust workspace** — passes on both.
 - **Native addon artifact** — passes on both.
-- **JavaScript, 306 tests** — passes on both.
+- **JavaScript, 320 tests** — passes on both.
 - **Packaged install, 12 checks** — passes on both.
 
 The C suite runs a differential test that hashes the same inputs through every SIMD level
@@ -238,6 +238,42 @@ a consumer depends on. One suite runs against the compiled addon, a mock addon, 
 JavaScript engine, and all three must agree on which writes changed a file's bytes — from
 digests that are deliberately not comparable, because each engine only ever compares a path
 against its own earlier digest.
+
+### Adversarial suites and campaigns
+
+Beyond the example tests, three tiers push the code the way a hostile file system would. They
+share seeds and durations so every failure is replayable rather than a one-off.
+
+```bash
+make test-adversarial   # bounded, seeded, deterministic — safe for the PR gate
+make test-chaos         # storms, fault injection, and repeated-run flake hunts
+make test-fuzz          # time-budgeted libFuzzer plus a high-iteration proptest pass
+```
+
+- `test-adversarial` is the bounded subset: C metamorphic, contract, and adversarial-I/O
+  proofs plus a shared-library load check; Rust queue/cache/watcher state-machine properties
+  and real-filesystem race suites; and the JavaScript glob, bounded-container, content-change,
+  and chunked-hash properties. It also runs inside `make test`, because the suites
+  auto-discover their files; this target is the focused way to iterate on them alone.
+- `test-chaos` runs the heavier storms and the `#[ignore]`-marked fault-injection cases, then
+  repeats the bounded tier `CHAOS_ITERATIONS` times to hunt flakes.
+- `test-fuzz` runs the C libFuzzer targets for `FUZZ_SECONDS` each and a `PROPTEST_CASES`-deep
+  proptest pass.
+
+Every knob is an environment variable, so a campaign is one line and a failing seed replays
+exactly:
+
+```bash
+FUZZ_SECONDS=120 PROPTEST_CASES=65536 CHAOS_ITERATIONS=25 make test-chaos test-fuzz
+
+# Replay a specific proptest counterexample (fast-check and proptest both print the seed):
+PROPTEST_CASES=1 cargo test -p retrigger-system --lib properties
+cd src/bindings/nodejs && npx vitest run test/properties.test.mjs   # seed is fixed in the file
+```
+
+The same campaigns run on demand in CI through the `campaign` workflow
+(`workflow_dispatch`), which accepts the seed and duration inputs and uses only the free
+standard runners — there is no scheduled job.
 
 ## The Optional Daemon
 

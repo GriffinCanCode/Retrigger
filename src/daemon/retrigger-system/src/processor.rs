@@ -714,4 +714,96 @@ mod tests {
         assert_eq!(stats.entries, 20);
         Ok(())
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// The distinct files a generated sequence may touch. Small on purpose: the property is about
+        /// the change-detection contract, and a handful of paths well below the cache ceiling keeps the
+        /// reference model exact — no generation ever retires, so the cache mirrors the model one for one.
+        const FILES: usize = 6;
+
+        #[derive(Debug, Clone)]
+        enum CacheOp {
+            /// Write `byte`-filled contents to file `idx`, changing what a later read will fingerprint.
+            Write { idx: usize, byte: u8 },
+            /// Deliver a `Modified` event for file `idx` and check the change decision.
+            Touch { idx: usize },
+            /// Remove file `idx` and deliver the `Deleted` event.
+            Delete { idx: usize },
+        }
+
+        fn cache_op() -> impl Strategy<Value = CacheOp> {
+            let idx = 0..FILES;
+            prop_oneof![
+                (idx.clone(), any::<u8>()).prop_map(|(idx, byte)| CacheOp::Write { idx, byte }),
+                idx.clone().prop_map(|idx| CacheOp::Touch { idx }),
+                idx.prop_map(|idx| CacheOp::Delete { idx }),
+            ]
+        }
+
+        proptest! {
+            // File I/O per operation, so keep the campaign bounded; the sequences are still long
+            // enough to interleave writes, re-reads, and deletes of the same path.
+            #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+            /// Whatever order writes, re-reads, and deletes arrive in, the processor's `content_changed`
+            /// and `hash` must track the bytes actually on disk against what it last fingerprinted —
+            /// never a stale "unchanged" that would let a real edit through, and never a phantom change
+            /// after an identical rewrite.
+            #[test]
+            fn change_decisions_track_the_bytes_on_disk(ops in prop::collection::vec(cache_op(), 1..40)) {
+                let harness = Harness::new().map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let processor = FileEventProcessor::new();
+
+                // The reference: current on-disk byte per file, and the fingerprint the cache last held.
+                let mut on_disk = [None::<u8>; FILES];
+                let mut cached = [None::<u64>; FILES];
+
+                for op in ops {
+                    match op {
+                        CacheOp::Write { idx, byte } => {
+                            let path = harness.root.join(format!("f{idx}.bin"));
+                            std::fs::write(&path, [byte; 8]).map_err(|e| TestCaseError::fail(e.to_string()))?;
+                            on_disk[idx] = Some(byte);
+                        }
+                        CacheOp::Touch { idx } => {
+                            let path = harness.root.join(format!("f{idx}.bin"));
+                            let processed = processor.process(file_event(path, EventKind::Modified));
+                            if let Some(byte) = on_disk[idx] {
+                                let hash = crate::hash::fnv1a_64(&[byte; 8]);
+                                prop_assert_eq!(processed.hash, Some(hash));
+                                prop_assert_eq!(
+                                    processed.content_changed,
+                                    cached[idx] != Some(hash),
+                                    "a change is exactly a fingerprint that differs from the cached one"
+                                );
+                                prop_assert_eq!(processed.cache_hit, cached[idx].is_some());
+                                cached[idx] = Some(hash);
+                            } else {
+                                // No file to read: unknown must fail towards a rebuild, and a read
+                                // error stores nothing, so the cache is left exactly as it was.
+                                prop_assert!(processed.content_changed);
+                                prop_assert_eq!(processed.hash, None);
+                            }
+                        }
+                        CacheOp::Delete { idx } => {
+                            let path = harness.root.join(format!("f{idx}.bin"));
+                            let _ = std::fs::remove_file(&path);
+                            on_disk[idx] = None;
+                            let processed = processor.process(file_event(path, EventKind::Deleted));
+                            prop_assert!(processed.content_changed, "a deletion is always a change");
+                            prop_assert_eq!(processed.hash, None);
+                            cached[idx] = None;
+                        }
+                    }
+                    prop_assert!(
+                        processor.stats().entries <= FILES,
+                        "the cache must never hold more than the files in play"
+                    );
+                }
+            }
+        }
+    }
 }

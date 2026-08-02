@@ -34,7 +34,6 @@ const TRIPLES = {
   'win32-arm64': ['win32-arm64-msvc'],
   'linux-x64': ['linux-x64-gnu', 'linux-x64-musl'],
   'linux-arm64': ['linux-arm64-gnu', 'linux-arm64-musl'],
-  'linux-arm': ['linux-arm-gnueabihf'],
 };
 
 /**

@@ -74,11 +74,35 @@ const char *rtr_hash_level_str(rtr_simd_level_t level);
 
 /* ------------------------------------------------------------- one-shot */
 
-/* XXH3-64 with the default secret and a zero seed. */
+/*
+ * XXH3-64 with the default secret and a zero seed.
+ *
+ * `(NULL, 0)` hashes as the empty input. `(NULL, len != 0)` is a caller bug --
+ * there is no buffer to read -- and aborts the process rather than reading from
+ * NULL or fabricating a digest of bytes that were never supplied; see
+ * rtr_hash64_seed.
+ */
 uint64_t rtr_hash64(const void *data, size_t len);
 
-/* XXH3-64 with a caller-supplied seed. */
+/*
+ * XXH3-64 with a caller-supplied seed.
+ *
+ * Contract for a NULL `data`: `len == 0` hashes as the empty input; `len != 0`
+ * aborts. The streaming API (rtr_hash_update) rejects the same mistake with -1,
+ * but a uint64_t return has no error channel, and returning any value would be a
+ * plausible-looking fingerprint of data that does not exist -- a silent wrong
+ * answer is the one outcome a content hasher must never produce.
+ */
 uint64_t rtr_hash64_seed(const void *data, size_t len, uint64_t seed);
+
+/*
+ * The ABI version the compiled library implements, i.e. the value of
+ * RTR_HASH_ABI_VERSION at build time. A caller that links this library at run
+ * time (rather than compiling against this header) can compare it against the
+ * RTR_HASH_ABI_VERSION it was built with to detect a struct-layout mismatch
+ * before it corrupts a read.
+ */
+uint32_t rtr_hash_abi_version(void);
 
 /* ------------------------------------------------------------ streaming */
 

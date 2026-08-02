@@ -24,6 +24,12 @@ const { Matcher } = require('../../lib/matcher');
 
 const SCAN_INTERVAL_MS = Number(process.env.RETRIGGER_MOCK_INTERVAL_MS || 15);
 
+/**
+ * Kinds a debounce window may absorb. Spelled out here rather than imported from the JavaScript
+ * engine on purpose: this file is meant to disagree with it when the contract is read differently.
+ */
+const COALESCABLE = new Set(['created', 'modified', 'metadata']);
+
 class Watcher {
   constructor(options = {}) {
     this.capacity = options.capacity > 0 ? Math.floor(options.capacity) : 8192;
@@ -197,17 +203,30 @@ class Watcher {
       this._enqueue(makeEvent(target, kind, info));
       return;
     }
+    // Leading edge with a trailing correction, from the same contract the Rust watcher implements:
+    // the first event for a path goes out at once, repeats behind it are absorbed for one window,
+    // and a window that absorbed anything closes with a `modified` carrying the final state. The
+    // deadline runs from the delivered event and is never extended, so a file written continuously
+    // is corrected once per window instead of going silent until the writing stops.
     const existing = this.pending.get(target);
     if (existing) {
-      clearTimeout(existing.timer);
-      existing.kind = coalesce(existing.kind, kind);
+      // A kind the window may not absorb ends it and is delivered on its own.
+      if (!COALESCABLE.has(kind) || !COALESCABLE.has(existing.kind)) {
+        clearTimeout(existing.timer);
+        this.pending.delete(target);
+        this._enqueue(makeEvent(target, kind, info));
+        return;
+      }
+      existing.kind = kind;
       existing.info = info;
-      existing.timer = setTimeout(() => this._flush(target), this.debounceMs);
+      existing.owed = true;
       return;
     }
+    this._enqueue(makeEvent(target, kind, info));
     this.pending.set(target, {
       kind,
       info,
+      owed: false,
       timer: setTimeout(() => this._flush(target), this.debounceMs),
     });
   }
@@ -216,7 +235,7 @@ class Watcher {
     const entry = this.pending.get(target);
     if (!entry) return;
     this.pending.delete(target);
-    this._enqueue(makeEvent(target, entry.kind, entry.info));
+    if (entry.owed) this._enqueue(makeEvent(target, 'modified', entry.info));
   }
 
   _enqueue(event) {
@@ -245,13 +264,6 @@ function makeEvent(target, kind, info) {
     isDirectory: Boolean(info && info.isDirectory),
     cookie: null,
   };
-}
-
-function coalesce(previous, next) {
-  if (next === 'deleted') return 'deleted';
-  if (previous === 'created' && next === 'modified') return 'created';
-  if (previous === 'deleted' && next === 'created') return 'modified';
-  return next;
 }
 
 // --------------------------------------------------------------------- hash

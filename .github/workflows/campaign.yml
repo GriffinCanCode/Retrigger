@@ -1,0 +1,90 @@
+name: Adversarial campaign
+
+# Manual only. The heavy adversarial tiers -- storms, fault injection, repeated
+# flake hunts, and time-budgeted fuzzing -- are too slow for every PR and too
+# valuable to never run. There is deliberately no `schedule:` trigger: a cron
+# would burn runner time unattended, and the point of this file is that someone
+# chose to run it. Standard GitHub-hosted runners are free and unlimited on
+# public repositories, so this costs nothing but wall-clock.
+on:
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per libFuzzer target
+        required: false
+        default: '300'
+      proptest_cases:
+        description: Proptest cases per property (scales the stochastic Rust tier)
+        required: false
+        default: '16384'
+      chaos_iterations:
+        description: Consecutive adversarial runs in the flake hunt
+        required: false
+        default: '5'
+
+concurrency:
+  group: campaign-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  chaos:
+    name: Chaos (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64, os: ubuntu-latest }
+          - { name: macos-arm64, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: campaign-${{ matrix.name }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
+
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Raise inotify limits (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+          sudo sysctl -w fs.inotify.max_user_instances=512
+
+      - name: Build C hash engine
+        run: make build-core
+
+      - name: Install JS dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: src/bindings/nodejs
+
+      - name: Chaos tier (storms, faults, flake hunt)
+        run: make test-chaos CHAOS_ITERATIONS=${{ github.event.inputs.chaos_iterations }} PROPTEST_CASES=${{ github.event.inputs.proptest_cases }}
+
+  fuzz:
+    name: Fuzz (libFuzzer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # ubuntu clang ships the compiler-rt fuzzer runtime; the Makefile probes
+      # for it and skips gracefully if a given image ever lacks it.
+      - name: Install clang + fuzzer runtime
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      - name: Fuzz campaign
+        run: make test-fuzz FUZZ_SECONDS=${{ github.event.inputs.fuzz_seconds }} PROPTEST_CASES=${{ github.event.inputs.proptest_cases }}
+        env:
+          CC: clang

@@ -304,11 +304,60 @@ fn rapid_writes_to_one_path_collapse_within_the_window() {
 
     let (queued, _, dropped) = common::delta(&watcher, baseline);
     assert_eq!(dropped, 0, "nothing was dropped; these were coalesced");
+    // At most two: the leading event, and the trailing correction that restates the final state of
+    // the file once the window closes. What must not happen is one event per write.
     assert!(
         queued <= 2,
         "{WRITES} writes inside the window produced {queued} events; coalescing did not \
          happen\n{}",
         render(&extra)
+    );
+}
+
+#[test]
+fn the_write_a_window_swallowed_is_corrected_rather_than_lost() {
+    // This failure is silent by construction. Leading-edge coalescing wakes the consumer on the
+    // *first* event of a burst, so a burst that ends inside the window leaves it holding whatever
+    // the file said mid-write, and nothing further ever arrives to correct that. One large save is
+    // the ordinary shape of it: the backend fires on the first chunk and the write that finishes
+    // the file lands milliseconds later, inside the window.
+    //
+    // So the correction has to carry the file's *final* size, not its intermediate one.
+    const FINAL: &[u8] = b"the whole file, written after the consumer had already been woken";
+
+    let tree = Tree::new();
+    let window = Duration::from_millis(300);
+    let watcher = watcher_with(
+        &tree,
+        WatcherConfig {
+            debounce: window,
+            ..Default::default()
+        },
+    );
+    arm(&watcher, &tree);
+    let _ = common::drain_for(&watcher, Duration::from_millis(150));
+
+    let path = tree.path("partial.txt");
+    std::fs::write(&path, b"x").expect("first write");
+    let leading = wait_for(&watcher, DEADLINE, |event| event.path == path)
+        .expect("the first write must be delivered immediately");
+
+    // Inside the window, so coalescing drops it: without a trailing correction this is the write
+    // the consumer would never hear about.
+    std::fs::write(&path, FINAL).expect("completing write");
+
+    let correction = wait_for(&watcher, DEADLINE, |event| {
+        event.path == path && event.size == FINAL.len() as u64
+    })
+    .expect("the swallowed write must be restated once the window closes");
+
+    assert_eq!(correction.kind, EventKind::Modified);
+    assert!(
+        leading.size < correction.size,
+        "the correction carried {} bytes and the leading event {}; it must describe the finished \
+         file, not the partial one",
+        correction.size,
+        leading.size
     );
 }
 

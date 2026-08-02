@@ -16,6 +16,7 @@ use crate::bounded::BoundedMap;
 use crate::config::{Backend, WatcherConfig, WatcherStats};
 use crate::error::WatchError;
 use crate::event::{now_ns, EventKind, FileEvent};
+use crate::flush::{self, Flusher};
 use crate::queue::{EventQueue, Push};
 use crate::scan::{self, Reconciler};
 
@@ -208,7 +209,20 @@ pub(crate) struct Core {
     scope: RwLock<Vec<WatchEntry>>,
     running: AtomicBool,
     reconciler: Reconciler,
+    /// Paths whose window swallowed an event and are owed a trailing correction. See
+    /// [`crate::flush`].
+    ///
+    /// Locked only from inside [`Core::suppressed`], which already holds `coalesce`; the lock order
+    /// is therefore always `coalesce` then `flusher`, and nothing takes them the other way round.
+    flusher: Flusher,
     events_synthesized: AtomicU64,
+    /// Test seam: when set, [`Watcher::spawn_reconcile_thread`] reports a spawn failure without
+    /// touching the OS, so the degraded-start path can be proven deterministically. There is no
+    /// portable way to make `thread::Builder::spawn` fail on demand, and the behaviour under test
+    /// — that a reconciler which cannot start is announced as a rescan rather than hidden — is too
+    /// important to leave unexercised.
+    #[cfg(test)]
+    fail_reconciler_spawn: AtomicBool,
 }
 
 impl Core {
@@ -225,6 +239,11 @@ impl Core {
     /// The work list of directories awaiting reconciliation.
     pub(crate) fn reconciler(&self) -> &Reconciler {
         &self.reconciler
+    }
+
+    /// The trailing-correction work list, for [`crate::flush`].
+    pub(crate) fn flusher(&self) -> &Flusher {
+        &self.flusher
     }
 
     /// Handle one item from the backend.
@@ -481,7 +500,54 @@ impl Core {
                 },
             },
         );
+
+        // A suppressed backend event is the only thing that owes a correction. The deadline is the
+        // window measured from the *delivered* event, matching the entry that was just re-recorded,
+        // so the correction lands exactly when this path stops being coalesced rather than one
+        // window after the last write. See [`crate::flush`] for why the correction exists at all.
+        if redundant && origin == Origin::Backend {
+            if let Some(last) = previous {
+                self.flusher.owe(path, last.at + window);
+            }
+        }
         redundant
+    }
+
+    /// Deliver the correction owed to a path whose coalescing window swallowed an event.
+    ///
+    /// Always a [`Modified`](EventKind::Modified): the path exists and its content moved after the
+    /// consumer was last told about it, which is the whole of what this event claims. It carries no
+    /// opinion about *which* suppressed event it stands for, because the suppressed events were
+    /// repeat noise for one logical change.
+    pub(crate) fn emit_trailing(&self, path: &Path) {
+        if !self.is_running() || !self.in_scope(path) || !self.config.filter.matches(path) {
+            return;
+        }
+
+        let probe = self.probe(path, EventKind::Modified, None);
+        // A path that has since gone had its removal delivered already — removals are never
+        // coalesced — so there is nothing left to correct, and claiming a modification for
+        // something absent is the one thing the coalescing rules exist to prevent.
+        if !probe.exists {
+            trace!(path = %path.display(), "path gone before its correction; nothing to report");
+            return;
+        }
+
+        // Re-checks the ledger rather than trusting the deadline, because a real event may have
+        // been delivered for this path in the meantime — in which case it already said everything
+        // this one would, and `suppressed` re-owes the correction against the newer window.
+        if self.suppressed(path, EventKind::Modified, true, Origin::Backend) {
+            trace!(path = %path.display(), "correction overtaken by a real event");
+            return;
+        }
+
+        trace!(path = %path.display(), "trailing correction");
+        self.deliver(FileEvent::new(
+            path.to_path_buf(),
+            EventKind::Modified,
+            probe.size,
+            probe.is_directory,
+        ));
     }
 
     /// Inspect a path at event time.
@@ -605,6 +671,9 @@ pub struct Watcher {
     /// The reconciler thread (see [`crate::scan`]). Joined by `stop` before the backend is
     /// dropped, so no scan can outlive the watcher.
     reconciler: Mutex<Option<JoinHandle<()>>>,
+    /// The trailing-correction thread (see [`crate::flush`]). Joined by `stop` on the same terms
+    /// and for the same reason as the reconciler.
+    flusher: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Watcher {
@@ -631,10 +700,14 @@ impl Watcher {
                 scope: RwLock::new(Vec::new()),
                 running: AtomicBool::new(false),
                 reconciler: Reconciler::default(),
+                flusher: Flusher::default(),
                 events_synthesized: AtomicU64::new(0),
+                #[cfg(test)]
+                fail_reconciler_spawn: AtomicBool::new(false),
             }),
             backend: Mutex::new(None),
             reconciler: Mutex::new(None),
+            flusher: Mutex::new(None),
         })
     }
 
@@ -740,23 +813,72 @@ impl Watcher {
         self.core.queue.set_active(true);
         *backend = Some(watcher);
 
-        self.core.reconciler.resume();
+        self.launch_reconciler();
+        self.launch_flusher();
+        Ok(())
+    }
+
+    /// Start the trailing-correction thread, or carry on without it.
+    ///
+    /// Unlike the reconciler, a failed spawn here does not raise a rescan. The corrections this
+    /// thread delivers restate paths the consumer has *already* been woken for, so losing them
+    /// costs freshness inside one debounce window and nothing else — exactly the behaviour the
+    /// watcher had before [`crate::flush`] existed. A rescan would be a wildly disproportionate
+    /// answer to that, and the loss-reporting contract is about events that were never reported at
+    /// all.
+    fn launch_flusher(&self) {
+        self.core.flusher.resume();
         let core = Arc::clone(&self.core);
-        // A failed spawn is not fatal: the watcher still reports everything the backend reports,
-        // it just cannot close the newly-created-directory gap. Saying so is better than refusing
-        // to start, and better than pretending.
         match std::thread::Builder::new()
-            .name("retrigger-reconcile".to_owned())
-            .spawn(move || scan::run(&core))
+            .name("retrigger-flush".to_owned())
+            .spawn(move || flush::run(&core))
         {
-            Ok(handle) => *self.reconciler.lock() = Some(handle),
+            Ok(handle) => *self.flusher.lock() = Some(handle),
             Err(err) => warn!(
                 error = %err,
-                "could not start the directory reconciler; \
-                 files written into a directory as it is created may be missed"
+                "could not start the trailing-correction thread; coalescing stays leading-edge only"
             ),
         }
-        Ok(())
+    }
+
+    /// Start the directory reconciler, or announce that it could not start.
+    ///
+    /// A failed spawn is not fatal — the watcher still reports everything the backend reports — but
+    /// it is not silent either. Without the reconciler the newly-created-directory gap that
+    /// [`crate::scan`] exists to close is reopened: a file written into a directory as it is created
+    /// may be reported to nobody. This crate's contract is that every such loss surfaces as a
+    /// rescan, so a spawn failure raises one. A consumer that treats
+    /// [`EventKind::RescanRequired`](crate::EventKind::RescanRequired) as "re-read everything" then
+    /// stays correct, exactly as it does for a queue overflow.
+    fn launch_reconciler(&self) {
+        self.core.reconciler.resume();
+        let core = Arc::clone(&self.core);
+        match self.spawn_reconcile_thread(core) {
+            Ok(handle) => *self.reconciler.lock() = Some(handle),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "could not start the directory reconciler; requesting a rescan so the \
+                     newly-created-directory gap is reported rather than silently accepted"
+                );
+                self.core.signal_rescan();
+            }
+        }
+    }
+
+    /// Spawn the reconciler thread. Isolated so the failure path has a [test seam](Core).
+    // `self` carries the seam, so it is genuinely unused once the seam is compiled out.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn spawn_reconcile_thread(&self, core: Arc<Core>) -> std::io::Result<JoinHandle<()>> {
+        #[cfg(test)]
+        if self.core.fail_reconciler_spawn.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other(
+                "forced reconciler spawn failure (test seam)",
+            ));
+        }
+        std::thread::Builder::new()
+            .name("retrigger-reconcile".to_owned())
+            .spawn(move || scan::run(&core))
     }
 
     /// Detach the backend, joining its thread.
@@ -787,6 +909,13 @@ impl Watcher {
         if let Some(handle) = self.reconciler.lock().take() {
             // A reconciler that panicked (it does not, but a panic must not become a hang) has
             // already stopped, which is all this needs.
+            let _ = handle.join();
+        }
+
+        // Joined on the same terms as the reconciler: it touches neither the backend nor any lock
+        // held here, and it wakes from its deadline wait as soon as `stop` signals.
+        self.core.flusher.stop();
+        if let Some(handle) = self.flusher.lock().take() {
             let _ = handle.join();
         }
 
@@ -1317,6 +1446,82 @@ mod tests {
         assert!(!core.coalesced(path, EventKind::Created, true));
         assert!(!core.coalesced(path, EventKind::RenamedFrom, false));
         assert!(!core.coalesced(path, EventKind::Created, true));
+    }
+
+    #[test]
+    fn a_swallowed_event_owes_a_trailing_correction() {
+        // Leading-edge coalescing is only honest if what it drops is eventually restated: the
+        // consumer was woken for the first write and never told about the one that finished the
+        // file. See [`crate::flush`].
+        let core = core_for(WatcherConfig {
+            debounce: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let path = Path::new("/x/a.txt");
+
+        assert!(!core.coalesced(path, EventKind::Modified, true));
+        assert_eq!(
+            core.flusher.pending_len(),
+            0,
+            "an event that was delivered needs no correction"
+        );
+
+        assert!(core.coalesced(path, EventKind::Modified, true));
+        assert_eq!(
+            core.flusher.pending_len(),
+            1,
+            "the write the window swallowed is owed one"
+        );
+
+        // Further writes in the same window join the debt rather than multiplying it.
+        assert!(core.coalesced(path, EventKind::Metadata, true));
+        assert_eq!(core.flusher.pending_len(), 1, "one correction per path");
+    }
+
+    #[test]
+    fn events_that_are_delivered_owe_nothing() {
+        // Every one of these reaches the consumer, so there is nothing left to restate. A
+        // correction for a path that was just reported would be pure duplicate noise.
+        let core = core_for(WatcherConfig {
+            debounce: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let path = Path::new("/x/a.txt");
+
+        assert!(!core.coalesced(path, EventKind::Created, true));
+        assert!(!core.coalesced(path, EventKind::Deleted, false));
+        assert!(!core.coalesced(path, EventKind::RenamedTo, true));
+        assert_eq!(core.flusher.pending_len(), 0);
+    }
+
+    #[test]
+    fn zero_debounce_owes_no_corrections() {
+        // Nothing is suppressed, so there is nothing to correct and the flusher stays inert.
+        let core = core_for(WatcherConfig {
+            debounce: Duration::ZERO,
+            ..Default::default()
+        });
+        let path = Path::new("/x/a.txt");
+        for _ in 0..5 {
+            assert!(!core.coalesced(path, EventKind::Modified, true));
+        }
+        assert_eq!(core.flusher.pending_len(), 0);
+    }
+
+    #[test]
+    fn a_deduplicated_synthesized_event_owes_no_correction() {
+        // A reconciliation pass restates what is already on disk. Suppressing one means the
+        // consumer has heard it, not that a change went unreported, so it is not the debounce
+        // window's debt to settle.
+        let core = core_for(WatcherConfig {
+            debounce: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let path = Path::new("/x/fresh/only.txt");
+
+        assert!(!core.coalesced(path, EventKind::Created, true));
+        assert!(core.suppressed(path, EventKind::Created, true, Origin::Synthesized));
+        assert_eq!(core.flusher.pending_len(), 0);
     }
 
     #[test]
@@ -2086,7 +2291,41 @@ mod tests {
             scope: RwLock::new(Vec::new()),
             running: AtomicBool::new(true),
             reconciler: Reconciler::default(),
+            flusher: Flusher::default(),
             events_synthesized: AtomicU64::new(0),
+            fail_reconciler_spawn: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn a_failed_reconciler_spawn_asks_for_a_rescan_rather_than_hiding_the_gap() {
+        // The crate promises that every mechanism which can lose an event surfaces it. A reconciler
+        // that cannot start reopens the newly-created-directory loss window, so start() must raise a
+        // rescan rather than warn and carry on. Proven through the spawn seam so no real thread is
+        // involved and the outcome is deterministic.
+        let watcher = Watcher::new(WatcherConfig::default()).expect("new");
+        watcher.force_running_for_test();
+        watcher.core.queue.set_active(true);
+        watcher
+            .core
+            .fail_reconciler_spawn
+            .store(true, Ordering::Relaxed);
+
+        let mut subscriber = watcher.subscribe();
+        watcher.launch_reconciler();
+
+        assert!(
+            watcher.poll().is_some_and(|event| event.is_rescan()),
+            "a reconciler that could not start must leave a rescan in the queue"
+        );
+        assert_eq!(
+            subscriber.try_recv().map(|event| event.kind).ok(),
+            Some(EventKind::RescanRequired),
+            "and subscribers must hear about the degraded start too"
+        );
+        assert!(
+            watcher.reconciler.lock().is_none(),
+            "no reconciler handle should be stored when the spawn failed"
+        );
     }
 }

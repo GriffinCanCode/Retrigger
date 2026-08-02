@@ -64,6 +64,11 @@ pub struct WatcherConfig {
     ///
     /// Deletes and renames are never coalesced, and neither is any event that follows a change in
     /// the path's existence, so a window can never hide a file disappearing or coming back.
+    ///
+    /// What the window *did* swallow is restated once it closes, so a burst wakes the consumer
+    /// twice — immediately, and again with the file's final state — rather than leaving it holding
+    /// a file it was woken for mid-write. Raising this therefore trades freshness for fewer
+    /// wake-ups in both directions.
     pub debounce: Duration,
     /// Whether the backend follows symbolic links when recursing.
     ///

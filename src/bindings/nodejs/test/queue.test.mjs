@@ -7,7 +7,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 process.env.RETRIGGER_NATIVE_PATH = path.join(HERE, 'helpers', 'mock-native.js');
 process.env.RETRIGGER_SILENT = '1';
 
-import { JsWatcher, mergeKind } from '../lib/js-watcher.js';
+import { JsWatcher } from '../lib/js-watcher.js';
 import { cleanupTempDirs, tempDir, waitFor } from './helpers/tmp.js';
 import mockNative from './helpers/mock-native.js';
 
@@ -174,12 +174,50 @@ describe('bounded queue under real filesystem pressure', () => {
   });
 });
 
-describe('debounce coalescing rule', () => {
-  it('keeps a create through subsequent writes and lets a delete win', () => {
-    expect(mergeKind('created', 'modified')).toBe('created');
-    expect(mergeKind('created', 'deleted')).toBe('deleted');
-    expect(mergeKind('modified', 'deleted')).toBe('deleted');
-    expect(mergeKind('deleted', 'created')).toBe('modified');
-    expect(mergeKind('modified', 'modified')).toBe('modified');
+describe('debounce windows', () => {
+  const sinks = (watcher) => {
+    const seen = [];
+    for (let e = watcher.poll(); e; e = watcher.poll()) seen.push(`${e.path}:${e.kind}`);
+    return seen;
+  };
+
+  it('delivers the first event at once and absorbs the repeats behind it', async () => {
+    const watcher = new JsWatcher({ debounceMs: 30 });
+    watcher._emitIfMatched('/x/a.js', 'created', false, 1);
+    watcher._emitIfMatched('/x/a.js', 'modified', false, 4);
+    watcher._emitIfMatched('/x/a.js', 'modified', false, 9);
+
+    expect(sinks(watcher), 'only the leading event is immediate').toEqual(['/x/a.js:created']);
+
+    await new Promise((r) => setTimeout(r, 60));
+    // One correction, not one per absorbed write, and it carries the final size rather than the
+    // size the leading event described.
+    expect(sinks(watcher)).toEqual(['/x/a.js:modified']);
+  });
+
+  it('closes a window that absorbed nothing without inventing an event', async () => {
+    const watcher = new JsWatcher({ debounceMs: 30 });
+    watcher._emitIfMatched('/x/a.js', 'modified', false, 1);
+    expect(sinks(watcher)).toEqual(['/x/a.js:modified']);
+
+    await new Promise((r) => setTimeout(r, 60));
+    expect(sinks(watcher), 'a single write is a single event').toEqual([]);
+  });
+
+  it('never absorbs a delete, even mid-window', async () => {
+    // The window may only ever collapse repeat noise. Swallowing a delete would change what the
+    // stream means, and is how a dev server ends up serving a file that is gone.
+    const watcher = new JsWatcher({ debounceMs: 30 });
+    watcher._emitIfMatched('/x/a.js', 'created', false, 1);
+    watcher._emitIfMatched('/x/a.js', 'deleted', false, 0);
+    expect(sinks(watcher)).toEqual(['/x/a.js:created', '/x/a.js:deleted']);
+
+    // The delete ended the window, so the arrival that follows it is news again rather than
+    // something a still-open window could absorb.
+    watcher._emitIfMatched('/x/a.js', 'created', false, 2);
+    expect(sinks(watcher)).toEqual(['/x/a.js:created']);
+
+    await new Promise((r) => setTimeout(r, 60));
+    expect(sinks(watcher)).toEqual([]);
   });
 });

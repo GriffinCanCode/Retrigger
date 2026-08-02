@@ -189,10 +189,11 @@ describe('debounce buffer memory', () => {
     for (let i = 0; i < 20_000; i += 1) {
       watcher._enqueueDebounced(`/synthetic/f${i}.ts`, 'modified', false, 0);
     }
-    // Past the ceiling, events are emitted immediately instead of being buffered — early rather than
-    // withheld, and nothing is lost either way.
+    // The buffer holds windows, not events: every path was already reported on the leading edge, so
+    // the ceiling costs those paths a *correction* and nothing else. Nothing is withheld and
+    // nothing is lost.
     expect(watcher._pending.size).toBeLessThanOrEqual(4096);
-    expect(watcher.stats().eventsQueued + watcher._pending.size).toBe(20_000);
+    expect(watcher.stats().eventsQueued).toBe(20_000);
   });
 
   it('collapses repeat writes to one path into one pending entry', async () => {
@@ -204,8 +205,10 @@ describe('debounce buffer memory', () => {
       watcher._enqueueDebounced('/synthetic/app.ts', 'modified', false, i);
       expect(watcher._pending.size).toBe(1);
     }
-    await waitFor(() => watcher.stats().queuePending > 0, { timeout: 5_000 });
-    expect(watcher.stats().queuePending).toBe(1);
+    // Two events for twenty thousand writes: the leading one, and the single correction the window
+    // owes once it closes. Memory followed the one distinct path, not the event count.
+    await waitFor(() => watcher._pending.size === 0, { timeout: 5_000 });
+    expect(watcher.stats().queuePending).toBe(2);
   });
 
   it('leaves no timer behind after stop', async () => {

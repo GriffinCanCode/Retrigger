@@ -68,6 +68,7 @@ mod ffi {
     }
 
     extern "C" {
+        pub fn rtr_hash_abi_version() -> u32;
         pub fn rtr_hash_init() -> c_int;
         pub fn rtr_hash_cpu_level() -> c_int;
         pub fn rtr_hash_active_level() -> c_int;
@@ -94,13 +95,50 @@ mod ffi {
     }
 }
 
-// The other half of the layout contract asserted in retrigger_hash.h. These
-// are compile-time: a mismatch is a build failure, never a runtime surprise.
+/// The struct layout this binding was written against, and the value it expects
+/// [`ffi::rtr_hash_abi_version`] to return. Bumped in lockstep with
+/// `RTR_HASH_ABI_VERSION` in `retrigger_hash.h`; the runtime handshake test
+/// below fails if the linked library disagrees with this number, and the
+/// compile-time assertions fail if the struct shape it describes has drifted.
+pub const EXPECTED_ABI_VERSION: u32 = 2;
+
+// The other half of the layout contract asserted in retrigger_hash.h. These are
+// compile-time: a mismatch is a build failure, never a runtime surprise. Sizes
+// alone are not enough -- two structs can share a size while a field moved -- so
+// every offset the C header pins with offsetof is pinned here too, via the
+// stable std::mem::offset_of!.
 const _: () = {
-    assert!(std::mem::size_of::<ffi::rtr_hash_file_result_t>() == 24);
-    assert!(std::mem::size_of::<ffi::rtr_benchmark_result_t>() == 48);
-    assert!(std::mem::size_of::<c_int>() == 4);
+    use std::mem::{offset_of, size_of};
+
+    assert!(size_of::<c_int>() == 4);
+
+    assert!(size_of::<ffi::rtr_hash_file_result_t>() == 24);
+    assert!(offset_of!(ffi::rtr_hash_file_result_t, hash) == 0);
+    assert!(offset_of!(ffi::rtr_hash_file_result_t, size) == 8);
+    assert!(offset_of!(ffi::rtr_hash_file_result_t, error) == 16);
+    assert!(offset_of!(ffi::rtr_hash_file_result_t, reserved) == 20);
+
+    assert!(size_of::<ffi::rtr_benchmark_result_t>() == 48);
+    assert!(offset_of!(ffi::rtr_benchmark_result_t, throughput_mbps) == 0);
+    assert!(offset_of!(ffi::rtr_benchmark_result_t, ns_per_byte) == 8);
+    assert!(offset_of!(ffi::rtr_benchmark_result_t, bytes_hashed) == 16);
+    assert!(offset_of!(ffi::rtr_benchmark_result_t, elapsed_ns) == 24);
+    assert!(offset_of!(ffi::rtr_benchmark_result_t, checksum) == 32);
+    assert!(offset_of!(ffi::rtr_benchmark_result_t, level) == 40);
+    assert!(offset_of!(ffi::rtr_benchmark_result_t, reserved) == 44);
 };
+
+/// The ABI version the linked C engine implements.
+///
+/// A hand-written FFI is only safe while both sides agree on struct layout. The
+/// compile-time assertions above catch a mismatch when this crate is built
+/// against the current header; this catches the other case -- a shared library
+/// swapped underneath a binary that was built against a different header -- by
+/// asking the engine at runtime.
+pub fn abi_version() -> u32 {
+    // SAFETY: no arguments, returns a plain integer.
+    unsafe { ffi::rtr_hash_abi_version() }
+}
 
 // ------------------------------------------------------------------- errors
 
@@ -438,6 +476,22 @@ mod tests {
     fn matches_the_published_empty_vector() {
         assert_eq!(hash(b""), XXH3_EMPTY);
         assert_eq!(hash(&[]), XXH3_EMPTY);
+    }
+
+    #[test]
+    fn abi_version_handshake_holds() {
+        // The linked engine must report exactly the ABI this binding was
+        // written for. If C bumps RTR_HASH_ABI_VERSION for a layout change, the
+        // offset_of! assertions above stop compiling and this constant must be
+        // moved in lockstep -- so a silently mismatched library cannot slip
+        // past both checks.
+        assert_eq!(
+            abi_version(),
+            EXPECTED_ABI_VERSION,
+            "linked engine reports ABI {} but this binding expects {}",
+            abi_version(),
+            EXPECTED_ABI_VERSION
+        );
     }
 
     #[test]

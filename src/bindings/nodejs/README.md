@@ -227,6 +227,26 @@ createRetrigger({
 });
 ```
 
+#### How `debounceMs` behaves
+
+Debouncing is **leading-edge with a trailing correction**, and both halves matter.
+
+The first event for a path is delivered immediately — nothing waits out the window — and further
+events for that path inside the window are absorbed. If the window absorbed anything, it closes
+with one `modified` carrying the file's final size.
+
+The correction is not redundant. Because the first event is delivered at once, it can describe a
+file that is still being written; a large save fires on its first chunk, and the write that
+completes it lands inside the window. Without the correction that completing write would never be
+reported, and the consumer would keep the partial file. So a burst costs two wake-ups, not one, and
+the second is the one that is definitely current.
+
+With `contentHashing` on, a correction whose bytes did not actually move since the leading event
+arrives with `contentChanged: false`, so it costs a hash rather than a rebuild.
+
+Deletes and renames are never absorbed: they end the window and are delivered on their own. Both
+engines implement this identically, and the parity suite holds them to it.
+
 ### Events
 
 A `Retrigger` emits seven events.
@@ -317,8 +337,9 @@ add a second, redundant invalidation for it. `/__retrigger_stats` reports the co
 The package has two requirements.
 
 - **Node.js** — 18.17 or newer.
-- **Operating system** — Linux, macOS or Windows on x64 or arm64, plus linux-arm
-  gnueabihf.
+- **Operating system** — Linux, macOS or Windows on x64 or arm64. Linux covers both
+  glibc and musl, so Alpine images get the native engine rather than the fallback;
+  the loader detects the libc and tries the other build if it guesses wrong.
 
 The JavaScript engine works on every platform Node supports, including those with no
 published native build.

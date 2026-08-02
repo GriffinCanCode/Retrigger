@@ -1,5 +1,14 @@
 import { defineConfig } from 'vitest/config';
 
+// vite is deliberately held at 6 even though 8 is current, and it is a test-only
+// dependency: nothing published imports it, and plugins/vite-plugin.js
+// reimplements normalizePath precisely so it stays that way. vite 7+ bundles
+// rolldown, which imports node:util#styleText (Node 20.12+), and because vitest
+// loads this very file through vite, an older runtime fails at startup rather
+// than in one test. That would cost the whole suite on Node 18 -- the floor
+// package.json#engines.node promises -- to gain coverage of a build pipeline
+// this package never invokes. Raise it when engines.node rises, not before.
+
 export default defineConfig({
   test: {
     environment: 'node',

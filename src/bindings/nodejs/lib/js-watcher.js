@@ -41,6 +41,16 @@ const EVENT_KINDS = Object.freeze([
   'rescanRequired',
 ]);
 
+/**
+ * Kinds a debounce window may absorb.
+ *
+ * Everything else — a delete, either half of a rename — either changes whether the path exists or
+ * says something the next event cannot restate, so it ends the window and is delivered on its own.
+ * Collapsing one would change what the stream means rather than how often it fires, and is how a
+ * dev server ends up serving a file the user deleted.
+ */
+const COALESCABLE = new Set(['created', 'modified', 'metadata']);
+
 const DEFAULT_CAPACITY = 8192;
 
 /**
@@ -475,35 +485,50 @@ class JsWatcher {
   }
 
   /**
-   * Hold `target` for its debounce window, merging with anything already waiting for it.
+   * Deliver the first event for `target` at once, then absorb repeats behind it for one window.
    *
-   * Entries are kept in deadline order, which a `Map` gives for free as long as a refreshed entry is
-   * re-inserted at the back — every window is the same length, so insertion order *is* deadline
-   * order. That is what lets one timer serve every pending path: the sweep only has to look at the
-   * front of the map.
+   * Leading edge, matching the native engine: waiting out the window before saying anything would
+   * tax every save with the full delay, which is the cost this package exists to remove. What the
+   * window absorbs is not discarded — the entry left behind owes a correction, emitted by
+   * {@link JsWatcher#_flushDue} once the window closes, carrying the path's final size. Without it
+   * a burst that *ends* inside the window would leave the consumer holding whatever the file said
+   * when it was first woken, which for a large save is a partially written file.
+   *
+   * Entries are kept in deadline order, which a `Map` gives for free: the deadline runs from the
+   * event that was *delivered* and is never extended, so insertion order is deadline order. That is
+   * what lets one timer serve every pending path — the sweep only looks at the front of the map.
+   * Not extending it is also what keeps a continuously written file being corrected once per
+   * window, rather than going silent until the writing stops.
    */
   _enqueueDebounced(target, kind, isDirectory, size) {
     const existing = this._pending.get(target);
     if (existing) {
-      this._pending.delete(target);
-      this._pending.set(target, {
-        kind: mergeKind(existing.kind, kind),
-        isDirectory,
-        size,
-        due: Date.now() + this.debounceMs,
-      });
+      // A change of existence ends the window rather than being absorbed by it: collapsing a
+      // delete, or the arrival that follows one, would change what the stream means rather than
+      // how often it fires. The native engine draws the line in the same place.
+      if (!COALESCABLE.has(kind) || !COALESCABLE.has(existing.kind)) {
+        this._pending.delete(target);
+        this._enqueue(this._makeEvent(target, kind, isDirectory, size));
+        return;
+      }
+      existing.owed = true;
+      existing.kind = kind;
+      existing.isDirectory = isDirectory;
+      existing.size = size;
       return;
     }
+
+    this._enqueue(this._makeEvent(target, kind, isDirectory, size));
     if (this._pending.size >= PENDING_LIMIT) {
-      // Past the ceiling the window is abandoned rather than buffered: emitting sooner than asked is
-      // a fidelity cost, holding an unbounded number of paths is a memory fault. See PENDING_LIMIT.
-      this._enqueue(this._makeEvent(target, kind, isDirectory, size));
+      // Past the ceiling no window is opened, so this path simply gets no correction. The event
+      // above was still delivered; see PENDING_LIMIT.
       return;
     }
     this._pending.set(target, {
       kind,
       isDirectory,
       size,
+      owed: false,
       due: Date.now() + this.debounceMs,
     });
     this._scheduleSweep();
@@ -526,7 +551,11 @@ class JsWatcher {
   }
 
   /**
-   * Emit every pending path whose window has expired, then re-arm for the rest.
+   * Close every window that has expired, emitting a correction for each one that absorbed
+   * something, then re-arm for the rest.
+   *
+   * A window that absorbed nothing closes silently: its one event was already delivered on the
+   * leading edge, so there is nothing left to restate.
    */
   _flushDue() {
     const now = Date.now();
@@ -534,7 +563,13 @@ class JsWatcher {
       // Deadline order, so the first entry that is still waiting ends the sweep.
       if (entry.due > now) break;
       this._pending.delete(target);
-      this._enqueue(this._makeEvent(target, entry.kind, entry.isDirectory, entry.size));
+      // Always a `modified`, exactly as the native engine reports it: the path exists and its
+      // content moved after the consumer was last told about it, which is the whole of what this
+      // event claims. It stands for repeat noise around one logical change, so it has no useful
+      // opinion about which of those events it replaces.
+      if (entry.owed) {
+        this._enqueue(this._makeEvent(target, 'modified', entry.isDirectory, entry.size));
+      }
     }
     this._scheduleSweep();
   }
@@ -594,15 +629,4 @@ class JsWatcher {
   }
 }
 
-/**
- * Coalescing rule for debounced events on the same path. A create followed by
- * writes is still a create; anything followed by a delete is a delete.
- */
-function mergeKind(previous, next) {
-  if (next === 'deleted') return 'deleted';
-  if (previous === 'created' && next === 'modified') return 'created';
-  if (previous === 'deleted' && next === 'created') return 'modified';
-  return next;
-}
-
-module.exports = { EVENT_KINDS, JsWatcher, mergeKind };
+module.exports = { COALESCABLE, EVENT_KINDS, JsWatcher };

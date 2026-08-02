@@ -224,22 +224,39 @@ export function runEngineSuite(engineName, makeRetrigger) {
 
     // -------------------------------------------------------------- debouncing
 
-    it('coalesces a burst of writes into a single event', async () => {
+    it('collapses a burst of writes to one event and one correction', async () => {
+      // Six writes must not be six wake-ups. They must also not be *one*: the window closes with a
+      // correction carrying the file's final bytes, because the leading event was delivered while
+      // the burst was still running and described the file part-way through it.
       const dir = tempDir();
       const target = path.join(dir, 'burst.js');
       writeFile(target, 'v0');
       const { events } = await start({ dir, debounceMs: 120 });
 
+      // Spaced tightly enough that the whole burst, plus the lag before a backend reports its tail,
+      // lands well inside the 120 ms window. A write whose notification arrived *after* the window
+      // closed would legitimately open a second one, and this test is about the first.
+      const last = 'v6'.padEnd(10, 'x');
       for (let i = 1; i <= 6; i += 1) {
-        writeFile(target, `v${i}`.padEnd(i + 4, 'x'));
-        await new Promise((r) => setTimeout(r, 15));
+        writeFile(target, i === 6 ? last : `v${i}`.padEnd(i + 4, 'x'));
+        await new Promise((r) => setTimeout(r, 5));
       }
       await waitFor(() => kindsFor(events, target).length > 0, { message: 'no debounced event' });
       await waitForQuiet(() => events.length, { quietMs: 250 });
-      expect(kindsFor(events, target)).toEqual(['modified']);
+
+      const kinds = kindsFor(events, target);
+      expect(
+        kinds.length,
+        `6 writes produced ${kinds.length} events: ${kinds}`
+      ).toBeLessThanOrEqual(2);
+      expect(new Set(kinds)).toEqual(new Set(['modified']));
+      expect(fs.readFileSync(target, 'utf8')).toBe(last);
     });
 
-    it('keeps "created" when a create is followed by writes inside the window', async () => {
+    it('reports a create at once and corrects the write that followed it', async () => {
+      // The leading event keeps its own identity — a new file is announced as created, not as a
+      // modification — and the write the window absorbed still reaches the consumer, as the
+      // correction that closes the window.
       const { dir, events } = await start({ debounceMs: 120 });
       const target = path.join(dir, 'fresh.js');
       writeFile(target, 'a');
@@ -247,7 +264,7 @@ export function runEngineSuite(engineName, makeRetrigger) {
       writeFile(target, 'ab');
       await waitFor(() => kindsFor(events, target).length > 0, { message: 'no event' });
       await waitForQuiet(() => events.length, { quietMs: 250 });
-      expect(kindsFor(events, target)).toEqual(['created']);
+      expect(kindsFor(events, target)).toEqual(['created', 'modified']);
     });
 
     // -------------------------------------------------------- content changes

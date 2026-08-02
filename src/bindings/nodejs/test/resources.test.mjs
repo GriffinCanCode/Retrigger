@@ -122,13 +122,22 @@ describe('resource hygiene', () => {
     const watcher = new Retrigger({ paths: dir, engine: 'javascript', debounceMs: 400 });
     watcher.on('all', (e) => events.push(e));
     watcher.start();
-    writeFile(path.join(dir, 'pending.js'), 'x');
+    const target = path.join(dir, 'pending.js');
+    writeFile(target, 'x');
     await new Promise((resolve) => setTimeout(resolve, 50));
+    // The second write is absorbed by the window, so a correction is owed and its timer is armed.
+    // That armed timer is the thing stop() must not let fire.
+    writeFile(target, 'xyz');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const delivered = events.length;
     watcher.stop();
     await settle();
     const timersAfterStop = countOf('Timeout');
     await new Promise((resolve) => setTimeout(resolve, 600));
-    expect(events).toHaveLength(0);
+    expect(events, 'a stopped watcher delivered its owed correction anyway').toHaveLength(
+      delivered
+    );
     expect(countOf('Timeout')).toBeLessThanOrEqual(timersAfterStop);
     watcher.close();
   });

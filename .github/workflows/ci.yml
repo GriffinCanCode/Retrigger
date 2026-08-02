@@ -117,14 +117,14 @@ jobs:
         run: npm run build
         working-directory: src/bindings/nodejs
 
-      # Vitest 4 declares node ^20 || ^22 || >=24, so it refuses to start on the
-      # two Node 18 legs. Those legs are not here to exercise the test runner
-      # though: they defend package.json#engines.node (>=18.17.0, the floor the
-      # napi9 feature is pinned to), which is a promise about the *shipped*
-      # artifact. A dev-only runner never reaches a consumer, so the step below
-      # carries Node 18 instead -- and carries it better.
+      # Unguarded on every leg, Node 18 included, and vite is held at 6 to keep
+      # it that way. Vitest 4 declares node ^20 || ^22 || >=24, but that is
+      # advisory and it runs on 18 regardless; vite 7+ is the real constraint,
+      # because it bundles rolldown, which imports node:util#styleText (Node
+      # 20.12+). With vite 7+ installed the failure is a startup error -- vitest
+      # loads this config through vite -- so it costs the entire suite on the
+      # oldest Node engines.node claims, not just the dev-server file.
       - name: JavaScript tests
-        if: matrix.node != 18
         run: npm test
         working-directory: src/bindings/nodejs
 
@@ -138,11 +138,6 @@ jobs:
 
       # The direct answer to "will it work when I install it somewhere else":
       # pack the tarball, install it into a clean directory, and require it.
-      # Deliberately unguarded, so this is what proves Node 18 support: it is
-      # plain node + assert with no runner, the tarball carries no binary, and
-      # it drives require(), ESM import, both subpath exports, a real watch
-      # cycle, hashing and clean exit -- the whole JavaScript-engine contract,
-      # on the oldest Node claimed.
       - name: Packaged install proof
         run: npm run test:pack
         working-directory: src/bindings/nodejs

@@ -138,8 +138,14 @@ BENCH_BIN := $(BIN_DIR)/bench_hash
 
 PREFIX ?= /usr/local
 
-.PHONY: all static shared test asan bench fuzz fuzz-build clean-asan clean install \
-        uninstall info help
+.PHONY: all static shared test test-shared asan tsan bench fuzz fuzz-build \
+        clean-asan clean install uninstall info help
+
+# dlopen lives in libdl on Linux and in libc everywhere else this builds.
+DL_LIBS :=
+ifeq ($(OS),linux)
+  DL_LIBS := -ldl
+endif
 
 all: static shared ## Build the static and shared libraries
 
@@ -197,6 +203,15 @@ test: $(TEST_BINS) ## Build and run the test suite (non-zero exit on failure)
 	if [ $$fail -ne 0 ]; then echo "TEST SUITE FAILED"; exit 1; fi; \
 	echo "ALL TEST BINARIES PASSED"
 
+# Load the shipped shared library and resolve its public symbols. Separate from
+# the archive-linked suite because it needs -ldl and the library's path; it
+# proves the .so/.dylib a consumer actually links is complete and correct.
+test-shared: $(SHARED_LIB) | $(BIN_DIR) ## Load the shared library and check its exported symbols
+	@echo "CC $(BIN_DIR)/shlib_check"
+	@$(CC) $(ALL_CFLAGS) -I$(TEST_DIR) -DRTR_SHARED_LIB='"$(abspath $(SHARED_LIB))"' \
+	    $(TEST_DIR)/shlib_check.c -o $(BIN_DIR)/shlib_check $(DL_LIBS)
+	@$(BIN_DIR)/shlib_check
+
 # Instrumentation shared by the sanitizer and fuzzer builds.
 #
 # _FORTIFY_SOURCE is switched back off here: it and the sanitizers instrument the
@@ -236,7 +251,34 @@ asan: ## Build and run the tests under AddressSanitizer + UBSan
 	echo "ALL ASAN TESTS PASSED"
 
 clean-asan:
-	@rm -rf $(BIN_DIR)/asan $(OBJ_DIR)/asan $(OBJ_DIR)/asan-hooked
+	@rm -rf $(BIN_DIR)/asan $(OBJ_DIR)/asan $(OBJ_DIR)/asan-hooked $(BIN_DIR)/tsan $(OBJ_DIR)/tsan
+
+# ThreadSanitizer over the multithreaded suite.
+#
+# Only the concurrency test spawns threads, so only it is worth instrumenting:
+# TSAN over single-threaded tests finds nothing and roughly doubles their cost.
+# The point is to prove the lock-free dispatch initialisation race (g_levels /
+# g_cpu_level) is genuinely benign, not merely benign on the runs we happened to
+# take. Probed by linking, like the fuzzer, since not every toolchain ships the
+# TSan runtime.
+TSAN_FLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=thread -fno-sanitize-recover=all
+HAVE_TSAN := $(shell printf 'int main(void){return 0;}\n' \
+  | $(CC) -fsanitize=thread -x c - -o /dev/null 2>/dev/null && echo yes)
+
+tsan: ## Build and run the concurrency test under ThreadSanitizer
+ifneq ($(HAVE_TSAN),yes)
+	@echo "tsan: $(CC) cannot link a -fsanitize=thread binary; skipping."
+	@echo "      The concurrency invariants are also checked without TSan by 'make test'."
+else
+	@$(MAKE) --no-print-directory clean-asan
+	$(call build_lib_variant,$(TSAN_FLAGS),$(OBJ_DIR)/tsan)
+	@mkdir -p $(BIN_DIR)/tsan
+	@echo "CC $(BIN_DIR)/tsan/test_concurrency"
+	@$(CC) $(BASE) $(TSAN_FLAGS) -I$(TEST_DIR) $(TEST_DIR)/test_concurrency.c \
+	    $(OBJ_DIR)/tsan/*.o -o $(BIN_DIR)/tsan/test_concurrency
+	@$(BIN_DIR)/tsan/test_concurrency
+	@echo "TSAN CONCURRENCY CLEAN"
+endif
 
 bench: $(BENCH_BIN) ## Build and run the benchmark
 	@$(BENCH_BIN)

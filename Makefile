@@ -177,12 +177,13 @@ PROPTEST_CASES   ?= 4096
 test-adversarial: ## Bounded, seeded adversarial suites across all three layers
 	$(call step,"C: deterministic metamorphic + contract + adversarial I/O")
 	@$(MAKE) -C $(CORE_DIR) test
+	@$(MAKE) -C $(CORE_DIR) test-shared
 	$(call step,"Rust: state-machine properties and filesystem races")
 	@cargo test -p retrigger-system $(CARGO_FLAGS) --lib properties
 	@cargo test -p retrigger-system $(CARGO_FLAGS) --test races
 	@cargo test -p retrigger-daemon $(CARGO_FLAGS) --lib config
 	$(call step,"JavaScript: property and toxic-input suites")
-	@cd $(NODE_DIR) && npx vitest run test/property.test.mjs test/toxic.test.mjs
+	@cd $(NODE_DIR) && npx vitest run test/properties.test.mjs test/content.test.mjs test/resources.test.mjs
 	$(call ok,"adversarial suites passed")
 
 .PHONY: test-chaos

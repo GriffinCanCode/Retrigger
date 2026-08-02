@@ -78,34 +78,7 @@ impl Harness {
     /// `POST` with a JSON body. The shipped client deliberately cannot send bodies, so the
     /// tests that need one speak HTTP directly.
     async fn post_json(&self, path: &str, body: &str) -> Result<HttpResponse> {
-        let mut stream = TcpStream::connect(self.address).await?;
-        let request = format!(
-            "POST {path} HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            self.address,
-            body.len()
-        );
-        stream.write_all(request.as_bytes()).await?;
-        stream.flush().await?;
-
-        let mut raw = Vec::new();
-        tokio::time::timeout(REQUEST_TIMEOUT, stream.read_to_end(&mut raw))
-            .await
-            .context("the daemon did not answer")??;
-        let text = String::from_utf8_lossy(&raw);
-        let (head, body) = text
-            .split_once("\r\n\r\n")
-            .context("no header terminator in the response")?;
-        let status = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse().ok())
-            .context("no status code in the response")?;
-        Ok(HttpResponse {
-            status,
-            body: body.to_owned(),
-        })
+        raw_post_json(self.address, path, body).await
     }
 
     async fn status(&self) -> Result<Value> {
@@ -144,6 +117,38 @@ fn answered(reply: Reply) -> Result<HttpResponse> {
         Reply::Answered(response) => Ok(response),
         Reply::Unreachable(reason) => bail!("the daemon was unreachable: {reason}"),
     }
+}
+
+/// Speak a one-shot JSON `POST` by hand, from anywhere: the shipped client cannot send bodies,
+/// and the chaos tests need to fire these from many concurrent tasks that do not share a harness.
+async fn raw_post_json(address: SocketAddr, path: &str, body: &str) -> Result<HttpResponse> {
+    let mut stream = TcpStream::connect(address).await?;
+    let request = format!(
+        "POST {path} HTTP/1.0\r\nHost: {address}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(REQUEST_TIMEOUT, stream.read_to_end(&mut raw))
+        .await
+        .context("the daemon did not answer")??;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .context("no header terminator in the response")?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .context("no status code in the response")?;
+    Ok(HttpResponse {
+        status,
+        body: body.to_owned(),
+    })
 }
 
 /// Read server-sent events until `wanted` `change` payloads have arrived or the budget expires.
@@ -454,6 +459,209 @@ async fn the_port_cannot_be_bound_twice() -> Result<()> {
         err.kind(),
         std::io::ErrorKind::AddrInUse,
         "expected an address-in-use error, got {err}"
+    );
+
+    harness.shutdown().await
+}
+
+/// Write `count` small files as fast as the disk allows, so the watcher and processor are put
+/// under a real burst rather than a metronome. Returns once every write has been issued.
+fn burst_writes(root: &Path, count: usize) -> JoinHandle<()> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        for index in 0..count {
+            let _ = std::fs::write(
+                root.join(format!("burst-{index}.txt")),
+                index.to_le_bytes(),
+            );
+        }
+    })
+}
+
+#[tokio::test]
+async fn toxic_paths_and_oversized_bodies_are_refused_without_taking_the_daemon_down() -> Result<()>
+{
+    let harness = Harness::start().await?;
+
+    // A path that is 64 KiB of slashes, a classic traversal string, an embedded NUL, and a body
+    // that is far larger than any real request: each must be refused, and none may be a 5xx that
+    // says the server fell over rather than the client sending nonsense.
+    let overlong = format!("/{}", "a/".repeat(32 * 1024));
+    let toxic_bodies = [
+        format!("{{\"path\":{overlong:?}}}"),
+        r#"{"path":"../../../../../../etc/passwd"}"#.to_owned(),
+        r#"{"path":"/tmp/has\u0000nul"}"#.to_owned(),
+        format!("{{\"path\":\"/tmp\",\"junk\":\"{}\"}}", "x".repeat(256 * 1024)),
+        format!("{{\"path\":\"{}\"", "\"".repeat(1024)), // truncated, never closes
+    ];
+    for body in &toxic_bodies {
+        let response = harness.post_json("/watch", body).await?;
+        assert!(
+            response.status >= 400,
+            "a toxic body must be refused, not accepted: {} for {} bytes",
+            response.status,
+            body.len()
+        );
+    }
+
+    // Every one of those was survivable, and the daemon is still watching the one real path.
+    assert_eq!(harness.get("/health").await?.status, 200);
+    assert_eq!(
+        harness.status().await?["watched"].as_array().map(Vec::len),
+        Some(1),
+        "no toxic path may have leaked into the watch set"
+    );
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn concurrent_watch_and_unwatch_over_http_leaves_a_consistent_watch_set() -> Result<()> {
+    let harness = Harness::start().await?;
+    let address = harness.address;
+
+    // Real subdirectories so the watch calls succeed rather than 404-ing on their own.
+    const DIRS: usize = 12;
+    let mut paths = Vec::new();
+    for index in 0..DIRS {
+        let dir = harness.path(&format!("sub-{index}"));
+        std::fs::create_dir(&dir)?;
+        paths.push(dir);
+    }
+
+    // Fire a watch and an unwatch for every directory at once. Whatever order they land in, the
+    // daemon must not deadlock, double-count, or lose track of the original root.
+    let mut handles = Vec::new();
+    for path in &paths {
+        let body = format!("{{\"path\":{:?}}}", path.display());
+        let watch = body.clone();
+        handles.push(tokio::spawn(async move {
+            raw_post_json(address, "/watch", &watch).await
+        }));
+        handles.push(tokio::spawn(async move {
+            raw_post_json(address, "/unwatch", &body).await
+        }));
+    }
+    for handle in handles {
+        // A panicked task or a torn response is the failure we are hunting; surface it.
+        let response = handle.await??;
+        assert!(
+            response.status < 500,
+            "a concurrent watch/unwatch must never 5xx: {}",
+            response.status
+        );
+    }
+
+    // The set landed somewhere between "only the root" and "the root plus every subdir", and the
+    // daemon is still healthy either way.
+    assert_eq!(harness.get("/health").await?.status, 200);
+    let watched = harness.status().await?["watched"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+    assert!(
+        (1..=DIRS + 1).contains(&watched),
+        "the watch set is inconsistent after concurrent churn: {watched} roots"
+    );
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn a_subscriber_that_never_reads_cannot_stall_the_daemon() -> Result<()> {
+    // The bounded per-client channel exists precisely so one slow reader cannot become everyone's
+    // problem. Open a stream, ask for events, then never read a byte, and prove the rest of the
+    // daemon stays responsive while its buffer to that client backs up.
+    let harness = Harness::start().await?;
+
+    let mut deadbeat = TcpStream::connect(harness.address).await?;
+    deadbeat
+        .write_all(
+            format!(
+                "GET /events HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
+                harness.address
+            )
+            .as_bytes(),
+        )
+        .await?;
+    deadbeat.flush().await?;
+    harness.await_subscribers(1, Duration::from_secs(10)).await?;
+
+    // Enough events to overflow the 64-slot client buffer several times over.
+    let writer = burst_writes(harness.dir.path(), 500);
+
+    // While that client's buffer backs up, health must keep answering promptly.
+    for _ in 0..10 {
+        let started = Instant::now();
+        assert_eq!(harness.get("/health").await?.status, 200);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a stalled subscriber must not slow other clients: health took {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    writer.await.ok();
+    drop(deadbeat);
+    // Dropping the socket must let the subscriber count fall back to zero.
+    harness
+        .await_subscribers(0, Duration::from_secs(10))
+        .await
+        .context("the stalled subscriber was never reaped after its socket closed")?;
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn watcher_accounting_stays_consistent_after_a_burst() -> Result<()> {
+    let harness = Harness::start().await?;
+
+    let writer = burst_writes(harness.dir.path(), 400);
+    writer.await.ok();
+
+    // Let the pump work, then read a snapshot and hold every counter to the relationships it can
+    // never legitimately violate. A miscount or a double-delivery bug shows up here.
+    let deadline = Instant::now() + EVENT_BUDGET;
+    while Instant::now() < deadline {
+        if harness.status().await?["events_processed"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let status = harness.status().await?;
+    let watcher = &status["watcher"];
+    let queued = watcher["events_queued"].as_u64().unwrap_or(0);
+    let delivered = watcher["events_delivered"].as_u64().unwrap_or(0);
+    let synthesized = watcher["events_synthesized"].as_u64().unwrap_or(0);
+    let pending = watcher["queue_pending"].as_u64().unwrap_or(0);
+    let capacity = watcher["queue_capacity"].as_u64().unwrap_or(0);
+
+    assert!(
+        delivered <= queued,
+        "more events were delivered ({delivered}) than were ever queued ({queued})"
+    );
+    assert!(
+        synthesized <= queued,
+        "synthesized events ({synthesized}) are a subset of queued ({queued})"
+    );
+    assert!(
+        pending <= capacity + 1,
+        "pending ({pending}) exceeded the queue bound ({capacity}) by more than the held rescan"
+    );
+
+    let processed = status["events_processed"].as_u64().unwrap_or(0);
+    let changes = status["changes_detected"].as_u64().unwrap_or(0);
+    let hashed = status["processor"]["files_hashed"].as_u64().unwrap_or(0);
+    assert!(
+        changes <= processed,
+        "content changes ({changes}) cannot exceed processed events ({processed})"
+    );
+    assert!(
+        hashed <= processed,
+        "the processor hashed ({hashed}) more times than it saw events ({processed})"
     );
 
     harness.shutdown().await
