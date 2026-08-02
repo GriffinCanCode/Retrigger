@@ -22,7 +22,13 @@ pnpm-lock.yaml
 # hand-written entry points, so the build redirects the generated one into here
 # rather than overwriting them. The generated loader is suppressed outright
 # with --no-js, since nothing consumes it.
+#
+# npm/ holds one directory per platform package, generated from napi.targets by
+# `napi create-npm-dirs` and filled in by `napi artifacts` during a release.
+# Committing it would mean a second, hand-stale copy of a list package.json
+# already owns -- and the release regenerates it from scratch either way.
 /.napi/
+/npm/
 /dist/
 /out/
 /build/
