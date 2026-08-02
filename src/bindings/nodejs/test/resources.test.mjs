@@ -57,7 +57,14 @@ describe('resource hygiene', () => {
 
     watcher.stop();
     await settle();
-    expect(watcherResourceTotal()).toBe(baseline);
+    // Only the upper bound is the watcher's to answer for. `Timeout` is one of
+    // WATCHED_KINDS and the count is process-global, so the runner's own timer
+    // can retire between the two samples and carry the total below the baseline
+    // -- which is not a leak, and is the only direction an exact match fails in.
+    await waitFor(() => watcherResourceTotal() <= baseline, {
+      timeout: 2000,
+      message: `watcher resources still held after stop() (baseline=${baseline})`,
+    });
   });
 
   it('does not accumulate handles across repeated start/stop cycles', async () => {
@@ -80,7 +87,12 @@ describe('resource hygiene', () => {
       watcher.stop();
       await settle();
     }
-    expect(watcherResourceTotal()).toBe(afterFirstCycle);
+    // Accumulation is the failure being looked for, so the bound is one-sided
+    // for the same reason as above.
+    await waitFor(() => watcherResourceTotal() <= afterFirstCycle, {
+      timeout: 2000,
+      message: `handles accumulated across start/stop cycles (after one cycle=${afterFirstCycle})`,
+    });
     watcher.close();
   });
 
