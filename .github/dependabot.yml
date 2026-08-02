@@ -47,6 +47,19 @@ updates:
     ignore:
       - dependency-name: '@retrigger/daemon-*'
 
+  # The benchmark harness compares @retrigger/core against chokidar, watchpack
+  # and @parcel/watcher. A stale competitor is not a neutral omission here: it
+  # makes the published numbers flattering rather than true, so these are
+  # tracked like any shipped dependency.
+  - package-ecosystem: npm
+    directory: /tools/benchmarks
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: 'deps(bench)'
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

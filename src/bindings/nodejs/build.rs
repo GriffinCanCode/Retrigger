@@ -1,1 +1,3 @@
-../../daemon/retrigger-bindings/build.rs
+fn main() {
+    napi_build::setup();
+}

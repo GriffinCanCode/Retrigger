@@ -77,6 +77,20 @@ watcher.on('unlink', (path) => console.log('removed', path));
 watcher.start();
 ```
 
+Every event says whether the bytes actually changed, so a write that rewrote a file with the
+contents it already had can be told apart from an edit:
+
+```javascript
+watcher.on('change', (path, event) => {
+  if (event.contentChanged === false) return; // a formatter on save; nothing to rebuild
+  rebuild(path);
+});
+```
+
+That comparison is a path against its own previous digest, so it works on both engines even though
+they hash with different algorithms. `contentHashing: false` turns it off; events are then delivered
+without the field.
+
 Hashing is exposed directly, and is the same engine the watcher uses.
 
 ```javascript
@@ -86,10 +100,14 @@ const {
   getEngineInfo,
 } = require('@retrigger/core');
 
-hashBytesSync(Buffer.from('abc')); // '78af5f94892f3950'  (canonical XXH3-64)
+hashBytesSync(Buffer.from('abc')); // '78af5f94892f3950' on the native engine
 hashFileSync('./src/index.ts'); // { hash: '…', size: 1234 }
 getEngineInfo(); // which engine loaded, and why
 ```
+
+That digest is canonical XXH3-64 only when the native engine loaded. The JavaScript engine returns
+a BLAKE2b-64 digest of the same shape, and `getEngineInfo().hashAlgorithm` says which you have.
+Never persist a digest from one engine and compare it against the other.
 
 ### Bundler Plugins
 
@@ -112,6 +130,12 @@ export default {
   plugins: [createRetriggerVitePlugin({ watchPaths: ['./src'] })],
 };
 ```
+
+Both plugins hash before they invalidate. A write that did not change a file's bytes is not
+reported to webpack and does not reach Vite's HMR pipeline, so a formatter on save, a generator
+that reran, or a branch switch that restored the same contents costs nothing. `contentHashing:
+false` restores the ordinary behaviour of rebuilding on every write. The count of writes each
+plugin suppressed is `metrics.eventsUnchanged`, which Vite serves at `/__retrigger_stats`.
 
 ## Installation
 
@@ -198,15 +222,22 @@ and `linux/x86-64`.
 - **C under ASan/UBSan** — passes on both.
 - **Rust workspace** — passes on both.
 - **Native addon artifact** — passes on both.
-- **JavaScript, 267 tests** — passes on both.
+- **JavaScript, 306 tests** — passes on both.
 - **Packaged install, 12 checks** — passes on both.
 
 The C suite runs a differential test that hashes the same inputs through every SIMD level
 the CPU offers and compares them against scalar, so "AVX2 is enabled" is a measurement
 rather than an assumption.
 
-Published XXH3-64 vectors are checked from C, from Rust, from the Node addon, and from the
-JavaScript fallback.
+Published XXH3-64 vectors are checked from C, from Rust, and from the Node addon. The
+JavaScript fallback is checked against published BLAKE2b vectors, because that is the
+algorithm it actually uses.
+
+What the two engines are held to _jointly_ is the content-change decision, which is the thing
+a consumer depends on. One suite runs against the compiled addon, a mock addon, and the
+JavaScript engine, and all three must agree on which writes changed a file's bytes — from
+digests that are deliberately not comparable, because each engine only ever compares a path
+against its own earlier digest.
 
 ## The Optional Daemon
 

@@ -1,8 +1,9 @@
 # Keep clippy's suggestions inside the MSRV the workspace advertises. Without
-# this, clippy proposes rewrites using APIs newer than rust-version = "1.75",
-# and CI's `-D warnings` turns that suggestion into a failure the MSRV job then
-# contradicts.
-msrv = "1.75"
+# this, clippy proposes rewrites using APIs newer than rust-version, and CI's
+# `-D warnings` turns that suggestion into a failure the MSRV job then
+# contradicts. This must track [workspace.package] rust-version in Cargo.toml:
+# notify 8 requires 1.77, criterion 0.8 requires 1.86, and napi 3 requires 1.88.
+msrv = "1.88"
 
 # A file watcher walks paths constantly; the default threshold flags the
 # recursive descent helpers without saying anything useful about them.

@@ -1,677 +1,708 @@
-//! Retrigger Core - High-performance hashing engine
+//! XXH3-64 hashing, backed by the C engine in `src/core`.
 //!
-//! This crate provides the core hashing functionality with SIMD optimizations.
-//! Follows the Single Responsibility Principle - only handles hash computation.
+//! # One algorithm, always
+//!
+//! An earlier version of this crate chose between BLAKE3 and XXH3 depending on
+//! input size. That meant the same bytes produced different digests depending
+//! on how large the file was, and nothing outside this crate — least of all the
+//! JavaScript layer — could reproduce a hash without knowing the threshold.
+//! There is now exactly one algorithm. `hash(x)` is XXH3-64 of `x`, on every
+//! platform, at every size, from every entry point.
+//!
+//! # SIMD is a runtime decision
+//!
+//! The C engine detects CPU features at runtime and dispatches to a scalar,
+//! NEON, SSE2, AVX2, or AVX-512 kernel. All of them compute identical values;
+//! the C test suite proves this by running the same inputs through every
+//! kernel the host supports, and validates the result against reference
+//! vectors taken from upstream xxHash.
+//!
+//! # The FFI declarations are hand-written
+//!
+//! Deliberately, so that building from source does not require `libclang` for
+//! bindgen. What makes that safe is that both sides assert the layout
+//! independently: `retrigger_hash.h` carries `_Static_assert`s and this module
+//! carries matching `const` assertions. If the two ever disagree, one of them
+//! stops compiling.
+
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::fmt;
+use std::io;
+use std::path::Path;
+use std::ptr::NonNull;
 
 use serde::{Deserialize, Serialize};
-use std::ffi::CString;
-use std::path::Path;
-use std::ptr;
 use thiserror::Error;
 
-// Include generated C bindings
-#[allow(non_upper_case_globals)]
+// ---------------------------------------------------------------------- ffi
+
 #[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-#[allow(dead_code)]
 mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+    use super::{c_char, c_int, c_void};
+
+    /// Opaque streaming state owned by the C engine.
+    #[repr(C)]
+    pub struct rtr_hash_state {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct rtr_hash_file_result_t {
+        pub hash: u64,
+        pub size: u64,
+        pub error: i32,
+        pub reserved: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct rtr_benchmark_result_t {
+        pub throughput_mbps: f64,
+        pub ns_per_byte: f64,
+        pub bytes_hashed: u64,
+        pub elapsed_ns: u64,
+        pub checksum: u64,
+        pub level: i32,
+        pub reserved: i32,
+    }
+
+    extern "C" {
+        pub fn rtr_hash_init() -> c_int;
+        pub fn rtr_hash_cpu_level() -> c_int;
+        pub fn rtr_hash_active_level() -> c_int;
+        pub fn rtr_hash_available_levels() -> u32;
+        pub fn rtr_hash_force_level(level: c_int) -> c_int;
+        pub fn rtr_hash_reset_level();
+        pub fn rtr_hash_level_str(level: c_int) -> *const c_char;
+
+        pub fn rtr_hash64(data: *const c_void, len: usize) -> u64;
+        pub fn rtr_hash64_seed(data: *const c_void, len: usize, seed: u64) -> u64;
+
+        pub fn rtr_hash_create() -> *mut rtr_hash_state;
+        pub fn rtr_hash_destroy(state: *mut rtr_hash_state);
+        pub fn rtr_hash_reset(state: *mut rtr_hash_state, seed: u64) -> c_int;
+        pub fn rtr_hash_update(
+            state: *mut rtr_hash_state,
+            data: *const c_void,
+            len: usize,
+        ) -> c_int;
+        pub fn rtr_hash_digest(state: *const rtr_hash_state) -> u64;
+
+        pub fn rtr_hash_file(path: *const c_char) -> rtr_hash_file_result_t;
+        pub fn rtr_hash_benchmark(test_size: usize, iterations: u32) -> rtr_benchmark_result_t;
+    }
 }
 
-/// Errors that can occur during hashing operations
-#[derive(Error, Debug)]
+// The other half of the layout contract asserted in retrigger_hash.h. These
+// are compile-time: a mismatch is a build failure, never a runtime surprise.
+const _: () = {
+    assert!(std::mem::size_of::<ffi::rtr_hash_file_result_t>() == 24);
+    assert!(std::mem::size_of::<ffi::rtr_benchmark_result_t>() == 48);
+    assert!(std::mem::size_of::<c_int>() == 4);
+};
+
+// ------------------------------------------------------------------- errors
+
+/// Something went wrong hashing.
+#[derive(Debug, Error)]
 pub enum HashError {
-    #[error("Invalid file path: {0}")]
+    /// The path contained an interior NUL and cannot cross the C boundary.
+    #[error("path is not representable as a C string: {0}")]
     InvalidPath(String),
-    #[error("Hash computation failed")]
-    ComputationFailed,
-    #[error("Incremental hasher not initialized")]
-    HasherNotInitialized,
+
+    /// The OS refused the read; carries the original `errno`.
+    #[error("could not hash {path}: {source}")]
+    Io {
+        /// The file being hashed.
+        path: String,
+        /// The underlying OS error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The engine could not allocate streaming state.
+    #[error("hash engine failed to allocate streaming state")]
+    Alloc,
+
+    /// The requested SIMD level is not usable on this CPU or was not compiled.
+    #[error("SIMD level {0} is unavailable on this machine")]
+    UnsupportedLevel(SimdLevel),
 }
 
-/// Result of a hash computation
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HashResult {
-    pub hash: u64,
-    pub size: u32,
-    pub is_incremental: bool,
-}
+// -------------------------------------------------------------------- level
 
-/// SIMD optimization levels available
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A hash kernel. Every level computes identical values; they differ only in
+/// how much of the CPU they use to get there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SimdLevel {
-    None = 0,
-    Neon = 1,
-    Avx2 = 2,
-    Avx512 = 3,
-    Blake3 = 4, // BLAKE3's built-in SIMD
+    /// Portable C. Available everywhere.
+    Scalar,
+    /// AArch64 / ARMv7 NEON.
+    Neon,
+    /// x86-64 baseline SSE2.
+    Sse2,
+    /// x86-64 AVX2.
+    Avx2,
+    /// x86-64 AVX-512F.
+    Avx512,
 }
 
-/// Hash algorithm selection strategy
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HashStrategy {
-    /// Use BLAKE3 for all files (secure + fast for large files)
-    Blake3Only,
-    /// Use XXH3 for all files (fastest for small files)
-    Xxh3Only,
-    /// Hybrid: BLAKE3 for files >1MB, XXH3 for smaller (optimal)
-    Hybrid,
-    /// Auto-detect best algorithm based on data characteristics
-    Auto,
-}
-
-impl From<ffi::rtr_simd_level_t> for SimdLevel {
-    fn from(level: ffi::rtr_simd_level_t) -> Self {
-        match level {
-            ffi::rtr_simd_level_t_RTR_SIMD_NONE => SimdLevel::None,
-            ffi::rtr_simd_level_t_RTR_SIMD_NEON => SimdLevel::Neon,
-            ffi::rtr_simd_level_t_RTR_SIMD_AVX2 => SimdLevel::Avx2,
-            ffi::rtr_simd_level_t_RTR_SIMD_AVX512 => SimdLevel::Avx512,
-            _ => SimdLevel::None,
-        }
-    }
-}
-
-impl From<ffi::rtr_hash_result_t> for HashResult {
-    fn from(result: ffi::rtr_hash_result_t) -> Self {
-        HashResult {
-            hash: result.hash,
-            size: result.size,
-            is_incremental: result.is_incremental,
-        }
-    }
-}
-
-/// Benchmark results for performance testing
-#[derive(Debug, Clone)]
-pub struct BenchmarkResult {
-    pub throughput_mbps: f64,
-    pub cycles_per_byte: u64,
-    pub latency_ns: u32,
-}
-
-impl From<ffi::rtr_benchmark_result_t> for BenchmarkResult {
-    fn from(result: ffi::rtr_benchmark_result_t) -> Self {
-        BenchmarkResult {
-            throughput_mbps: result.throughput_mbps,
-            cycles_per_byte: result.cycles_per_byte,
-            latency_ns: result.latency_ns,
-        }
-    }
-}
-
-/// Fast hash trait for extensibility (Interface Segregation Principle)
-pub trait FastHash {
-    fn hash_bytes(&self, data: &[u8]) -> Result<HashResult, HashError>;
-    fn hash_file<P: AsRef<Path>>(&self, path: P) -> Result<HashResult, HashError>;
-}
-
-/// Incremental hasher for streaming large files
-pub trait IncrementalHash {
-    fn new(block_size: Option<u32>) -> Result<Self, HashError>
-    where
-        Self: Sized;
-    fn update(&mut self, data: &[u8]) -> Result<HashResult, HashError>;
-    fn finalize(self) -> Result<HashResult, HashError>;
-}
-
-/// Main hashing engine - Hybrid pattern for optimal performance
-pub struct HashEngine {
-    interface: *const ffi::rtr_hash_interface_t,
-    simd_level: SimdLevel,
-    strategy: HashStrategy,
-}
-
-/// BLAKE3-specific hasher for large files
-#[derive(Default)]
-pub struct Blake3FastHash {
-    hasher: blake3::Hasher,
-}
-
-impl Blake3FastHash {
-    pub fn new() -> Self {
-        Self {
-            hasher: blake3::Hasher::new(),
+impl SimdLevel {
+    fn from_raw(v: c_int) -> Self {
+        match v {
+            1 => Self::Neon,
+            2 => Self::Sse2,
+            3 => Self::Avx2,
+            4 => Self::Avx512,
+            _ => Self::Scalar,
         }
     }
 
-    pub fn hash_bytes(&mut self, data: &[u8]) -> Result<HashResult, HashError> {
-        self.hasher.reset();
-        self.hasher.update(data);
-        let hash = self.hasher.finalize();
-
-        // Convert BLAKE3 hash to u64 for compatibility
-        let bytes = hash.as_bytes();
-        let hash_u64 = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-
-        Ok(HashResult {
-            hash: hash_u64,
-            size: data.len() as u32,
-            is_incremental: false,
-        })
-    }
-}
-
-/// SIMD-optimized file size threshold for algorithm selection
-const HYBRID_THRESHOLD: usize = 1024 * 1024; // 1MB
-
-unsafe impl Send for HashEngine {}
-unsafe impl Sync for HashEngine {}
-
-impl HashEngine {
-    /// Initialize the hash engine with optimal SIMD support and hybrid strategy
-    pub fn new() -> Self {
-        Self::with_strategy(HashStrategy::Hybrid)
-    }
-
-    /// Initialize with specific hash strategy
-    pub fn with_strategy(strategy: HashStrategy) -> Self {
-        let simd_level = unsafe { ffi::rtr_hash_init() };
-        let interface = unsafe { ffi::rtr_hash_get_interface() };
-
-        HashEngine {
-            interface,
-            simd_level: simd_level.into(),
-            strategy,
+    fn as_raw(self) -> c_int {
+        match self {
+            Self::Scalar => 0,
+            Self::Neon => 1,
+            Self::Sse2 => 2,
+            Self::Avx2 => 3,
+            Self::Avx512 => 4,
         }
     }
 
-    /// Get current hash strategy
-    pub fn strategy(&self) -> HashStrategy {
-        self.strategy
-    }
-
-    /// Get the current SIMD optimization level
-    pub fn simd_level(&self) -> SimdLevel {
-        self.simd_level
-    }
-
-    /// Detect available SIMD support
-    pub fn detect_simd() -> SimdLevel {
-        let level = unsafe { ffi::rtr_detect_simd_support() };
-        level.into()
-    }
-
-    /// Run benchmark for performance testing
-    pub fn benchmark(&self, test_size: usize) -> BenchmarkResult {
-        let result = unsafe { ffi::rtr_benchmark_hash(test_size) };
-        result.into()
-    }
-}
-
-impl Default for HashEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FastHash for HashEngine {
-    fn hash_bytes(&self, data: &[u8]) -> Result<HashResult, HashError> {
-        match self.strategy {
-            HashStrategy::Blake3Only => self.hash_bytes_blake3(data),
-            HashStrategy::Xxh3Only => self.hash_bytes_xxh3(data),
-            HashStrategy::Hybrid => {
-                // Use BLAKE3 for large files, XXH3 for small files
-                if data.len() >= HYBRID_THRESHOLD {
-                    self.hash_bytes_blake3(data)
-                } else {
-                    self.hash_bytes_xxh3(data)
-                }
-            }
-            HashStrategy::Auto => {
-                // Auto-detect based on data characteristics
-                self.hash_bytes_auto(data)
-            }
-        }
-    }
-
-    fn hash_file<P: AsRef<Path>>(&self, path: P) -> Result<HashResult, HashError> {
-        // For files, we can check size before reading
-        let metadata = std::fs::metadata(&path)
-            .map_err(|_| HashError::InvalidPath(path.as_ref().display().to_string()))?;
-
-        match self.strategy {
-            HashStrategy::Blake3Only => self.hash_file_blake3(&path),
-            HashStrategy::Xxh3Only => self.hash_file_xxh3(&path),
-            HashStrategy::Hybrid => {
-                if metadata.len() >= HYBRID_THRESHOLD as u64 {
-                    self.hash_file_blake3(&path)
-                } else {
-                    self.hash_file_xxh3(&path)
-                }
-            }
-            HashStrategy::Auto => self.hash_file_auto(&path, metadata.len()),
-        }
-    }
-}
-
-impl HashEngine {
-    /// Hash bytes using BLAKE3
-    fn hash_bytes_blake3(&self, data: &[u8]) -> Result<HashResult, HashError> {
-        let hash = blake3::hash(data);
-        let bytes = hash.as_bytes();
-        let hash_u64 = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-
-        Ok(HashResult {
-            hash: hash_u64,
-            size: data.len() as u32,
-            is_incremental: false,
-        })
-    }
-
-    /// Hash bytes using optimized XXH3
-    fn hash_bytes_xxh3(&self, data: &[u8]) -> Result<HashResult, HashError> {
-        if self.interface.is_null() {
-            // Re-initialize if interface is null
-            let _ = unsafe { ffi::rtr_hash_init() };
-            let interface = unsafe { ffi::rtr_hash_get_interface() };
-            if interface.is_null() {
-                return Err(HashError::ComputationFailed);
-            }
-        }
-
-        let result = unsafe {
-            let hash_fn = (*self.interface).hash_buffer;
-            if hash_fn.is_none() {
-                return Err(HashError::ComputationFailed);
-            }
-            hash_fn.unwrap()(data.as_ptr() as *const _, data.len())
-        };
-
-        Ok(result.into())
-    }
-
-    /// Auto-detect best algorithm for data
-    fn hash_bytes_auto(&self, data: &[u8]) -> Result<HashResult, HashError> {
-        // For auto-detection, analyze data characteristics
-        let entropy = self.calculate_entropy(data);
-
-        // High entropy data benefits more from BLAKE3's parallelism
-        // Low entropy data is better with XXH3's speed
-        if entropy > 0.8 || data.len() >= HYBRID_THRESHOLD {
-            self.hash_bytes_blake3(data)
-        } else {
-            self.hash_bytes_xxh3(data)
-        }
-    }
-
-    /// Hash file using BLAKE3
-    fn hash_file_blake3<P: AsRef<Path>>(&self, path: P) -> Result<HashResult, HashError> {
-        let data = std::fs::read(&path)
-            .map_err(|_| HashError::InvalidPath(path.as_ref().display().to_string()))?;
-
-        self.hash_bytes_blake3(&data)
-    }
-
-    /// Hash file using XXH3
-    fn hash_file_xxh3<P: AsRef<Path>>(&self, path: P) -> Result<HashResult, HashError> {
-        if self.interface.is_null() {
-            return Err(HashError::ComputationFailed);
-        }
-
-        let path_str = path
-            .as_ref()
+    /// The engine's own name for this level.
+    pub fn name(self) -> &'static str {
+        // SAFETY: the C function returns a static, never-NULL string for any
+        // input, including values outside the enum.
+        unsafe { CStr::from_ptr(ffi::rtr_hash_level_str(self.as_raw())) }
             .to_str()
-            .ok_or_else(|| HashError::InvalidPath(path.as_ref().display().to_string()))?;
-
-        let c_path =
-            CString::new(path_str).map_err(|_| HashError::InvalidPath(path_str.to_string()))?;
-
-        let result = unsafe {
-            let hash_fn = (*self.interface).hash_file;
-            if hash_fn.is_none() {
-                return Err(HashError::ComputationFailed);
-            }
-            hash_fn.unwrap()(c_path.as_ptr())
-        };
-
-        if result.hash == 0 && result.size == 0 {
-            return Err(HashError::ComputationFailed);
-        }
-
-        Ok(result.into())
-    }
-
-    /// Auto-detect best algorithm for file
-    fn hash_file_auto<P: AsRef<Path>>(&self, path: P, size: u64) -> Result<HashResult, HashError> {
-        // For large files, always use BLAKE3 due to parallelism
-        if size >= HYBRID_THRESHOLD as u64 {
-            return self.hash_file_blake3(&path);
-        }
-
-        // For smaller files, we could sample to determine entropy
-        // For now, just use XXH3 for speed
-        self.hash_file_xxh3(&path)
-    }
-
-    /// Calculate Shannon entropy of data (simplified)
-    fn calculate_entropy(&self, data: &[u8]) -> f64 {
-        if data.is_empty() {
-            return 0.0;
-        }
-
-        let mut counts = [0u32; 256];
-        for &byte in data {
-            counts[byte as usize] += 1;
-        }
-
-        let len = data.len() as f64;
-        let mut entropy = 0.0;
-
-        for &count in &counts {
-            if count > 0 {
-                let p = count as f64 / len;
-                entropy -= p * p.log2();
-            }
-        }
-
-        entropy / 8.0 // Normalize to 0-1 range
+            .unwrap_or("unknown")
     }
 }
 
-/// Incremental hasher implementation
-pub struct IncrementalHasher {
-    hasher: *mut ffi::rtr_hasher_t,
-    interface: *const ffi::rtr_hash_interface_t,
-}
-
-impl IncrementalHasher {
-    fn get_interface() -> *const ffi::rtr_hash_interface_t {
-        unsafe { ffi::rtr_hash_get_interface() }
+impl fmt::Display for SimdLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 
-impl IncrementalHash for IncrementalHasher {
-    fn new(block_size: Option<u32>) -> Result<Self, HashError> {
-        let interface = Self::get_interface();
-        if interface.is_null() {
-            return Err(HashError::HasherNotInitialized);
-        }
+/// The best level this CPU supports.
+pub fn cpu_level() -> SimdLevel {
+    // SAFETY: no arguments, no pointers; the engine self-initializes.
+    SimdLevel::from_raw(unsafe { ffi::rtr_hash_cpu_level() })
+}
 
-        let hasher = unsafe {
-            let create_fn = (*interface).create_incremental;
-            if create_fn.is_none() {
-                return Err(HashError::HasherNotInitialized);
-            }
-            create_fn.unwrap()(block_size.unwrap_or(4096))
-        };
+/// The level currently dispatching, which differs from [`cpu_level`] only
+/// after a call to [`force_level`].
+pub fn active_level() -> SimdLevel {
+    // SAFETY: as above.
+    SimdLevel::from_raw(unsafe { ffi::rtr_hash_active_level() })
+}
 
-        if hasher.is_null() {
-            return Err(HashError::HasherNotInitialized);
-        }
+/// Every level usable on this machine, lowest first.
+pub fn available_levels() -> Vec<SimdLevel> {
+    // SAFETY: as above.
+    let mask = unsafe { ffi::rtr_hash_available_levels() };
+    [
+        SimdLevel::Scalar,
+        SimdLevel::Neon,
+        SimdLevel::Sse2,
+        SimdLevel::Avx2,
+        SimdLevel::Avx512,
+    ]
+    .into_iter()
+    .filter(|l| mask & (1 << l.as_raw()) != 0)
+    .collect()
+}
 
-        Ok(IncrementalHasher { hasher, interface })
-    }
-
-    fn update(&mut self, data: &[u8]) -> Result<HashResult, HashError> {
-        if self.hasher.is_null() || self.interface.is_null() {
-            return Err(HashError::HasherNotInitialized);
-        }
-
-        let result = unsafe {
-            let update_fn = (*self.interface).update_incremental;
-            if update_fn.is_none() {
-                return Err(HashError::HasherNotInitialized);
-            }
-            update_fn.unwrap()(self.hasher, data.as_ptr() as *const _, data.len())
-        };
-
-        Ok(result.into())
-    }
-
-    fn finalize(mut self) -> Result<HashResult, HashError> {
-        if self.hasher.is_null() || self.interface.is_null() {
-            return Err(HashError::HasherNotInitialized);
-        }
-
-        let result = unsafe {
-            let finalize_fn = (*self.interface).finalize_incremental;
-            if finalize_fn.is_none() {
-                return Err(HashError::HasherNotInitialized);
-            }
-            finalize_fn.unwrap()(self.hasher)
-        };
-
-        // Prevent double-free by setting to null
-        self.hasher = ptr::null_mut();
-
-        Ok(result.into())
+/// Pin dispatch to one kernel.
+///
+/// This exists for differential testing and for bisecting a suspected kernel
+/// bug in the field. It is process-global and is **not** safe to call while
+/// other threads are hashing.
+pub fn force_level(level: SimdLevel) -> Result<(), HashError> {
+    // SAFETY: passes a plain integer; the engine validates it and reports
+    // failure rather than trusting the caller.
+    if unsafe { ffi::rtr_hash_force_level(level.as_raw()) } == 0 {
+        Ok(())
+    } else {
+        Err(HashError::UnsupportedLevel(level))
     }
 }
 
-impl Drop for IncrementalHasher {
+/// Undo [`force_level`] and return to CPU-selected dispatch.
+pub fn reset_level() {
+    // SAFETY: no arguments.
+    unsafe { ffi::rtr_hash_reset_level() }
+}
+
+/// Initialize dispatch eagerly and report the level chosen. Optional: every
+/// entry point initializes on demand.
+pub fn init() -> SimdLevel {
+    // SAFETY: idempotent and thread-safe per the engine's contract.
+    SimdLevel::from_raw(unsafe { ffi::rtr_hash_init() })
+}
+
+// --------------------------------------------------------------- one-shot
+
+/// XXH3-64 of `data` with a zero seed.
+pub fn hash(data: &[u8]) -> u64 {
+    // SAFETY: pointer and length come from the same live slice. An empty slice
+    // yields a dangling-but-aligned pointer with len 0, which the engine
+    // handles as the documented empty-input case.
+    unsafe { ffi::rtr_hash64(data.as_ptr() as *const c_void, data.len()) }
+}
+
+/// XXH3-64 of `data` with an explicit seed.
+pub fn hash_with_seed(data: &[u8], seed: u64) -> u64 {
+    // SAFETY: as [`hash`].
+    unsafe { ffi::rtr_hash64_seed(data.as_ptr() as *const c_void, data.len(), seed) }
+}
+
+/// Lowercase, zero-padded 16-character hex, the form the Node layer exchanges.
+pub fn to_hex(hash: u64) -> String {
+    format!("{hash:016x}")
+}
+
+// --------------------------------------------------------------- streaming
+
+/// Incremental hasher. Feeding bytes in any chunking produces exactly the
+/// digest that [`hash`] gives for the concatenation.
+pub struct Hasher {
+    state: NonNull<ffi::rtr_hash_state>,
+}
+
+// SAFETY: the state is a plain allocation owned exclusively by this handle.
+// The engine keeps no global mutable state on the hashing path (dispatch
+// selection is set up once and only mutated by force_level, which is
+// documented as setup-only), so moving a Hasher between threads is sound.
+unsafe impl Send for Hasher {}
+
+impl Hasher {
+    /// A hasher with a zero seed.
+    pub fn new() -> Result<Self, HashError> {
+        Self::with_seed(0)
+    }
+
+    /// A hasher with an explicit seed.
+    pub fn with_seed(seed: u64) -> Result<Self, HashError> {
+        // SAFETY: the engine either returns a valid pointer or NULL.
+        let raw = unsafe { ffi::rtr_hash_create() };
+        let state = NonNull::new(raw).ok_or(HashError::Alloc)?;
+        let mut this = Self { state };
+        this.reset(seed);
+        Ok(this)
+    }
+
+    /// Absorb more bytes.
+    pub fn update(&mut self, data: &[u8]) {
+        // SAFETY: `state` is a live allocation we own; pointer and length come
+        // from the same live slice.
+        unsafe {
+            ffi::rtr_hash_update(
+                self.state.as_ptr(),
+                data.as_ptr() as *const c_void,
+                data.len(),
+            );
+        }
+    }
+
+    /// The digest so far. Non-destructive; the hasher may be updated further.
+    pub fn digest(&self) -> u64 {
+        // SAFETY: `state` is live and the call does not mutate it.
+        unsafe { ffi::rtr_hash_digest(self.state.as_ptr()) }
+    }
+
+    /// Return to the initial state so one allocation can hash many inputs.
+    pub fn reset(&mut self, seed: u64) {
+        // SAFETY: `state` is live and owned by us.
+        unsafe {
+            ffi::rtr_hash_reset(self.state.as_ptr(), seed);
+        }
+    }
+}
+
+impl Drop for Hasher {
     fn drop(&mut self) {
-        if !self.hasher.is_null() && !self.interface.is_null() {
-            unsafe {
-                if let Some(destroy_fn) = (*self.interface).destroy_incremental {
-                    destroy_fn(self.hasher);
-                }
-            }
-        }
+        // SAFETY: `state` was produced by rtr_hash_create and is freed once,
+        // here, because Hasher is neither Copy nor Clone.
+        unsafe { ffi::rtr_hash_destroy(self.state.as_ptr()) }
     }
 }
 
-/// Convenience functions for common operations
-pub mod prelude {
-    use super::*;
-
-    /// Quick hash of byte data using optimal algorithm
-    pub fn hash_bytes(data: &[u8]) -> Result<HashResult, HashError> {
-        let engine = HashEngine::new(); // Uses Hybrid by default
-        engine.hash_bytes(data)
+impl std::hash::Hasher for Hasher {
+    fn finish(&self) -> u64 {
+        self.digest()
     }
-
-    /// Quick hash of a file using optimal algorithm
-    pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<HashResult, HashError> {
-        let engine = HashEngine::new(); // Uses Hybrid by default
-        engine.hash_file(path)
-    }
-
-    /// Hash bytes using BLAKE3 specifically
-    pub fn hash_bytes_blake3(data: &[u8]) -> Result<HashResult, HashError> {
-        let engine = HashEngine::with_strategy(HashStrategy::Blake3Only);
-        engine.hash_bytes(data)
-    }
-
-    /// Hash file using BLAKE3 specifically
-    pub fn hash_file_blake3<P: AsRef<Path>>(path: P) -> Result<HashResult, HashError> {
-        let engine = HashEngine::with_strategy(HashStrategy::Blake3Only);
-        engine.hash_file(path)
-    }
-
-    /// Hash bytes using XXH3 specifically
-    pub fn hash_bytes_xxh3(data: &[u8]) -> Result<HashResult, HashError> {
-        let engine = HashEngine::with_strategy(HashStrategy::Xxh3Only);
-        engine.hash_bytes(data)
-    }
-
-    /// Hash file using XXH3 specifically
-    pub fn hash_file_xxh3<P: AsRef<Path>>(path: P) -> Result<HashResult, HashError> {
-        let engine = HashEngine::with_strategy(HashStrategy::Xxh3Only);
-        engine.hash_file(path)
-    }
-
-    /// Create an incremental hasher with default block size
-    pub fn incremental_hasher() -> Result<IncrementalHasher, HashError> {
-        IncrementalHasher::new(None)
-    }
-
-    /// Benchmark both algorithms and return comparison
-    pub fn benchmark_algorithms(test_size: usize) -> BenchmarkComparison {
-        let data: Vec<u8> = (0..test_size).map(|i| (i * 0x9E3779B1) as u8).collect();
-
-        let blake3_engine = HashEngine::with_strategy(HashStrategy::Blake3Only);
-        let xxh3_engine = HashEngine::with_strategy(HashStrategy::Xxh3Only);
-
-        // Benchmark BLAKE3
-        let blake3_start = std::time::Instant::now();
-        for _ in 0..100 {
-            let _ = blake3_engine.hash_bytes(&data);
-        }
-        let blake3_time = blake3_start.elapsed();
-
-        // Benchmark XXH3
-        let xxh3_start = std::time::Instant::now();
-        for _ in 0..100 {
-            let _ = xxh3_engine.hash_bytes(&data);
-        }
-        let xxh3_time = xxh3_start.elapsed();
-
-        BenchmarkComparison {
-            test_size,
-            blake3_ns_per_op: blake3_time.as_nanos() / 100,
-            xxh3_ns_per_op: xxh3_time.as_nanos() / 100,
-            blake3_throughput_mbps: (test_size as f64 * 100.0)
-                / (blake3_time.as_secs_f64() * 1024.0 * 1024.0),
-            xxh3_throughput_mbps: (test_size as f64 * 100.0)
-                / (xxh3_time.as_secs_f64() * 1024.0 * 1024.0),
-        }
+    fn write(&mut self, bytes: &[u8]) {
+        self.update(bytes);
     }
 }
 
-/// Benchmark comparison between algorithms
-#[derive(Debug, Clone)]
-pub struct BenchmarkComparison {
-    pub test_size: usize,
-    pub blake3_ns_per_op: u128,
-    pub xxh3_ns_per_op: u128,
-    pub blake3_throughput_mbps: f64,
-    pub xxh3_throughput_mbps: f64,
+/// Lets a file be streamed in with `io::copy` without a second buffer.
+impl io::Write for Hasher {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
+
+// -------------------------------------------------------------------- file
+
+/// A file's digest and the number of bytes that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHash {
+    /// XXH3-64 of the file's contents.
+    pub hash: u64,
+    /// Size in bytes.
+    pub size: u64,
+}
+
+/// Hash a file by streaming it in bounded chunks, so peak memory does not
+/// scale with file size.
+pub fn hash_file(path: impl AsRef<Path>) -> Result<FileHash, HashError> {
+    let path = path.as_ref();
+    let display = path.display().to_string();
+
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| HashError::InvalidPath(display.clone()))?;
+
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    let result = unsafe { ffi::rtr_hash_file(c_path.as_ptr()) };
+
+    if result.error != 0 {
+        return Err(HashError::Io {
+            path: display,
+            source: io::Error::from_raw_os_error(result.error),
+        });
+    }
+    Ok(FileHash {
+        hash: result.hash,
+        size: result.size,
+    })
+}
+
+// --------------------------------------------------------------- benchmark
+
+/// A measured throughput result.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Benchmark {
+    /// Throughput in mebibytes per second.
+    pub throughput_mbps: f64,
+    /// Nanoseconds per input byte.
+    pub ns_per_byte: f64,
+    /// Total bytes hashed across all iterations.
+    pub bytes_hashed: u64,
+    /// Wall time consumed.
+    pub elapsed_ns: u64,
+    /// The kernel that was exercised.
+    pub level: SimdLevel,
+}
+
+/// Measure throughput over `test_size` bytes for `iterations` passes.
+pub fn benchmark(test_size: usize, iterations: u32) -> Benchmark {
+    // SAFETY: scalar arguments only.
+    let r = unsafe { ffi::rtr_hash_benchmark(test_size, iterations) };
+    Benchmark {
+        throughput_mbps: r.throughput_mbps,
+        ns_per_byte: r.ns_per_byte,
+        bytes_hashed: r.bytes_hashed,
+        elapsed_ns: r.elapsed_ns,
+        level: SimdLevel::from_raw(r.level),
+    }
+}
+
+// ------------------------------------------------------------------- tests
 
 #[cfg(test)]
 mod tests {
-    use super::prelude::*;
     use super::*;
+    use std::io::Write as _;
+    use std::sync::Mutex;
+
+    /// `force_level` mutates process-global dispatch, so tests that use it
+    /// must not run concurrently with each other or with anything hashing.
+    static LEVEL_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The empty-input digest for XXH3-64 with a zero seed. This value is
+    /// published by upstream xxHash; it is an external oracle, not something
+    /// this crate produced. The exhaustive vector suite (148 vectors against
+    /// upstream v0.8.3) lives in `src/core/tests/test_vectors.c`; the tests
+    /// here exist to prove the *binding* is faithful, not to re-verify XXH3.
+    const XXH3_EMPTY: u64 = 0x2D06_8005_38D3_94C2;
 
     #[test]
-    fn test_engine_initialization() {
-        let engine = HashEngine::new();
-        let simd_level = engine.simd_level();
-        // Should detect some level of SIMD support on modern CPUs
-        println!("Detected SIMD level: {simd_level:?}");
-        println!("Strategy: {:?}", engine.strategy());
+    fn matches_the_published_empty_vector() {
+        assert_eq!(hash(b""), XXH3_EMPTY);
+        assert_eq!(hash(&[]), XXH3_EMPTY);
     }
 
     #[test]
-    fn test_hash_strategies() {
-        let data = b"Hello, Retrigger! This is a test of the hybrid hashing system.";
-
-        // Test all strategies
-        let hybrid = HashEngine::with_strategy(HashStrategy::Hybrid);
-        let blake3 = HashEngine::with_strategy(HashStrategy::Blake3Only);
-        let xxh3 = HashEngine::with_strategy(HashStrategy::Xxh3Only);
-        let auto = HashEngine::with_strategy(HashStrategy::Auto);
-
-        let result_hybrid = hybrid.hash_bytes(data).unwrap();
-        let result_blake3 = blake3.hash_bytes(data).unwrap();
-        let result_xxh3 = xxh3.hash_bytes(data).unwrap();
-        let result_auto = auto.hash_bytes(data).unwrap();
-
-        // All should produce valid hashes
-        assert_ne!(result_hybrid.hash, 0);
-        assert_ne!(result_blake3.hash, 0);
-        assert_ne!(result_xxh3.hash, 0);
-        assert_ne!(result_auto.hash, 0);
-
-        // Size should be consistent
-        assert_eq!(result_hybrid.size, data.len() as u32);
-        assert_eq!(result_blake3.size, data.len() as u32);
-        assert_eq!(result_xxh3.size, data.len() as u32);
-        assert_eq!(result_auto.size, data.len() as u32);
+    fn seeding_changes_the_digest() {
+        let data = b"retrigger";
+        assert_ne!(hash_with_seed(data, 0), hash_with_seed(data, 1));
+        // A zero seed must be exactly the unseeded case.
+        assert_eq!(hash_with_seed(data, 0), hash(data));
     }
 
     #[test]
-    fn test_hybrid_threshold() {
-        // Small data should use XXH3
-        let small_data = vec![0u8; 1000];
-        // Large data should use BLAKE3
-        let large_data = vec![0u8; 2 * 1024 * 1024]; // 2MB
-
-        let engine = HashEngine::with_strategy(HashStrategy::Hybrid);
-
-        let small_result = engine.hash_bytes(&small_data).unwrap();
-        let large_result = engine.hash_bytes(&large_data).unwrap();
-
-        assert_ne!(small_result.hash, 0);
-        assert_ne!(large_result.hash, 0);
-        assert_eq!(small_result.size, small_data.len() as u32);
-        assert_eq!(large_result.size, large_data.len() as u32);
-    }
-
-    #[test]
-    fn test_prelude_functions() {
-        let data = b"Test data for prelude functions";
-
-        let result_default = hash_bytes(data).unwrap();
-        let result_blake3 = hash_bytes_blake3(data).unwrap();
-        let result_xxh3 = hash_bytes_xxh3(data).unwrap();
-
-        assert_ne!(result_default.hash, 0);
-        assert_ne!(result_blake3.hash, 0);
-        assert_ne!(result_xxh3.hash, 0);
-
-        // BLAKE3 and XXH3 should produce different hashes
-        assert_ne!(result_blake3.hash, result_xxh3.hash);
-    }
-
-    #[test]
-    fn test_benchmark_comparison() {
-        let comparison = benchmark_algorithms(1024);
-
-        assert!(comparison.blake3_ns_per_op > 0);
-        assert!(comparison.xxh3_ns_per_op > 0);
-        assert!(comparison.blake3_throughput_mbps > 0.0);
-        assert!(comparison.xxh3_throughput_mbps > 0.0);
-
-        println!("Benchmark results for 1KB:");
-        println!(
-            "BLAKE3: {} ns/op, {:.2} MB/s",
-            comparison.blake3_ns_per_op, comparison.blake3_throughput_mbps
-        );
-        println!(
-            "XXH3: {} ns/op, {:.2} MB/s",
-            comparison.xxh3_ns_per_op, comparison.xxh3_throughput_mbps
-        );
-    }
-
-    #[test]
-    fn test_performance_targets() {
-        // Test 1MB file performance target: <0.1ms
-        let mb_data = vec![0xABu8; 1024 * 1024];
-        let engine = HashEngine::new();
-
-        let start = std::time::Instant::now();
-        for _ in 0..10 {
-            engine.hash_bytes(&mb_data).unwrap();
+    fn digest_depends_on_every_byte() {
+        let base = vec![0u8; 512];
+        let baseline = hash(&base);
+        for i in 0..base.len() {
+            let mut m = base.clone();
+            m[i] ^= 1;
+            assert_ne!(
+                hash(&m),
+                baseline,
+                "flipping byte {i} did not change the digest"
+            );
         }
-        let elapsed = start.elapsed();
-        let avg_per_op = elapsed / 10;
-
-        println!("1MB hash time: {avg_per_op:?} (target: <0.1ms)");
-        // Note: This may not pass on all systems, but gives us a baseline
-
-        // Test 100MB would be too large for unit tests, but we can extrapolate
-        let estimated_100mb = avg_per_op * 100;
-        println!("Estimated 100MB hash time: {estimated_100mb:?} (target: <1ms)");
     }
 
     #[test]
-    fn test_incremental_hashing() {
-        let mut hasher = IncrementalHasher::new(Some(1024)).unwrap();
+    fn length_is_part_of_the_input() {
+        // Truncation must not be invisible.
+        assert_ne!(hash(b"abc"), hash(b"abc\0"));
+        assert_ne!(hash(&[0u8; 8]), hash(&[0u8; 9]));
+    }
 
-        let chunk1 = b"Hello, ";
-        let chunk2 = b"Retrigger!";
+    #[test]
+    fn streaming_matches_one_shot_for_every_split() {
+        let data: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let expected = hash(&data);
 
-        hasher.update(chunk1).unwrap();
-        hasher.update(chunk2).unwrap();
+        // Split points chosen to straddle the engine's internal 256-byte
+        // buffer and its 1024-byte block boundary, where an off-by-one in the
+        // buffering logic would hide.
+        for split in [0, 1, 255, 256, 257, 1023, 1024, 1025, 4095, 4096] {
+            let mut h = Hasher::new().expect("allocate hasher");
+            h.update(&data[..split]);
+            h.update(&data[split..]);
+            assert_eq!(h.digest(), expected, "split at {split}");
+        }
+    }
 
-        let result = hasher.finalize().unwrap();
-        assert!(result.is_incremental);
-        assert_eq!(result.size, (chunk1.len() + chunk2.len()) as u32);
+    #[test]
+    fn single_byte_chunks_match_one_shot() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+        let mut h = Hasher::new().expect("allocate hasher");
+        for b in data {
+            h.update(&[*b]);
+        }
+        assert_eq!(h.digest(), hash(data));
+    }
+
+    #[test]
+    fn digest_is_non_destructive_and_resettable() {
+        let mut h = Hasher::new().expect("allocate hasher");
+        h.update(b"abc");
+        let first = h.digest();
+        assert_eq!(h.digest(), first, "digest mutated the state");
+
+        h.update(b"def");
+        assert_eq!(h.digest(), hash(b"abcdef"));
+
+        h.reset(0);
+        assert_eq!(
+            h.digest(),
+            XXH3_EMPTY,
+            "reset did not restore the initial state"
+        );
+    }
+
+    #[test]
+    fn empty_updates_are_inert() {
+        let mut h = Hasher::new().expect("allocate hasher");
+        h.update(b"");
+        h.update(b"abc");
+        h.update(b"");
+        assert_eq!(h.digest(), hash(b"abc"));
+    }
+
+    #[test]
+    fn hasher_works_as_an_io_sink() {
+        let data = vec![7u8; 100_000];
+        let mut h = Hasher::new().expect("allocate hasher");
+        h.write_all(&data).expect("write to hasher");
+        assert_eq!(h.digest(), hash(&data));
+    }
+
+    // ---- the point of the whole SIMD design: every kernel agrees ----------
+    #[test]
+    fn every_available_level_computes_the_same_digest() {
+        let _guard = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let levels = available_levels();
+        assert!(
+            levels.contains(&SimdLevel::Scalar),
+            "the scalar kernel must always be available; got {levels:?}"
+        );
+
+        // Sizes that cross every length-class boundary in XXH3 plus several
+        // multi-block inputs.
+        let sizes = [
+            0usize, 1, 3, 4, 8, 9, 16, 17, 64, 128, 129, 240, 241, 1024, 4096, 100_000,
+        ];
+
+        for size in sizes {
+            let data: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+
+            force_level(SimdLevel::Scalar).expect("scalar is always available");
+            let reference = hash(&data);
+
+            for &level in &levels {
+                force_level(level).expect("level reported as available");
+                assert_eq!(active_level(), level, "force_level did not take effect");
+                assert_eq!(
+                    hash(&data),
+                    reference,
+                    "{level} disagrees with scalar at {size} bytes"
+                );
+            }
+        }
+        reset_level();
+
+        // Not a hard assertion -- a scalar-only CPU is legitimate -- but a
+        // single-level run proves much less, so make that visible.
+        if levels.len() == 1 {
+            eprintln!("note: only the scalar kernel is available here; cross-kernel equivalence was not exercised");
+        }
+    }
+
+    #[test]
+    fn forcing_an_unsupported_level_fails_cleanly() {
+        let _guard = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let available = available_levels();
+
+        for level in [
+            SimdLevel::Neon,
+            SimdLevel::Sse2,
+            SimdLevel::Avx2,
+            SimdLevel::Avx512,
+        ] {
+            if !available.contains(&level) {
+                assert!(
+                    force_level(level).is_err(),
+                    "{level} is unavailable but force_level accepted it"
+                );
+                // The engine must be left usable after a rejected request.
+                assert_eq!(hash(b"still works"), hash(b"still works"));
+            }
+        }
+        reset_level();
+    }
+
+    #[test]
+    fn levels_report_sane_metadata() {
+        assert!(!available_levels().is_empty());
+        assert!(available_levels().contains(&cpu_level()));
+        for l in [
+            SimdLevel::Scalar,
+            SimdLevel::Neon,
+            SimdLevel::Sse2,
+            SimdLevel::Avx2,
+            SimdLevel::Avx512,
+        ] {
+            assert!(!l.name().is_empty(), "{l:?} has no name");
+        }
+        assert_eq!(init(), active_level());
+    }
+
+    // ---- files ------------------------------------------------------------
+    #[test]
+    fn file_hash_matches_memory_hash() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sample.bin");
+
+        // Larger than the engine's 256 KiB read chunk, so chunk stitching is
+        // actually exercised rather than assumed.
+        let data: Vec<u8> = (0..700_000u32).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&path, &data).expect("write sample");
+
+        let got = hash_file(&path).expect("hash file");
+        assert_eq!(got.hash, hash(&data));
+        assert_eq!(got.size, data.len() as u64);
+    }
+
+    #[test]
+    fn empty_file_hashes_to_the_empty_vector() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("empty");
+        std::fs::write(&path, b"").expect("write empty");
+
+        let got = hash_file(&path).expect("hash empty file");
+        assert_eq!(got.hash, XXH3_EMPTY);
+        assert_eq!(got.size, 0);
+    }
+
+    #[test]
+    fn missing_file_reports_not_found() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let err = hash_file(dir.path().join("nope")).expect_err("must fail");
+        match err {
+            HashError::Io { source, .. } => {
+                assert_eq!(source.kind(), io::ErrorKind::NotFound, "got {source:?}");
+            }
+            other => panic!("expected an Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn directory_is_rejected_rather_than_hashed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(hash_file(dir.path()).is_err());
+    }
+
+    #[test]
+    fn path_with_interior_nul_is_rejected() {
+        // Only Unix lets an OsString carry a NUL this way.
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            let bad = std::path::PathBuf::from(OsString::from_vec(b"/tmp/a\0b".to_vec()));
+            assert!(matches!(hash_file(bad), Err(HashError::InvalidPath(_))));
+        }
+    }
+
+    #[test]
+    fn hex_is_zero_padded_to_sixteen_chars() {
+        assert_eq!(to_hex(0), "0000000000000000");
+        assert_eq!(to_hex(u64::MAX), "ffffffffffffffff");
+        assert_eq!(to_hex(XXH3_EMPTY).len(), 16);
+    }
+
+    #[test]
+    fn benchmark_reports_real_work() {
+        let b = benchmark(64 * 1024, 8);
+        assert_eq!(b.bytes_hashed, 64 * 1024 * 8);
+        assert!(b.elapsed_ns > 0, "benchmark reported zero elapsed time");
+        assert!(b.throughput_mbps > 0.0);
+        assert!(available_levels().contains(&b.level));
+    }
+
+    #[test]
+    fn hashing_is_consistent_across_threads() {
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i % 256) as u8).collect();
+        let expected = hash(&data);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let d = data.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        assert_eq!(hash(&d), expected);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
     }
 }

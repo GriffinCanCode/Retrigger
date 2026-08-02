@@ -1,0 +1,185 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { afterAll, describe, expect, it } from 'vitest';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+process.env.RETRIGGER_NATIVE_PATH = path.join(HERE, 'helpers', 'mock-native.js');
+process.env.RETRIGGER_SILENT = '1';
+
+import { JsWatcher, mergeKind } from '../lib/js-watcher.js';
+import { cleanupTempDirs, tempDir, waitFor } from './helpers/tmp.js';
+import mockNative from './helpers/mock-native.js';
+
+afterAll(cleanupTempDirs);
+
+/**
+ * Overflow is exercised white-box because it must be deterministic. Driving it
+ * through the filesystem would make the assertion depend on how fast the OS
+ * delivers notifications, which is exactly the kind of flakiness a reliability
+ * suite must not contain. A filesystem-driven variant follows, with tolerances.
+ */
+const IMPLEMENTATIONS = [
+  { name: 'JsWatcher', make: (options) => new JsWatcher(options) },
+  { name: 'mock addon Watcher', make: (options) => new mockNative.Watcher(options) },
+];
+
+for (const impl of IMPLEMENTATIONS) {
+  describe(`bounded queue: ${impl.name}`, () => {
+    const push = (watcher, n) => {
+      for (let i = 0; i < n; i += 1) {
+        watcher._enqueue({
+          path: `/synthetic/${i}`,
+          kind: 'modified',
+          timestampNs: 0n,
+          size: 0,
+          isDirectory: false,
+          cookie: null,
+        });
+      }
+    };
+
+    it('accepts exactly `capacity` events before overflowing', () => {
+      const watcher = impl.make({ capacity: 5 });
+      push(watcher, 5);
+      expect(watcher.stats().queuePending).toBe(5);
+      expect(watcher.stats().eventsDropped).toBe(0);
+      expect(watcher.stats().eventsQueued).toBe(5);
+    });
+
+    it('discards the backlog and puts rescanRequired at the head on overflow', () => {
+      const watcher = impl.make({ capacity: 4 });
+      push(watcher, 10);
+      const first = watcher.poll();
+      expect(first.kind).toBe('rescanRequired');
+      expect(first.path).toBe('');
+      // Like inotify's IN_Q_OVERFLOW, the stream continues after the marker;
+      // only the events that could not be held are lost.
+      expect(watcher.stats().queuePending).toBeLessThanOrEqual(4);
+    });
+
+    it('counts every discarded and rejected event', () => {
+      const watcher = impl.make({ capacity: 4 });
+      push(watcher, 10);
+      // Of ten pushes with capacity four: four are queued, the fifth triggers
+      // overflow (discarding those four and queueing the marker), events six
+      // through eight refill the queue, and nine and ten are rejected.
+      // Dropped = 4 discarded + 1 rejected + 2 rejected = 7.
+      expect(watcher.stats().eventsDropped).toBe(7);
+      // Queued counts the four originals, the marker, and the three refills.
+      expect(watcher.stats().eventsQueued).toBe(8);
+    });
+
+    it('never queues two rescan markers for one overflow', () => {
+      const watcher = impl.make({ capacity: 2 });
+      push(watcher, 50);
+      const kinds = drain(watcher);
+      expect(kinds.filter((k) => k === 'rescanRequired')).toHaveLength(1);
+      expect(kinds[0]).toBe('rescanRequired');
+    });
+
+    it('re-arms overflow only after the rescan marker is consumed', () => {
+      const watcher = impl.make({ capacity: 2 });
+      push(watcher, 50);
+      expect(watcher.poll().kind).toBe('rescanRequired');
+      drain(watcher);
+      push(watcher, 50);
+      const kinds = drain(watcher);
+      expect(kinds.filter((k) => k === 'rescanRequired')).toHaveLength(1);
+    });
+
+    const drain = (watcher) => {
+      const kinds = [];
+      for (let e = watcher.poll(); e; e = watcher.poll()) kinds.push(e.kind);
+      return kinds;
+    };
+
+    it('reports queueCapacity and defaults a nonsensical capacity', () => {
+      expect(impl.make({ capacity: 7 }).stats().queueCapacity).toBe(7);
+      expect(impl.make({ capacity: 0 }).stats().queueCapacity).toBe(8192);
+      expect(impl.make({ capacity: -3 }).stats().queueCapacity).toBe(8192);
+      expect(impl.make({}).stats().queueCapacity).toBe(8192);
+    });
+
+    it('counts delivered events only as they are polled', () => {
+      const watcher = impl.make({ capacity: 10 });
+      push(watcher, 3);
+      expect(watcher.stats().eventsDelivered).toBe(0);
+      watcher.poll();
+      watcher.poll();
+      expect(watcher.stats().eventsDelivered).toBe(2);
+    });
+  });
+}
+
+describe('bounded queue under real filesystem pressure', () => {
+  it('drops and signals a rescan when nothing is polling', async () => {
+    const dir = tempDir();
+    const watcher = new JsWatcher({ capacity: 8 });
+    watcher.watch(dir, true);
+    watcher.start();
+    try {
+      for (let i = 0; i < 300; i += 1) {
+        fs.writeFileSync(path.join(dir, `f${i}.js`), String(i));
+      }
+      await waitFor(() => watcher.stats().eventsDropped > 0, {
+        message: `queue never overflowed (stats=${JSON.stringify(watcher.stats())})`,
+      });
+      const stats = watcher.stats();
+      expect(stats.eventsDropped).toBeGreaterThan(0);
+      expect(stats.queuePending).toBeLessThanOrEqual(stats.queueCapacity);
+
+      const kinds = [];
+      for (let event = watcher.poll(); event; event = watcher.poll()) kinds.push(event.kind);
+      expect(kinds).toContain('rescanRequired');
+    } finally {
+      watcher.stop();
+    }
+  });
+
+  /**
+   * Deliberately runs against the mock addon rather than the JavaScript
+   * engine. The JavaScript engine exposes `setNotifier`, so `Retrigger` drains
+   * its queue on a microtask after every single event and, with `fs.watch`
+   * delivering one callback per tick, it cannot realistically overflow through
+   * the public API. The addon contract has no notifier — it is polled — which
+   * is precisely the shape that can overflow, so that is what is tested here.
+   */
+  it('surfaces rescanRequired through the public API as a "rescan" event', async () => {
+    const { Retrigger } = await import('../lib/retrigger.js');
+    const dir = tempDir();
+    const watcher = new Retrigger({
+      paths: dir,
+      engine: 'native',
+      capacity: 4,
+      pollIntervalMs: 150,
+    });
+    const rescans = [];
+    watcher.on('rescan', (event) => rescans.push(event));
+    watcher.start();
+    try {
+      for (let i = 0; i < 400; i += 1) {
+        fs.writeFileSync(path.join(dir, `burst-${i}.js`), String(i));
+      }
+      await waitFor(() => rescans.length > 0, {
+        timeout: 10000,
+        message: 'no rescan event surfaced',
+      });
+      expect(rescans[0].kind).toBe('rescanRequired');
+      expect(watcher.getStats().metrics.rescans).toBeGreaterThan(0);
+      expect(watcher.getStats().eventsDropped).toBeGreaterThan(0);
+    } finally {
+      watcher.close();
+    }
+  });
+});
+
+describe('debounce coalescing rule', () => {
+  it('keeps a create through subsequent writes and lets a delete win', () => {
+    expect(mergeKind('created', 'modified')).toBe('created');
+    expect(mergeKind('created', 'deleted')).toBe('deleted');
+    expect(mergeKind('modified', 'deleted')).toBe('deleted');
+    expect(mergeKind('deleted', 'created')).toBe('modified');
+    expect(mergeKind('modified', 'modified')).toBe('modified');
+  });
+});

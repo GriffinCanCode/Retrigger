@@ -1,7 +1,8 @@
 # Ignore rules are deliberately anchored (leading "/") or path-qualified rather
-# than bare directory names. The previous version ignored "bin/", "lib/", and
-# "obj/" globally, which silently excluded src/daemon/bin/retrigger -- the very
-# file the daemon package declares in its "files" list. Keep patterns specific.
+# than bare directory names. A bare "bin/" matches at every depth, which is how
+# an earlier version of this file silently excluded everything under
+# src/daemon/bin/ -- including tracked source that lives there. Keep patterns
+# specific enough that adding a file to an ignored directory is a visible act.
 
 # --- Rust ---------------------------------------------------------------
 /target/
@@ -27,6 +28,13 @@
 *.dll
 *.lib
 *.pdb
+
+# The daemon's compiled binary is a build output and is distributed through the
+# @retrigger/daemon-<platform>-<arch> packages, never from the working tree.
+# Ignore the executable itself, NOT the directory: bin/retrigger.js is the
+# tracked CLI shim that resolves the platform package at runtime.
+/src/daemon/bin/retrigger
+/src/daemon/bin/retrigger.exe
 
 # --- Node ---------------------------------------------------------------
 node_modules/

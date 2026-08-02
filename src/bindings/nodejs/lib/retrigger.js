@@ -3,6 +3,7 @@
 const { EventEmitter } = require('events');
 const path = require('path');
 
+const { ContentTracker } = require('./content');
 const { getEngine, getEngineInfo } = require('./engine');
 const { Metrics } = require('./metrics');
 
@@ -30,13 +31,20 @@ const KIND_TO_EVENT = {
  *   'rescan'  (event)        the queue overflowed; re-read state from disk
  *   'error'   (error)        engine or listener failure; never thrown
  *   'ready'   ()             emitted once after a successful start()
+ *
+ * Every event carries `contentChanged` — whether the bytes actually differ from the last time this
+ * watcher saw that path — unless `contentHashing: false` was requested. Events are *annotated*, not
+ * withheld: a watcher that silently dropped events would be unable to report a file being touched,
+ * which some consumers do want. Deciding what to do with a no-op write belongs to the consumer, and
+ * both bundler plugins in this package decide to skip it.
  */
 class Retrigger extends EventEmitter {
   /**
    * @param {{paths?: string|string[], recursive?: boolean, include?: string[],
    *   exclude?: string[], debounceMs?: number, capacity?: number,
    *   pollIntervalMs?: number, engine?: 'auto'|'native'|'javascript',
-   *   emitDirectories?: boolean, unref?: boolean}} [options]
+   *   emitDirectories?: boolean, unref?: boolean, contentHashing?: boolean,
+   *   maxHashBytes?: number}} [options]
    */
   constructor(options = {}) {
     super();
@@ -49,10 +57,15 @@ class Retrigger extends EventEmitter {
       pollIntervalMs: options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
       emitDirectories: options.emitDirectories === true,
       unref: options.unref === true,
+      contentHashing: options.contentHashing !== false,
+      maxHashBytes: options.maxHashBytes,
     };
 
     this.engine = getEngine({ prefer: options.engine || 'auto' });
     this.metrics = new Metrics();
+    this._content = this.options.contentHashing
+      ? new ContentTracker(this.engine, { maxBytes: this.options.maxHashBytes })
+      : null;
 
     this._watcher = this.engine.createWatcher({
       capacity: this.options.capacity,
@@ -143,6 +156,9 @@ class Retrigger extends EventEmitter {
       }
     }
     this._started = false;
+    // The digests describe a watch that is over, and the next start() must treat every path as new
+    // anyway: the file system was free to change while nothing was watching it.
+    if (this._content) this._content.clear();
     this.metrics.markStopped();
     return this;
   }
@@ -163,6 +179,7 @@ class Retrigger extends EventEmitter {
       engine: this.engine.name,
       backend: this._watcher.backend(),
       ...normaliseStats(engineStats),
+      content: this._content ? this._content.stats() : null,
       metrics: this.metrics.snapshot(),
     };
   }
@@ -219,6 +236,10 @@ class Retrigger extends EventEmitter {
 
   _dispatch(event) {
     this.metrics.recordEvent(event.kind);
+    if (this._content) {
+      this._content.annotate(event);
+      if (event.contentChanged === false) this.metrics.recordUnchanged();
+    }
 
     if (event.kind === 'rescanRequired') {
       this._safeEmit('rescan', event);

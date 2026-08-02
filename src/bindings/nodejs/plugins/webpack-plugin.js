@@ -61,7 +61,7 @@ class RetriggerWebpackPlugin {
    * @param {{watchPaths?: string[], verbose?: boolean, debounceMs?: number,
    *   include?: string[], exclude?: string[], engine?: 'auto'|'native'|'javascript',
    *   replaceWatcher?: boolean, aggregateTimeout?: number, capacity?: number,
-   *   pollIntervalMs?: number}} [options]
+   *   pollIntervalMs?: number, contentHashing?: boolean}} [options]
    */
   constructor(options = {}) {
     const legacy = options.watchOptions || {};
@@ -76,6 +76,7 @@ class RetriggerWebpackPlugin {
       aggregateTimeout: options.aggregateTimeout ?? 20,
       capacity: options.capacity ?? 16384,
       pollIntervalMs: options.pollIntervalMs ?? 5,
+      contentHashing: options.contentHashing !== false,
     };
 
     this.compiler = null;
@@ -154,6 +155,7 @@ class RetriggerWebpackPlugin {
       capacity: this.options.capacity,
       pollIntervalMs: this.options.pollIntervalMs,
       engine: this.options.engine,
+      contentHashing: this.options.contentHashing,
     });
     watcher.on('error', (err) => {
       this.metrics.recordError();
@@ -199,6 +201,15 @@ class RetriggerWebpackPlugin {
   _onEvent(event) {
     if (event.kind === 'rescanRequired') return;
     this.metrics.recordEvent(event.kind);
+    // A write that did not change the bytes is not reported to webpack at all: no timestamp is
+    // advanced, no session is notified, and nothing is held over for the next one. Leaving the
+    // recorded timestamp where it was is the truthful answer — the contents webpack compiled are
+    // still the contents on disk — and webpack re-stats anything it was not told about, so the
+    // worst case of being wrong here is a slower answer rather than a stale build.
+    if (event.contentChanged === false) {
+      this.metrics.recordUnchanged();
+      return;
+    }
     const target = event.path;
     const time = Date.now();
 

@@ -1,26 +1,31 @@
-[workspace]
-
 [package]
 name = "retrigger-nodejs-bindings"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Node.js bindings for Retrigger using napi-rs"
 
+# The crate name determines the cdylib name, which must match
+# package.json#napi.binaryName so the loader in lib/native.js finds the
+# artifact.
 [lib]
 crate-type = ["cdylib"]
-path = "../../daemon/retrigger-bindings/src/lib.rs"
 
 [dependencies]
 retrigger-core = { path = "../../daemon/retrigger-core" }
 retrigger-system = { path = "../../daemon/retrigger-system" }
-napi = { version = "2.16", features = ["napi8", "tokio_rt", "compat-mode"] }
-napi-derive = "2.16"
-tokio = { version = "1.38", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0"
-tracing = "0.1"
-blake3 = "1.5"
+# `tokio_rt` is deliberately absent: the two asynchronous entry points
+# (`hashFile`, `benchmarkHash`) are `AsyncTask`s on libuv's own thread pool, so
+# the addon never starts a second runtime inside the Node process.
+#
+# `napi9` is the Node-API level, and it is pinned to package.json#engines.node:
+# level 9 first shipped in Node 18.17.0, which is exactly the floor declared
+# there. Raising one without the other would either strand supported runtimes
+# or leave capability on the table.
+napi = { version = "3.12", features = ["napi9"] }
+napi-derive = "3.6"
 
 [build-dependencies]
-napi-build = "2.1"
+napi-build = "2.4"

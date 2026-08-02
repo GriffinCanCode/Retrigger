@@ -1,0 +1,15 @@
+{
+  "//": "Type-checks the .d.ts files this package publishes. They are the whole type contract consumers see, they are hand-written rather than generated, and until this existed nothing verified they even parsed. skipLibCheck is off on purpose: it skips every .d.ts, which here would skip the only files worth checking.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": false,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["index.d.ts", "plugins/*.d.ts"]
+}

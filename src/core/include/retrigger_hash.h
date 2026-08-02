@@ -1,72 +1,178 @@
 #ifndef RETRIGGER_HASH_H
 #define RETRIGGER_HASH_H
 
-#include <stdint.h>
+/*
+ * Retrigger hashing engine: XXH3-64.
+ *
+ * This is the real XXH3 algorithm as specified by Yann Collet's xxHash, not a
+ * lookalike. That choice is deliberate and is what makes the engine testable:
+ * XXH3 has published reference vectors, so correctness is checked against an
+ * external oracle rather than against our own output.
+ *
+ * XXH3 is defined so that every vector width computes the same value. The
+ * scalar, NEON, AVX2, and AVX-512 paths here are therefore required to be
+ * bit-identical, and rtr_hash_force_level exists so a single machine can prove
+ * it by running one input through every path it supports.
+ *
+ * Dispatch is a runtime decision (see rtr_hash_cpu_level). Nothing in this
+ * library may be compiled with -march=native: a binary built on one machine
+ * has to run on another, and compile-time SIMD selection turns a portability
+ * question into an illegal-instruction crash.
+ */
+
 #include <stddef.h>
-#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/**
- * Retrigger Core Hashing Engine
- * High-performance XXH3-based hashing with SIMD optimizations
- * Follows SRP: Single responsibility for hash computation
- */
+#define RTR_HASH_ABI_VERSION 2u
 
-// Hash result structure for type safety and extensibility
-typedef struct {
-    uint64_t hash;
-    uint32_t size;
-    bool is_incremental;
-} rtr_hash_result_t;
+/* ------------------------------------------------------------- dispatch */
 
-// Incremental hasher context for block-based hashing
-typedef struct rtr_hasher {
-    void* internal_state;
-    uint32_t block_size;
-    uint64_t total_size;
-} rtr_hasher_t;
-
-// SIMD optimization levels detected at runtime
 typedef enum {
-    RTR_SIMD_NONE = 0,
-    RTR_SIMD_NEON = 1,     // ARM NEON
-    RTR_SIMD_AVX2 = 2,     // x86-64 AVX2
-    RTR_SIMD_AVX512 = 3    // x86-64 AVX-512
+    RTR_SIMD_SCALAR = 0, /* portable C, available everywhere */
+    RTR_SIMD_NEON = 1,   /* AArch64 / ARMv7 NEON             */
+    RTR_SIMD_SSE2 = 2,   /* x86-64 baseline                  */
+    RTR_SIMD_AVX2 = 3,   /* x86-64 AVX2                      */
+    RTR_SIMD_AVX512 = 4  /* x86-64 AVX-512F                  */
 } rtr_simd_level_t;
 
-// Core hashing interface - follows Interface Segregation Principle
-typedef struct {
-    rtr_hash_result_t (*hash_buffer)(const void* data, size_t len);
-    rtr_hash_result_t (*hash_file)(const char* filepath);
-    rtr_hasher_t* (*create_incremental)(uint32_t block_size);
-    rtr_hash_result_t (*update_incremental)(rtr_hasher_t* hasher, const void* data, size_t len);
-    rtr_hash_result_t (*finalize_incremental)(rtr_hasher_t* hasher);
-    void (*destroy_incremental)(rtr_hasher_t* hasher);
-} rtr_hash_interface_t;
-
-// Initialize the hashing engine with optimal SIMD level
+/*
+ * Initialize dispatch. Idempotent and thread-safe; every entry point calls it
+ * implicitly, so callers only need it to learn the selected level early.
+ * Returns the level now in effect.
+ */
 rtr_simd_level_t rtr_hash_init(void);
 
-// Get the singleton hash interface (Dependency Inversion Principle)
-const rtr_hash_interface_t* rtr_hash_get_interface(void);
+/* Best level this CPU supports, determined by runtime feature detection. */
+rtr_simd_level_t rtr_hash_cpu_level(void);
 
-// CPU feature detection
-rtr_simd_level_t rtr_detect_simd_support(void);
+/* Level currently in effect (differs from cpu_level only after a force). */
+rtr_simd_level_t rtr_hash_active_level(void);
 
-// Performance benchmarking utilities
-typedef struct {
+/* Bitmask of usable levels: bit N set means (rtr_simd_level_t)N is available. */
+uint32_t rtr_hash_available_levels(void);
+
+/*
+ * Pin dispatch to a specific level. Returns 0 on success, -1 if the level is
+ * not compiled in or not supported by this CPU.
+ *
+ * This exists for the differential test that asserts every path agrees, and
+ * for bisecting a suspected SIMD bug in the field. It is process-global and
+ * not thread-safe against concurrent hashing; set it during setup, not while
+ * other threads are hashing.
+ */
+int rtr_hash_force_level(rtr_simd_level_t level);
+
+/* Undo rtr_hash_force_level and return to the CPU-selected level. */
+void rtr_hash_reset_level(void);
+
+/* Static, never-NULL name for a level ("scalar", "neon", "avx2", ...). */
+const char *rtr_hash_level_str(rtr_simd_level_t level);
+
+/* ------------------------------------------------------------- one-shot */
+
+/* XXH3-64 with the default secret and a zero seed. */
+uint64_t rtr_hash64(const void *data, size_t len);
+
+/* XXH3-64 with a caller-supplied seed. */
+uint64_t rtr_hash64_seed(const void *data, size_t len, uint64_t seed);
+
+/* ------------------------------------------------------------ streaming */
+
+/*
+ * Streaming state. Feeding a byte sequence through update() in any chunking
+ * must produce exactly the digest that hashing the whole sequence at once
+ * produces; the test suite asserts this against randomized chunk splits.
+ */
+typedef struct rtr_hash_state rtr_hash_state_t;
+
+rtr_hash_state_t *rtr_hash_create(void);
+void rtr_hash_destroy(rtr_hash_state_t *state);
+
+/* Reset to the initial state so one allocation can hash many inputs. */
+int rtr_hash_reset(rtr_hash_state_t *state, uint64_t seed);
+
+/* Absorb another chunk. Returns 0 on success, -1 on invalid argument. */
+int rtr_hash_update(rtr_hash_state_t *state, const void *data, size_t len);
+
+/* Current digest. Non-destructive: the state may be updated further. */
+uint64_t rtr_hash_digest(const rtr_hash_state_t *state);
+
+/* ----------------------------------------------------------------- file */
+
+typedef struct rtr_hash_file_result {
+    uint64_t hash;
+    uint64_t size;  /* bytes read; 64-bit so files above 4 GiB are exact */
+    int32_t error;  /* 0 on success, else the errno observed             */
+    int32_t reserved;
+} rtr_hash_file_result_t;
+
+/*
+ * The Rust binding declares this struct by hand rather than generating it,
+ * which keeps libclang off the list of things a machine needs in order to
+ * build Retrigger from source. These assertions are one half of what makes
+ * that safe: the C compiler proves the layout is what we claim here, and the
+ * Rust side proves the same numbers independently. If either drifts, the
+ * mismatch is a compile error rather than a corrupted read at runtime.
+ */
+_Static_assert(sizeof(rtr_hash_file_result_t) == 24, "rtr_hash_file_result_t must be 24 bytes");
+_Static_assert(offsetof(rtr_hash_file_result_t, hash) == 0, "hash must be at offset 0");
+_Static_assert(offsetof(rtr_hash_file_result_t, size) == 8, "size must be at offset 8");
+_Static_assert(offsetof(rtr_hash_file_result_t, error) == 16, "error must be at offset 16");
+
+/*
+ * Hash a file's contents by streaming it in bounded chunks. Streaming rather
+ * than reading the whole file keeps peak memory independent of file size, so
+ * hashing a large artifact cannot OOM the daemon.
+ */
+rtr_hash_file_result_t rtr_hash_file(const char *path);
+
+/* ------------------------------------------------------------ benchmark */
+
+typedef struct rtr_benchmark_result {
     double throughput_mbps;
-    uint64_t cycles_per_byte;
-    uint32_t latency_ns;
+    double ns_per_byte;
+    uint64_t bytes_hashed;
+    uint64_t elapsed_ns;
+    uint64_t checksum; /* accumulated digest, so the work cannot be optimized away */
+    int32_t level;     /* rtr_simd_level_t actually exercised */
+    int32_t reserved;
 } rtr_benchmark_result_t;
 
-rtr_benchmark_result_t rtr_benchmark_hash(size_t test_size);
+_Static_assert(sizeof(rtr_benchmark_result_t) == 48, "rtr_benchmark_result_t must be 48 bytes");
+_Static_assert(offsetof(rtr_benchmark_result_t, throughput_mbps) == 0, "throughput_mbps at 0");
+_Static_assert(offsetof(rtr_benchmark_result_t, ns_per_byte) == 8, "ns_per_byte at 8");
+_Static_assert(offsetof(rtr_benchmark_result_t, bytes_hashed) == 16, "bytes_hashed at 16");
+_Static_assert(offsetof(rtr_benchmark_result_t, elapsed_ns) == 24, "elapsed_ns at 24");
+_Static_assert(offsetof(rtr_benchmark_result_t, checksum) == 32, "checksum at 32");
+_Static_assert(offsetof(rtr_benchmark_result_t, level) == 40, "level at 40");
+
+/* The C enum must be a plain int for the Rust declaration to match. */
+_Static_assert(sizeof(rtr_simd_level_t) == sizeof(int), "rtr_simd_level_t must be int-sized");
+
+/* Largest `test_size` rtr_hash_benchmark will accept, in bytes. */
+#define RTR_BENCH_MAX_SIZE (1024u * 1024u * 1024u)
+
+/*
+ * Measure throughput over `test_size` bytes for `iterations` passes. Returns a
+ * measurement of real work; `checksum` is folded from every pass specifically
+ * so the compiler cannot elide the loop and report a fictional number.
+ *
+ * Total by construction: no argument can crash or abort the process. A zero
+ * `test_size` or `iterations`, a `test_size` above RTR_BENCH_MAX_SIZE, or an
+ * allocation that fails all return a result with `bytes_hashed == 0`, which is
+ * how a caller distinguishes "no measurement" from a measurement. The size is
+ * capped rather than handed to the allocator because an absurd request aborts
+ * under glibc and under AddressSanitizer instead of returning NULL, and the
+ * caller is often a scripting language whose numbers are not to be trusted.
+ */
+rtr_benchmark_result_t rtr_hash_benchmark(size_t test_size, uint32_t iterations);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // RETRIGGER_HASH_H
+#endif /* RETRIGGER_HASH_H */

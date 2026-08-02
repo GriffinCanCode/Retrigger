@@ -2,119 +2,261 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: Test on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            node-version: 18
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            node-version: 18
-            target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            node-version: 18
-            target: x86_64-apple-darwin
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
-
-    - name: Install Zig
-      uses: goto-bus-stop/setup-zig@v2
-      with:
-        version: 0.15.1
-
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: npm
-        cache-dependency-path: src/bindings/nodejs/package-lock.json
-
-    - name: Install system dependencies (Ubuntu)
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential clang llvm-dev pkg-config liburing-dev
-
-    - name: Install system dependencies (macOS)
-      if: matrix.os == 'macos-latest'
-      run: |
-        brew install llvm pkg-config
-
-    - name: Cache Cargo dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
-
-    - name: Cache Node.js dependencies
-      uses: actions/cache@v4
-      with:
-        path: src/bindings/nodejs/node_modules
-        key: ${{ runner.os }}-node-${{ matrix.node-version }}-${{ hashFiles('src/bindings/nodejs/package-lock.json') }}
-        restore-keys: |
-          ${{ runner.os }}-node-${{ matrix.node-version }}-
-
-    - name: Install Node.js dependencies
-      run: |
-        cd src/bindings/nodejs
-        npm ci
-
-    - name: Build all components
-      run: make all BUILD_TYPE=debug
-
-    - name: Run Rust tests
-      run: cargo test --all-features --workspace
-
-    - name: Run Node.js tests
-      run: |
-        cd src/bindings/nodejs
-        npm test
-
-    - name: Test integration
-      run: |
-        cd tests
-        node test-plugin-functionality.js
-        node test-real-world-integration.js
-
-  security:
-    name: Security audit
+  # ---------------------------------------------------------------- quality
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: npm ci --no-audit --no-fund
+        working-directory: src/bindings/nodejs
+      - run: npm run lint
+        working-directory: src/bindings/nodejs
 
-    - name: Security audit
-      run: |
-        cargo install cargo-audit --quiet
-        cargo audit
+  # ------------------------------------------------------------------ tests
+  # The matrix is the whole point of this workflow: "works on my machine" is
+  # exactly the failure mode this project is trying to eliminate, so every
+  # supported OS/arch/Node combination has to run the same suites.
+  test:
+    name: ${{ matrix.name }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,   os: ubuntu-latest,     node: 18 }
+          - { name: linux-x64,   os: ubuntu-latest,     node: 20 }
+          - { name: linux-x64,   os: ubuntu-latest,     node: 22 }
+          - { name: linux-arm64, os: ubuntu-24.04-arm,  node: 22 }
+          - { name: macos-arm64, os: macos-latest,      node: 18 }
+          - { name: macos-arm64, os: macos-latest,      node: 22 }
+          - { name: macos-x64,   os: macos-13,          node: 22 }
+          - { name: windows-x64, os: windows-latest,    node: 20 }
+          - { name: windows-x64, os: windows-latest,    node: 22 }
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: 18
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
 
-    - name: Node.js security audit
-      run: |
-        cd src/bindings/nodejs
-        npm audit --audit-level moderate
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      # inotify's default watch limit is low enough that a recursive watch over
+      # a large tree can exhaust it. Raise it so a genuine bug is not masked by
+      # an environment limit -- and so the limit-exhaustion test stays
+      # meaningful rather than firing spuriously.
+      - name: Raise inotify limits (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+          sudo sysctl -w fs.inotify.max_user_instances=512
+
+      - name: Build C hash engine
+        run: make build-core
+
+      - name: C engine tests
+        run: make test-core
+
+      # retrigger-nodejs-bindings used to be excluded here. It is a `cdylib`
+      # whose napi_* symbols come from the Node process that loads it, and
+      # under napi 2 a standalone `cargo test` harness had no host for them:
+      # it failed to link on Windows and, on x86-64 Linux, linked but died at
+      # startup resolving napi_reference_unref through a GOT relocation. napi 3
+      # resolves those symbols at load time instead (napi-sys `dyn-symbols`, on
+      # by default), so the harness now carries no napi_* imports at all and
+      # one command is honest on every runner.
+      - name: Rust tests
+        run: cargo test --workspace --release
+
+      - name: Install JS dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: src/bindings/nodejs
+
+      # Build the addon this package actually ships, so the native-parity suite
+      # (parity-native.test.mjs) runs instead of skipping. Without this step a
+      # green JS run never proves the fallback matches the real Rust engine --
+      # the one guarantee the whole package rests on. Gated to match the JS test
+      # legs below: the addon is a Rust build (Node-version independent), but its
+      # only consumer here is the vitest run, which the Node 18 legs skip.
+      - name: Build native addon
+        if: matrix.node != 18
+        run: npm run build
+        working-directory: src/bindings/nodejs
+
+      # Vitest 4 declares node ^20 || ^22 || >=24, so it refuses to start on the
+      # two Node 18 legs. Those legs are not here to exercise the test runner
+      # though: they defend package.json#engines.node (>=18.17.0, the floor the
+      # napi9 feature is pinned to), which is a promise about the *shipped*
+      # artifact. A dev-only runner never reaches a consumer, so the step below
+      # carries Node 18 instead -- and carries it better.
+      - name: JavaScript tests
+        if: matrix.node != 18
+        run: npm test
+        working-directory: src/bindings/nodejs
+
+      # The daemon npm package is a shim over a per-platform Rust binary. This
+      # proves the shim, the shipped config, and the documented no-binary
+      # degradation from Node. Plain node:test, so it runs on every leg
+      # including Node 18.
+      - name: Daemon package smoke test
+        run: node scripts/test-daemon.js
+        working-directory: src/daemon
+
+      # The direct answer to "will it work when I install it somewhere else":
+      # pack the tarball, install it into a clean directory, and require it.
+      # Deliberately unguarded, so this is what proves Node 18 support: it is
+      # plain node + assert with no runner, the tarball carries no binary, and
+      # it drives require(), ESM import, both subpath exports, a real watch
+      # cycle, hashing and clean exit -- the whole JavaScript-engine contract,
+      # on the oldest Node claimed.
+      - name: Packaged install proof
+        run: npm run test:pack
+        working-directory: src/bindings/nodejs
+
+  # ------------------------------------------------------------------- musl
+  # Alpine is a separate risk surface from Debian: different libc, and the
+  # package's libc detection has to pick the musl binaries. It has been wrong
+  # before, so it gets its own job rather than being assumed from linux-x64.
+  test-musl:
+    name: linux-x64-musl
+    runs-on: ubuntu-latest
+    container:
+      image: node:22-alpine
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain
+        run: apk add --no-cache build-base clang clang-dev llvm-dev rust cargo make bash python3
+      - run: make build-core
+      - run: make test-core
+      - run: cargo test --workspace --release
+      - run: npm ci --no-audit --no-fund
+        working-directory: src/bindings/nodejs
+      - run: npm test
+        working-directory: src/bindings/nodejs
+
+  # ----------------------------------------------------------- sanitizers
+  sanitizers:
+    name: Sanitizers (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - name: C engine under ASan/UBSan
+        run: make test-core-asan
+        env:
+          CC: clang
+      # Compile-only, so it needs no libFuzzer runtime and gives the same answer
+      # on every machine: it stops a fuzz target from rotting unnoticed between
+      # the manual campaigns that actually run them.
+      - name: Fuzz targets still build
+        run: make check-fuzz
+        env:
+          CC: clang
+
+  # --------------------------------------------------------- no-native path
+  # Proves the JavaScript fallback: the package must load and work with no
+  # native addon present at all. This is the guarantee that an unsupported
+  # platform degrades instead of throwing at require() time.
+  fallback:
+    name: JS fallback (no native binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: src/bindings/nodejs
+      - name: Remove any native artifacts
+        run: find . -name '*.node' -delete
+      - name: Suite must pass with no addon
+        run: npm test
+        working-directory: src/bindings/nodejs
+        env:
+          RETRIGGER_FORCE_JS: '1'
+
+  # ------------------------------------------------------------------- MSRV
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read rust-version from the workspace manifest
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: cargo check --workspace --all-targets
+
+  # ------------------------------------------------------------------ audit
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: npm audit
+        run: npm audit --audit-level=moderate
+        working-directory: src/bindings/nodejs
+
+  # ------------------------------------------------------------------- gate
+  # A single required check, so branch protection does not need updating every
+  # time the matrix changes.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [lint, test, test-musl, sanitizers, fallback, msrv]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any dependency failed
+        run: |
+          if echo '${{ join(needs.*.result, ' ') }}' | grep -qE 'failure|cancelled'; then
+            echo "One or more required jobs did not succeed."
+            exit 1
+          fi
+          echo "All required jobs succeeded."

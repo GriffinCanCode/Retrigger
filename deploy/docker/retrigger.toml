@@ -1,52 +1,53 @@
-# Retrigger Docker Configuration
-# Optimized for containerized deployment
+# Retrigger daemon configuration for the container images.
+#
+# Every key here is read by the daemon, and unknown keys are rejected rather
+# than ignored -- run `retrigger validate -c <file>` after editing. The previous
+# version of this file predated the 2.0 daemon and described sections that no
+# longer exist ([performance], metrics_port, zero-copy IPC), which meant the
+# image booted straight into a config parse error.
 
 [server]
+# Containers must be reachable from outside the network namespace, so this
+# binds to all interfaces rather than the 127.0.0.1 default. Publish the port
+# deliberately (-p) and keep the daemon off untrusted networks: it exposes an
+# unauthenticated control API that can add watch roots.
 bind_address = "0.0.0.0"
 port = 9090
-max_connections = 1000
-request_timeout_ms = 30000
-enable_metrics = true
-metrics_port = 9091
 
 [watcher]
-# No default watch paths - let clients specify
-watch_paths = []
-event_buffer_size = 65536
-hash_cache_size = 50000
+queue_capacity = 4096
+debounce_ms = 50
+# Bind mounts are frequently symlinked on the host side.
+follow_symlinks = true
+hash_cache_size = 100000
 hash_cache_ttl_secs = 3600
-hash_block_size = 4096
 
-[performance]
-# Auto-detect optimal settings in container
-worker_threads = 0
-enable_simd = true
-event_batch_size = 100
-poll_interval_us = 1000
-enable_zero_copy = true
+[patterns]
+include = []
+exclude = [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/target/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.next/**",
+    "**/coverage/**",
+    "**/*.tmp",
+    "**/*.swp",
+    "**/*~",
+    "**/.DS_Store",
+]
 
 [logging]
 level = "info"
+# One JSON object per line, which is what a container log shipper wants.
 format = "json"
-structured = true
-# Log to stdout in containers
-file = ""
 
-[patterns]
-include = ["**/*"]
-exclude = [
-    "**/node_modules/**",
-    "**/.git/**", 
-    "**/target/**",
-    "**/build/**",
-    "**/dist/**",
-    "**/.vscode/**",
-    "**/.idea/**",
-    "**/coverage/**",
-    "**/*.log",
-    "**/.*",
-    "**/Dockerfile*",
-    "**/docker-compose*",
-]
-max_file_size = 104857600  # 100MB
-ignore_binary = true
+# Nothing is watched until a root is declared. The image declares none, because
+# the path only exists once something is mounted: run with
+#   -v "$PWD:/workspace" and uncomment the block below,
+# or add it at runtime with `POST /watch`.
+#
+# [[watcher.paths]]
+# path = "/workspace"
+# recursive = true

@@ -1,42 +1,89 @@
 #!/usr/bin/env node
+'use strict';
 
-const { exec } = require('child_process');
-const { platform, arch } = process;
-const path = require('path');
-const fs = require('fs');
+/*
+ * Post-install check for @retrigger/daemon.
+ *
+ * This script reports; it does not fail. The previous version called
+ * process.exit(1) when the daemon binary was missing or unrunnable, which
+ * turned an optional component into a hard `npm install` failure for every
+ * user on a platform without a prebuilt binary.
+ *
+ * The daemon is optional: @retrigger/core watches in-process and needs nothing
+ * from this package. So a missing binary is a degraded state worth explaining,
+ * never a reason to break someone's install.
+ */
 
-console.log('🚀 Installing Retrigger daemon...');
-console.log(`Platform: ${platform}-${arch}`);
+const { execFile } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
 
-// Make binary executable
-const binPath = path.join(__dirname, '..', 'bin', 'retrigger');
-if (fs.existsSync(binPath)) {
-  try {
-    fs.chmodSync(binPath, 0o755);
-    console.log('✅ Made daemon binary executable');
-  } catch (error) {
-    console.warn('⚠️  Could not make binary executable:', error.message);
-  }
-} else {
-  console.warn('⚠️  Daemon binary not found at:', binPath);
+const QUIET = process.env.RETRIGGER_SILENT === '1' || process.env.CI === 'true';
+
+function note(msg) {
+  if (!QUIET) console.log(`retrigger: ${msg}`);
 }
 
-// Test daemon
-console.log('🔍 Testing daemon installation...');
-exec(`${binPath} --version`, (error, stdout, stderr) => {
-  if (error) {
-    console.error('❌ Daemon test failed:', error.message);
-    process.exit(1);
+function warn(msg) {
+  if (!QUIET) console.warn(`retrigger: ${msg}`);
+}
+
+function binaryName() {
+  return process.platform === 'win32' ? 'retrigger.exe' : 'retrigger';
+}
+
+function localBinary() {
+  return path.join(__dirname, '..', 'bin', binaryName());
+}
+
+/** Resolve the platform package npm should have installed for this host. */
+function platformPackage() {
+  const { platform, arch } = process;
+  try {
+    return require.resolve(`@retrigger/daemon-${platform}-${arch}/${binaryName()}`);
+  } catch {
+    return null;
   }
-  
-  console.log('✅ Daemon installed successfully!');
-  console.log(`Version: ${stdout.trim()}`);
-  console.log('');
-  console.log('Usage:');
-  console.log('  retrigger start    # Start the daemon');
-  console.log('  retrigger stop     # Stop the daemon');
-  console.log('  retrigger status   # Check daemon status');
-  console.log('  retrigger --help   # Show all commands');
-  console.log('');
-  console.log('📖 Documentation: https://github.com/GriffinCanCode/Retrigger');
-});
+}
+
+function explainMissing() {
+  warn(`no prebuilt daemon binary for ${process.platform}-${process.arch}.`);
+  warn('this is not fatal: @retrigger/core watches in-process and does not require the daemon.');
+  warn('to build it from source: cargo install --git https://github.com/GriffinCanCode/Retrigger retrigger-daemon');
+}
+
+function main() {
+  const resolved = platformPackage() || (fs.existsSync(localBinary()) ? localBinary() : null);
+
+  if (!resolved) {
+    explainMissing();
+    return;
+  }
+
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(resolved, 0o755);
+    } catch (err) {
+      warn(`could not mark the daemon executable (${err.message}); you may need to chmod +x it yourself.`);
+    }
+  }
+
+  // Verify it actually runs on this machine. A binary that exists but was
+  // built for the wrong CPU baseline would otherwise only reveal itself later,
+  // at the least convenient moment.
+  execFile(resolved, ['--version'], { timeout: 10_000 }, (err, stdout) => {
+    if (err) {
+      warn(`the daemon binary is present but did not run: ${err.message}`);
+      warn('falling back to in-process watching; run `retrigger --version` to investigate.');
+      return;
+    }
+    note(`daemon ready (${String(stdout).trim()})`);
+  });
+}
+
+try {
+  main();
+} catch (err) {
+  // Nothing this script can hit is worth failing an install over.
+  warn(`post-install check skipped: ${err && err.message}`);
+}

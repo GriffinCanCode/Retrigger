@@ -152,6 +152,41 @@ A correct pure-JavaScript XXH3-64 would need BigInt arithmetic that is roughly t
 of magnitude slower than the native path and easy to get subtly wrong, so the fallback uses
 a hash Node already implements in C rather than shipping a plausible-looking near-miss.
 
+`event.contentChanged` is unaffected by any of this, and is comparable across engines even
+though the digests behind it are not: the decision compares a path against its own earlier
+digest, taken by the same engine in the same process. One test suite runs against the compiled
+addon, a mock addon, and the JavaScript engine, and all three must reach the same answer.
+
+### Content Changes
+
+Every event carries `contentChanged`, and the plugins act on it.
+
+```javascript
+watcher.on('change', (path, event) => {
+  if (event.contentChanged === false) return; // rewritten with the bytes it already had
+  rebuild(path);
+});
+```
+
+The decision table is the same one the Rust daemon uses, so an in-process watcher and the
+daemon cannot disagree.
+
+- **A file whose digest differs from the cached one** — `true`, and `event.hash` is the new
+  digest.
+- **A file whose digest matches** — `false`.
+- **A file that could not be read, or is larger than `maxHashBytes`** — `true`, with a `null`
+  hash. Unknown is not the same as unchanged.
+- **A file deleted or renamed away** — `true`, and the cached digest is forgotten.
+- **A directory created, deleted or renamed** — `true`; modified or metadata is `false`,
+  because directory mtime churn is not a content change.
+- **A rescan signal** — `true`.
+
+Hashing runs on the drain loop, which is why `maxHashBytes` exists: a source file costs tens of
+microseconds and is worth it against a rebuild, while a large build artifact is neither cheap to
+hash nor likely to have been rewritten byte-for-byte by hand. The digest cache is bounded the
+same way every other map in this package is, and forgetting an entry costs one re-hash and a
+redundant rebuild — never a missed change.
+
 ## API
 
 Twelve exports make up the API.
@@ -186,7 +221,9 @@ createRetrigger({
   pollIntervalMs: 5, // how often the engine queue is drained
   engine: 'auto', // 'auto' | 'native' | 'javascript'
   emitDirectories: false,
-  unref: false, // do not keep the process alive
+  unref: false, // unref the poll timer
+  contentHashing: true, // report `contentChanged` on every event
+  maxHashBytes: 4194304, // above this a file is reported changed without being read
 });
 ```
 
@@ -226,10 +263,17 @@ new RetriggerWebpackPlugin({
   aggregateTimeout: 20,
   capacity: 16384,
   pollIntervalMs: 5,
+  contentHashing: true, // skip files rewritten with identical bytes
 });
 ```
 
-`plugin.getStats()` returns measured counters, or `null` before the first watch.
+A write that did not change a file's bytes is never reported to webpack: no timestamp is
+advanced, no watch session is notified, and nothing is held over for the next one. Leaving the
+recorded timestamp where it was is the truthful answer, since the contents webpack compiled are
+still the contents on disk, and webpack re-stats anything it was not told about.
+
+`plugin.getStats()` returns measured counters, or `null` before the first watch;
+`metrics.eventsUnchanged` is how many rebuilds this saved.
 
 Default exclusions matter. `node_modules` is not recursed into, so edits inside it will not
 trigger a rebuild while `replaceWatcher` is on. Pass `exclude: []` if you are actively
@@ -258,8 +302,15 @@ createRetriggerVitePlugin({
   capacity: 8192,
   pollIntervalMs: 5,
   stats: true, // mounts GET /__retrigger_stats
+  contentHashing: true, // skip files rewritten with identical bytes
 });
 ```
+
+A write that did not change a file's bytes is not replayed onto `server.watcher`, so the module
+graph is not invalidated and the browser is not reloaded. Vite's own chokidar watcher is still
+running and is free to reach its own conclusion about that write; what Retrigger will not do is
+add a second, redundant invalidation for it. `/__retrigger_stats` reports the count as
+`metrics.eventsUnchanged`.
 
 ## Requirements
 

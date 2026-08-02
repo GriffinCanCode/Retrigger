@@ -18,6 +18,11 @@ pnpm-lock.yaml
 
 # --- Build output --------------------------------------------------------
 # lib/ and plugins/ are SOURCE here and are deliberately absent from this list.
+# .napi/ holds the .d.ts that `napi build` emits; index.js and index.d.ts are
+# hand-written entry points, so the build redirects the generated one into here
+# rather than overwriting them. The generated loader is suppressed outright
+# with --no-js, since nothing consumes it.
+/.napi/
 /dist/
 /out/
 /build/

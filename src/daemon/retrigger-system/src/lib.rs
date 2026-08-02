@@ -1,1030 +1,139 @@
-//! Retrigger System Integration
+//! Cross-platform file system watching for Retrigger.
 //!
-//! Rust wrapper around the high-performance Zig system layer.
-//! Provides async interfaces for file system monitoring.
-
-use std::ffi::{CStr, CString};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use anyhow::{Context, Result};
-use dashmap::DashMap;
-use retrigger_core::{FastHash, HashEngine, HashResult};
-use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
-
-/// File system event from the native layer
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemEvent {
-    pub path: PathBuf,
-    pub event_type: SystemEventType,
-    pub timestamp: u64,
-    pub size: u64,
-    pub is_directory: bool,
-}
-
-/// System event types matching the Zig layer
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum SystemEventType {
-    Created = 1,
-    Modified = 2,
-    Deleted = 3,
-    Moved = 4,
-    MetadataChanged = 5,
-}
-
-/// File system watcher statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatcherStats {
-    pub pending_events: u32,
-    pub buffer_capacity: u32,
-    pub dropped_events: u64,
-    pub total_events: u64,
-    pub watched_directories: usize,
-}
-
-/// FFI bindings to the Zig layer
-mod ffi {
-    use std::os::raw::{c_char, c_int};
-
-    #[repr(C)]
-    pub struct FileWatcher {
-        _private: [u8; 0],
-    }
-
-    #[repr(C)]
-    #[allow(dead_code)]
-    pub struct FileEvent {
-        pub path: *const c_char,
-        pub event_type: u8,
-        pub timestamp: u64,
-        pub size: u64,
-        pub is_directory: bool,
-    }
-
-    extern "C" {
-        pub fn fw_watcher_create() -> *mut FileWatcher;
-        pub fn fw_watcher_destroy(watcher: *mut FileWatcher);
-        pub fn fw_watcher_watch_directory(
-            watcher: *mut FileWatcher,
-            path: *const c_char,
-            recursive: bool,
-        ) -> c_int;
-        pub fn fw_watcher_start(watcher: *mut FileWatcher) -> c_int;
-        #[allow(dead_code)]
-        pub fn fw_watcher_poll_event(watcher: *mut FileWatcher, out_event: *mut FileEvent) -> bool;
-    }
-}
-
-/// Wrapper for raw pointer to make it Send + Sync
-/// SAFETY: The Zig file watcher is thread-safe for our use case
-struct WatcherPtr(*mut ffi::FileWatcher);
-unsafe impl Send for WatcherPtr {}
-unsafe impl Sync for WatcherPtr {}
-
-impl WatcherPtr {
-    fn new(ptr: *mut ffi::FileWatcher) -> Self {
-        Self(ptr)
-    }
-    
-    fn as_ptr(&self) -> *mut ffi::FileWatcher {
-        self.0
-    }
-    
-    fn is_null(&self) -> bool {
-        self.0.is_null()
-    }
-}
-
-
-/// Event filtering configuration
-#[derive(Debug, Clone)]
-pub struct EventFilter {
-    pub include_patterns: Vec<String>,
-    pub exclude_patterns: Vec<String>,
-    pub debounce_ms: u64,
-    pub min_file_size: u64,
-    pub max_file_size: Option<u64>,
-}
-
-impl Default for EventFilter {
-    fn default() -> Self {
-        Self {
-            include_patterns: vec![],
-            exclude_patterns: vec![
-                "**/node_modules/**".to_string(),
-                "**/.git/**".to_string(),
-                "**/.*".to_string(),
-                "**/*.tmp".to_string(),
-                "**/*.swp".to_string(),
-            ],
-            debounce_ms: 100,
-            min_file_size: 0,
-            max_file_size: None,
-        }
-    }
-}
-
-/// High-level system file watcher
-pub struct SystemWatcher {
-    watcher: WatcherPtr,
-    #[allow(dead_code)]
-    hash_engine: Arc<HashEngine>,
-    watched_paths: DashMap<PathBuf, bool>, // path -> recursive
-    event_sender: broadcast::Sender<SystemEvent>,
-    stats: Arc<tokio::sync::RwLock<WatcherStats>>,
-    event_filter: EventFilter,
-    last_events: Arc<DashMap<PathBuf, u64>>, // path -> timestamp for debouncing
-    // Background polling task management
-    polling_handle: Arc<tokio::sync::RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    shutdown_signal: Arc<tokio::sync::Notify>,
-}
-
-unsafe impl Send for SystemWatcher {}
-unsafe impl Sync for SystemWatcher {}
-
-impl SystemWatcher {
-    /// Create a stub system watcher for testing/fallback
-    pub fn stub() -> Self {
-        let (event_sender, _) = broadcast::channel(10_000);
-        let hash_engine = Arc::new(HashEngine::new());
-
-        SystemWatcher {
-            watcher: WatcherPtr::new(std::ptr::null_mut()),
-            hash_engine,
-            watched_paths: DashMap::new(),
-            event_sender,
-            stats: Arc::new(tokio::sync::RwLock::new(WatcherStats {
-                pending_events: 0,
-                buffer_capacity: 0,
-                dropped_events: 0,
-                total_events: 0,
-                watched_directories: 0,
-            })),
-            event_filter: EventFilter::default(),
-            last_events: Arc::new(DashMap::new()),
-            polling_handle: Arc::new(tokio::sync::RwLock::new(None)),
-            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-        }
-    }
-    
-    /// Create a new system watcher
-    pub fn new() -> Result<Self> {
-        let watcher = unsafe { ffi::fw_watcher_create() };
-        if watcher.is_null() {
-            anyhow::bail!("Failed to create system watcher");
-        }
-
-        let (event_sender, _) = broadcast::channel(10_000);
-        let hash_engine = Arc::new(HashEngine::new());
-
-        info!(
-            "Created system watcher with SIMD level: {:?}",
-            hash_engine.simd_level()
-        );
-
-        Ok(SystemWatcher {
-            watcher: WatcherPtr::new(watcher),
-            hash_engine,
-            watched_paths: DashMap::new(),
-            event_sender,
-            stats: Arc::new(tokio::sync::RwLock::new(WatcherStats {
-                pending_events: 0,
-                buffer_capacity: 0,
-                dropped_events: 0,
-                total_events: 0,
-                watched_directories: 0,
-            })),
-            event_filter: EventFilter::default(),
-            last_events: Arc::new(DashMap::new()),
-            polling_handle: Arc::new(tokio::sync::RwLock::new(None)),
-            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-        })
-    }
-
-    /// Watch a directory for file system changes
-    pub async fn watch_directory<P: AsRef<Path>>(&self, path: P, recursive: bool) -> Result<()> {
-        let path = path.as_ref().to_path_buf();
-        
-        // Handle stub watcher
-        if self.watcher.is_null() {
-            info!("Stub watcher: would watch {} (recursive: {})", path.display(), recursive);
-            self.watched_paths.insert(path.clone(), recursive);
-            
-            // Update stats
-            {
-                let mut stats = self.stats.write().await;
-                stats.watched_directories = self.watched_paths.len();
-            }
-            return Ok(());
-        }
-        
-        let path_str = path
-            .to_str()
-            .with_context(|| format!("Invalid path: {}", path.display()))?;
-
-        let c_path = CString::new(path_str)?;
-
-        // Call the FFI function with a timeout to prevent infinite hanging
-        let result = unsafe { ffi::fw_watcher_watch_directory(self.watcher.as_ptr(), c_path.as_ptr(), recursive) };
-
-        if result != 0 {
-            anyhow::bail!("Failed to watch directory: {}", path.display());
-        }
-
-        self.watched_paths.insert(path.clone(), recursive);
-
-        // Update stats
-        {
-            let mut stats = self.stats.write().await;
-            stats.watched_directories = self.watched_paths.len();
-        }
-
-        info!(
-            "Watching directory: {} (recursive: {})",
-            path.display(),
-            recursive
-        );
-        Ok(())
-    }
-
-    /// Start the file system monitoring  
-    pub async fn start(&self) -> Result<()> {
-        // Handle stub watcher
-        if self.watcher.is_null() {
-            info!("Stub watcher: started successfully");
-            return Ok(());
-        }
-        
-        let result = unsafe { ffi::fw_watcher_start(self.watcher.as_ptr()) };
-        if result != 0 {
-            anyhow::bail!("Failed to start system watcher");
-        }
-
-        // Start background event polling task
-        self.start_polling_task().await?;
-
-        info!("Started system watcher with event polling");
-        Ok(())
-    }
-
-    /// Start the background polling task that bridges file system events to the event channel
-    async fn start_polling_task(&self) -> Result<()> {
-        let mut polling_handle = self.polling_handle.write().await;
-        
-        // Don't start if already running
-        if polling_handle.is_some() {
-            return Ok(());
-        }
-
-        let event_sender = self.event_sender.clone();
-        let stats = Arc::clone(&self.stats);
-        let last_events = Arc::clone(&self.last_events);
-        let shutdown_signal = Arc::clone(&self.shutdown_signal);
-        let watcher_ptr = WatcherPtr::new(self.watcher.as_ptr()); // Clone the pointer
-        let event_filter = self.event_filter.clone();
-
-        let handle = tokio::spawn(async move {
-            info!("SystemWatcher: Starting background polling loop...");
-            Self::polling_loop(
-                watcher_ptr,
-                event_sender,
-                stats,
-                last_events,
-                shutdown_signal,
-                event_filter,
-            ).await;
-            info!("SystemWatcher: Background polling loop ended");
-        });
-
-        *polling_handle = Some(handle);
-        info!("Started background event polling task");
-        Ok(())
-    }
-
-    /// Background polling loop - this is the missing link!
-    async fn polling_loop(
-        watcher: WatcherPtr,
-        event_sender: broadcast::Sender<SystemEvent>,
-        stats: Arc<tokio::sync::RwLock<WatcherStats>>,
-        last_events: Arc<DashMap<PathBuf, u64>>,
-        shutdown_signal: Arc<tokio::sync::Notify>,
-        event_filter: EventFilter,
-    ) {
-        info!("SystemWatcher: Polling loop started - begin monitoring for events...");
-        let mut interval = tokio::time::interval(Duration::from_millis(5)); // 5ms for production performance
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        
-        // Tick immediately to consume the first tick
-        let _ = interval.tick().await;
-        info!("SystemWatcher: Initial interval tick consumed, entering polling loop...");
-
-        info!("SystemWatcher: Starting main event polling loop...");
-        
-        loop {
-            // Simple approach: wait for tick, then check shutdown
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Poll for events from the Zig layer
-                    let events = Self::poll_events_internal(
-                        &watcher,
-                        &event_filter,
-                        &last_events
-                    ).await;
-
-                    if !events.is_empty() {
-                        info!("SystemWatcher: 🎉 FOUND {} EVENTS! Processing...", events.len());
-                        
-                        // Update stats
-                        {
-                            let mut stats_guard = stats.write().await;
-                            stats_guard.total_events += events.len() as u64;
-                        }
-
-                        // Send events to subscribers
-                        for event in events.iter() {
-                            if let Err(_) = event_sender.send(event.clone()) {
-                                debug!("No event subscribers, event dropped");
-                            }
-                        }
-                        info!("SystemWatcher: Processed {} file events successfully", events.len());
-                    }
-                }
-                
-                _ = shutdown_signal.notified() => {
-                    info!("Shutting down event polling task");
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Internal polling function (static to work in async task)
-    async fn poll_events_internal(
-        watcher: &WatcherPtr,
-        event_filter: &EventFilter,
-        last_events: &DashMap<PathBuf, u64>,
-    ) -> Vec<SystemEvent> {
-        if watcher.is_null() {
-            return vec![];
-        }
-        
-        debug!("SystemWatcher: Polling for events from Zig layer...");
-
-        let mut events = Vec::new();
-        
-        // Poll up to 10 events at a time to avoid blocking too long
-        for _ in 0..10 {
-            let mut ffi_event = ffi::FileEvent {
-                path: std::ptr::null(),
-                event_type: 0,
-                timestamp: 0,
-                size: 0,
-                is_directory: false,
-            };
-
-            let has_event = unsafe { ffi::fw_watcher_poll_event(watcher.as_ptr(), &mut ffi_event) };
-            
-            if !has_event {
-                break;
-            }
-            
-            debug!("SystemWatcher: Processing FFI event (type: {})", ffi_event.event_type);
-
-            // Convert FFI event to Rust event
-            let path = if ffi_event.path.is_null() {
-                warn!("SystemWatcher: FFI event has NULL path, skipping");
-                continue;
-            } else {
-                let path_cstr = unsafe { CStr::from_ptr(ffi_event.path) };
-                match path_cstr.to_str() {
-                    Ok(path_str) => PathBuf::from(path_str),
-                    Err(e) => {
-                        warn!("SystemWatcher: Invalid path in event: {}", e);
-                        continue;
-                    }
-                }
-            };
-
-            let event_type = match ffi_event.event_type {
-                1 => SystemEventType::Created,
-                2 => SystemEventType::Modified,
-                3 => SystemEventType::Deleted,
-                4 => SystemEventType::Moved,
-                5 => SystemEventType::MetadataChanged,
-                _ => {
-                    debug!("SystemWatcher: Unknown FFI event type: {}, defaulting to Created", ffi_event.event_type);
-                    SystemEventType::Created  // SIMPLE FIX: Default to Created instead of skipping
-                },
-            };
-
-            let system_event = SystemEvent {
-                path: path.clone(),
-                event_type,
-                timestamp: ffi_event.timestamp,
-                size: ffi_event.size,
-                is_directory: ffi_event.is_directory,
-            };
-
-            // Apply filtering and debouncing
-            info!("SystemWatcher: Processing event: path={:?}, size={}, type={:?}", 
-                   system_event.path, system_event.size, system_event.event_type);
-            if Self::should_process_event_static(&system_event, event_filter, last_events) {
-                info!("SystemWatcher: ✅ Event passed filters, adding to results");
-                events.push(system_event);
-            } else {
-                info!("SystemWatcher: ❌ Event rejected by filters");
-            }
-        }
-        
-        debug!("SystemWatcher: Polled {} events from Zig layer", events.len());
-        events
-    }
-
-    /// Static version of should_process_event for use in async task
-    fn should_process_event_static(
-        event: &SystemEvent,
-        event_filter: &EventFilter,
-        last_events: &DashMap<PathBuf, u64>,
-    ) -> bool {
-        info!("SystemWatcher: Filtering event - path={:?}, size={}, min_size={}", 
-               event.path, event.size, event_filter.min_file_size);
-        
-        // Skip if file is too small
-        if event.size < event_filter.min_file_size {
-            info!("SystemWatcher: ❌ Event rejected - file too small ({} < {})", 
-                   event.size, event_filter.min_file_size);
-            return false;
-        }
-
-        // Skip if file is too large
-        if let Some(max_size) = event_filter.max_file_size {
-            if event.size > max_size {
-                return false;
-            }
-        }
-
-        // Apply path-based filtering
-        let path_str = event.path.to_string_lossy();
-        info!("SystemWatcher: Checking path patterns - exclude: {:?}, include: {:?}", 
-               event_filter.exclude_patterns, event_filter.include_patterns);
-        
-        // Check exclude patterns first (more common)
-        for pattern in &event_filter.exclude_patterns {
-            if glob_match(pattern, &path_str) {
-                info!("SystemWatcher: ❌ Event rejected - excluded by pattern '{}'", pattern);
-                return false;
-            }
-        }
-
-        // Check include patterns (if any specified)
-        if !event_filter.include_patterns.is_empty() {
-            let mut included = false;
-            for pattern in &event_filter.include_patterns {
-                if glob_match(pattern, &path_str) {
-                    included = true;
-                    break;
-                }
-            }
-            if !included {
-                info!("SystemWatcher: ❌ Event rejected - not included by any include pattern");
-                return false;
-            }
-        }
-
-        // Apply debouncing
-        if event_filter.debounce_ms > 0 {
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            if let Some(last_time) = last_events.get(&event.path) {
-                if current_time - *last_time < event_filter.debounce_ms {
-                    return false;
-                }
-            }
-
-            // Update last event time
-            last_events.insert(event.path.clone(), current_time);
-        }
-
-        info!("SystemWatcher: ✅ Event passed all filters!");
-        true
-    }
-
-    /// Subscribe to file system events
-    pub fn subscribe(&self) -> broadcast::Receiver<SystemEvent> {
-        self.event_sender.subscribe()
-    }
-
-    /// Update event filter from config patterns
-    pub fn update_event_filter(&mut self, include_patterns: Vec<String>, exclude_patterns: Vec<String>) {
-        info!("SystemWatcher: Updating event filters - include: {:?}, exclude: {:?}", include_patterns, exclude_patterns);
-        self.event_filter.include_patterns = include_patterns;
-        self.event_filter.exclude_patterns = exclude_patterns;
-    }
-
-    /// Poll for events manually (non-blocking)
-    pub async fn poll_events(&self) -> Result<Vec<SystemEvent>> {
-        if self.watcher.is_null() {
-            return Ok(vec![]);
-        }
-
-        let mut events = Vec::new();
-        
-        // Poll up to 10 events at a time to avoid blocking too long
-        for _ in 0..10 {
-            let mut ffi_event = ffi::FileEvent {
-                path: std::ptr::null(),
-                event_type: 0,
-                timestamp: 0,
-                size: 0,
-                is_directory: false,
-            };
-
-            let has_event = unsafe { ffi::fw_watcher_poll_event(self.watcher.as_ptr(), &mut ffi_event) };
-            
-            if !has_event {
-                break;
-            }
-
-            // Convert FFI event to Rust event
-            let path = if ffi_event.path.is_null() {
-                continue;
-            } else {
-                let path_cstr = unsafe { CStr::from_ptr(ffi_event.path) };
-                match path_cstr.to_str() {
-                    Ok(path_str) => PathBuf::from(path_str),
-                    Err(e) => {
-                        warn!("Invalid path in event: {}", e);
-                        continue;
-                    }
-                }
-            };
-
-            let event_type = match ffi_event.event_type {
-                1 => SystemEventType::Created,
-                2 => SystemEventType::Modified,
-                3 => SystemEventType::Deleted,
-                4 => SystemEventType::Moved,
-                5 => SystemEventType::MetadataChanged,
-                _ => continue,
-            };
-
-            let system_event = SystemEvent {
-                path: path.clone(),
-                event_type,
-                timestamp: ffi_event.timestamp,
-                size: ffi_event.size,
-                is_directory: ffi_event.is_directory,
-            };
-
-            // Apply filtering and debouncing
-            if self.should_process_event(&system_event) {
-                // Send to subscribers
-                if let Err(_) = self.event_sender.send(system_event.clone()) {
-                    debug!("No event subscribers");
-                }
-
-                events.push(system_event);
-            }
-        }
-
-        // Update stats
-        if !events.is_empty() {
-            let mut stats_guard = self.stats.write().await;
-            stats_guard.total_events += events.len() as u64;
-        }
-
-        Ok(events)
-    }
-
-    /// Set event filter configuration
-    pub fn set_event_filter(&mut self, filter: EventFilter) {
-        self.event_filter = filter;
-    }
-
-    /// Check if an event should be processed based on filters
-    fn should_process_event(&self, event: &SystemEvent) -> bool {
-        // Skip if file is too small
-        if event.size < self.event_filter.min_file_size {
-            return false;
-        }
-
-        // Skip if file is too large
-        if let Some(max_size) = self.event_filter.max_file_size {
-            if event.size > max_size {
-                return false;
-            }
-        }
-
-        // Apply path-based filtering
-        let path_str = event.path.to_string_lossy();
-        
-        // Check exclude patterns first (more common)
-        for pattern in &self.event_filter.exclude_patterns {
-            if glob_match(pattern, &path_str) {
-                return false;
-            }
-        }
-
-        // Check include patterns (if any specified)
-        if !self.event_filter.include_patterns.is_empty() {
-            let mut included = false;
-            for pattern in &self.event_filter.include_patterns {
-                if glob_match(pattern, &path_str) {
-                    included = true;
-                    break;
-                }
-            }
-            if !included {
-                return false;
-            }
-        }
-
-        // Apply debouncing
-        if self.event_filter.debounce_ms > 0 {
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            if let Some(last_time) = self.last_events.get(&event.path) {
-                if current_time - *last_time < self.event_filter.debounce_ms {
-                    return false;
-                }
-            }
-
-            // Update last event time
-            self.last_events.insert(event.path.clone(), current_time);
-        }
-
-        true
-    }
-
-    /// Get current watcher statistics
-    pub async fn get_stats(&self) -> WatcherStats {
-        self.stats.read().await.clone()
-    }
-
-    /// Stop the file system monitoring and cleanup
-    pub async fn stop(&self) -> Result<()> {
-        info!("Stopping system watcher...");
-        
-        // Signal shutdown to polling task
-        self.shutdown_signal.notify_waiters();
-        
-        // Wait for polling task to complete
-        let mut polling_handle = self.polling_handle.write().await;
-        if let Some(handle) = polling_handle.take() {
-            if let Err(e) = handle.await {
-                warn!("Error joining polling task: {}", e);
-            } else {
-                info!("Event polling task stopped successfully");
-            }
-        }
-        
-        info!("System watcher stopped");
-        Ok(())
-    }
-}
-
-impl Drop for SystemWatcher {
-    fn drop(&mut self) {
-        // Signal shutdown (non-async)
-        self.shutdown_signal.notify_waiters();
-        
-        // Cleanup the FFI watcher
-        if !self.watcher.is_null() {
-            unsafe {
-                ffi::fw_watcher_destroy(self.watcher.as_ptr());
-            }
-        }
-        
-        // Note: We can't wait for the async task here since Drop is sync
-        // The polling task should stop soon after the shutdown signal
-    }
-}
-
-/// Enhanced file event that includes hash information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnhancedFileEvent {
-    pub system_event: SystemEvent,
-    pub hash: Option<HashResult>,
-    pub processing_time_ns: u64,
-}
-
-/// Enhanced cache entry with hierarchy info (2025 best practice)
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    hash: HashResult,
-    timestamp: SystemTime,
-    access_count: u32,
-    #[allow(dead_code)]
-    directory_level: usize,
-}
-
-/// Configuration for the enhanced cache
-#[derive(Debug, Clone)]
-pub struct CacheConfig {
-    pub max_entries: usize,
-    pub ttl_seconds: u64,
-    pub enable_hierarchy: bool,
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            max_entries: 1_000_000,
-            ttl_seconds: 3600,
-            enable_hierarchy: true,
-        }
-    }
-}
-
-/// Enhanced file event processor with hierarchical caching
-pub struct FileEventProcessor {
-    hash_engine: Arc<HashEngine>,
-    hash_cache: Arc<DashMap<PathBuf, CacheEntry>>,
-    directory_cache: Arc<DashMap<PathBuf, Vec<PathBuf>>>,
-    config: CacheConfig,
-}
-
-impl FileEventProcessor {
-    pub fn new() -> Self {
-        Self::with_config(CacheConfig::default())
-    }
-
-    pub fn with_config(config: CacheConfig) -> Self {
-        Self {
-            hash_engine: Arc::new(HashEngine::new()),
-            hash_cache: Arc::new(DashMap::with_capacity(config.max_entries)),
-            directory_cache: Arc::new(DashMap::new()),
-            config,
-        }
-    }
-
-    /// Process a system event and add hash information
-    pub async fn process_event(&self, event: SystemEvent) -> Result<EnhancedFileEvent> {
-        let start_time = std::time::Instant::now();
-
-        let hash = if !event.is_directory
-            && matches!(
-                event.event_type,
-                SystemEventType::Created | SystemEventType::Modified
-            ) {
-            // Check hierarchical cache first
-            if let Some(mut entry) = self.hash_cache.get_mut(&event.path) {
-                let event_time = UNIX_EPOCH + Duration::from_nanos(event.timestamp);
-
-                // Check TTL
-                let age = SystemTime::now()
-                    .duration_since(entry.timestamp)
-                    .unwrap_or(Duration::ZERO);
-
-                if age.as_secs() <= self.config.ttl_seconds && entry.timestamp >= event_time {
-                    // Update access count for LRU
-                    entry.access_count += 1;
-                    Some(entry.hash.clone())
-                } else {
-                    drop(entry); // Release lock before computing new hash
-                    self.compute_and_cache_hash(&event.path).await
-                }
-            } else {
-                // Compute new hash
-                self.compute_and_cache_hash(&event.path).await
-            }
-        } else {
-            // Handle directory events for hierarchy
-            if event.is_directory && matches!(event.event_type, SystemEventType::Deleted) {
-                self.invalidate_directory(&event.path);
-            }
-            None
-        };
-
-        let processing_time_ns = start_time.elapsed().as_nanos() as u64;
-
-        Ok(EnhancedFileEvent {
-            system_event: event,
-            hash,
-            processing_time_ns,
-        })
-    }
-
-    /// Compute and cache file hash with hierarchical awareness
-    async fn compute_and_cache_hash(&self, path: &Path) -> Option<HashResult> {
-        let hash_result = match self.hash_engine.hash_file(path) {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("Failed to hash file {}: {}", path.display(), e);
-                return None;
-            }
-        };
-
-        // Create enhanced cache entry
-        let entry = CacheEntry {
-            hash: hash_result.clone(),
-            timestamp: SystemTime::now(),
-            access_count: 1,
-            directory_level: path.components().count(),
-        };
-
-        // Insert into cache
-        self.hash_cache.insert(path.to_path_buf(), entry);
-
-        // Update directory hierarchy if enabled
-        if self.config.enable_hierarchy {
-            if let Some(parent) = path.parent() {
-                self.directory_cache
-                    .entry(parent.to_path_buf())
-                    .or_default()
-                    .push(path.to_path_buf());
-            }
-        }
-
-        // Check if we need to evict (simple capacity management)
-        if self.hash_cache.len() > self.config.max_entries {
-            self.evict_lru();
-        }
-
-        Some(hash_result)
-    }
-
-    /// Invalidate directory hierarchy
-    fn invalidate_directory(&self, dir: &Path) {
-        if !self.config.enable_hierarchy {
-            return;
-        }
-
-        if let Some((_, files)) = self.directory_cache.remove(dir) {
-            for file in files {
-                self.hash_cache.remove(&file);
-            }
-        }
-
-        // Also remove subdirectories
-        let dir_str = dir.to_string_lossy();
-        self.directory_cache
-            .retain(|path, _| !path.to_string_lossy().starts_with(dir_str.as_ref()));
-    }
-
-    /// Evict least recently used entries
-    fn evict_lru(&self) {
-        let target_size = (self.config.max_entries as f64 * 0.8) as usize;
-        let entries_to_remove = self.hash_cache.len().saturating_sub(target_size);
-
-        if entries_to_remove == 0 {
-            return;
-        }
-
-        // Collect entries for eviction (simple LRU based on access_count)
-        let mut to_evict = Vec::new();
-        for entry in self.hash_cache.iter() {
-            to_evict.push((entry.key().clone(), entry.access_count));
-            if to_evict.len() >= entries_to_remove * 2 {
-                break;
-            }
-        }
-
-        // Sort by access count (ascending) to evict least used
-        to_evict.sort_by_key(|(_, count)| *count);
-
-        // Remove the least used entries
-        for (path, _) in to_evict.into_iter().take(entries_to_remove) {
-            self.hash_cache.remove(&path);
-            // Also clean up from directory hierarchy
-            if let Some(parent) = path.parent() {
-                if let Some(mut files) = self.directory_cache.get_mut(parent) {
-                    files.retain(|p| p != &path);
-                }
-            }
-        }
-    }
-
-    /// Get enhanced cache statistics
-    pub fn cache_stats(&self) -> (usize, usize) {
-        (self.hash_cache.len(), self.config.max_entries)
-    }
-
-    /// Get detailed cache statistics
-    pub fn detailed_cache_stats(&self) -> DetailedCacheStats {
-        let entry_count = self.hash_cache.len();
-        let directory_count = self.directory_cache.len();
-        let utilization = (entry_count as f64 / self.config.max_entries as f64) * 100.0;
-
-        DetailedCacheStats {
-            entry_count,
-            directory_count,
-            capacity: self.config.max_entries,
-            utilization,
-            ttl_seconds: self.config.ttl_seconds,
-        }
-    }
-
-    /// Clear expired cache entries
-    pub async fn cleanup_cache(&self, max_age: Duration) {
-        let cutoff = SystemTime::now() - max_age;
-        let mut removed_count = 0;
-
-        self.hash_cache.retain(|path, entry| {
-            if entry.timestamp < cutoff {
-                removed_count += 1;
-                // Clean up from directory hierarchy
-                if let Some(parent) = path.parent() {
-                    if let Some(mut files) = self.directory_cache.get_mut(parent) {
-                        files.retain(|p| p != path);
-                    }
-                }
-                false
-            } else {
-                true
-            }
-        });
-
-        // Clean up empty directories
-        self.directory_cache.retain(|_, files| !files.is_empty());
-
-        if removed_count > 0 {
-            debug!("Cleaned up {} expired cache entries", removed_count);
-        }
-    }
-
-    /// Clear all cache entries
-    pub fn clear_cache(&self) {
-        self.hash_cache.clear();
-        self.directory_cache.clear();
-    }
-}
-
-impl Default for FileEventProcessor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Detailed cache statistics for monitoring
-#[derive(Debug, Clone)]
-pub struct DetailedCacheStats {
-    pub entry_count: usize,
-    pub directory_count: usize,
-    pub capacity: usize,
-    pub utilization: f64,
-    pub ttl_seconds: u64,
-}
-
-/// Simple glob pattern matching for file paths
-fn glob_match(pattern: &str, path: &str) -> bool {
-    // Simple implementation - convert glob to regex
-    let regex_pattern = pattern
-        .replace("**", "DOUBLE_STAR")
-        .replace("*", "[^/]*")
-        .replace("DOUBLE_STAR", ".*")
-        .replace("?", "[^/]");
-    
-    if let Ok(regex) = regex::Regex::new(&format!("^{}$", regex_pattern)) {
-        regex.is_match(path)
-    } else {
-        // Fallback to simple string matching
-        path.contains(&pattern.replace("*", ""))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[allow(unused_imports)]
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn test_watcher_creation() {
-        // This test would only work with the full Zig implementation
-        if let Ok(watcher) = SystemWatcher::new() {
-            let stats = watcher.get_stats().await;
-            assert_eq!(stats.watched_directories, 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_event_processor() {
-        let processor = FileEventProcessor::new();
-
-        // Create a test event
-        let test_event = SystemEvent {
-            path: PathBuf::from("/tmp/test.txt"),
-            event_type: SystemEventType::Created,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
-            size: 1024,
-            is_directory: false,
-        };
-
-        // Processing should complete without error (even if file doesn't exist)
-        let enhanced = processor.process_event(test_event).await;
-        assert!(enhanced.is_ok());
-    }
-}
+//! A thin, safe layer over the [`notify`] crate that adds the properties a dev-server watcher
+//! actually needs: a **bounded** queue that reports its own losses, per-path coalescing that
+//! never swallows a delete, uniform non-recursive semantics across backends, include/exclude
+//! filtering applied before anything is queued, and a lifecycle that joins its threads.
+//!
+//! There is no FFI, no `unsafe`, and no silent failure mode: [`forbid(unsafe_code)`] is enforced
+//! at the crate root.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use retrigger_system::{EventKind, Watcher, WatcherConfig};
+//! use std::path::Path;
+//! use std::time::Duration;
+//!
+//! let watcher = Watcher::new(WatcherConfig::default())?;
+//! watcher.watch(Path::new("src"), true)?;
+//! watcher.start()?;
+//!
+//! while let Some(event) = watcher.recv_timeout(Duration::from_secs(5)) {
+//!     match event.kind {
+//!         // Events were lost; re-read the tree instead of trusting the stream.
+//!         EventKind::RescanRequired => rebuild_everything(),
+//!         _ => rebuild(&event.path),
+//!     }
+//! }
+//!
+//! watcher.stop()?;
+//! # fn rebuild_everything() {}
+//! # fn rebuild(_: &Path) {}
+//! # Ok::<(), retrigger_system::WatchError>(())
+//! ```
+//!
+//! # Loss is reported, never silent
+//!
+//! Every mechanism that can lose an event surfaces it:
+//!
+//! - the bounded queue overflowing raises [`EventKind::RescanRequired`] and increments
+//!   [`WatcherStats::events_dropped`];
+//! - a kernel-reported overflow (`IN_Q_OVERFLOW`, `kFSEventStreamEventFlagMustScanSubDirs`)
+//!   raises the same signal;
+//! - a watch that could not be installed because the kernel limit was reached raises it too, and
+//!   [`WatchError::WatchLimitExceeded`] carries the remediation;
+//! - a [`subscribe`](Watcher::subscribe) receiver that falls behind gets
+//!   [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged).
+//!
+//! A consumer that treats [`EventKind::RescanRequired`] as "re-read everything" is always
+//! correct, no matter how hard the file system is hammered.
+//!
+//! # New directories
+//!
+//! `mkdir -p dist && write dist/bundle.js` is the most common shape of change a build tool makes,
+//! and on inotify it is the one shape a naive watcher loses: watches are per directory, so `dist`
+//! is unobserved until its own creation event has been processed, and the write lands inside that
+//! window.
+//!
+//! When a directory appears inside a recursive watch, this crate therefore *reads* it and reports
+//! what is already there as [`Created`](EventKind::Created), descending into subdirectories it
+//! finds the same way. Those events are counted in
+//! [`WatcherStats::events_synthesized`] and are otherwise indistinguishable from real ones, which
+//! is the point: an entry either produced a kernel event or gets a synthesized one. A tree too
+//! large to describe this way raises [`EventKind::RescanRequired`] instead of emitting tens of
+//! thousands of events. The mechanism, its bounds, and what it does *not* guarantee are documented
+//! on the `scan` module — read it before changing any of it.
+//!
+//! # Debouncing
+//!
+//! [`WatcherConfig::debounce`] coalesces on the **leading** edge: the first event for a path is
+//! delivered immediately and further [coalescable](EventKind::is_coalescable) events for the same
+//! path within the window are dropped. Deletes and renames are never coalesced, and neither is an
+//! event that follows a change in whether the path exists — collapsing either would change what
+//! the stream means rather than how often it fires.
+//!
+//! [`notify-debouncer-full`] was evaluated and deliberately not used: it debounces on the
+//! trailing edge, which taxes *every* change with the full window before the consumer hears about
+//! it, and it re-derives its own rename/delete model on top of the backend's, which is precisely
+//! the layer of guesswork this crate is meant to remove. It is also, at the time of writing, only
+//! published as a release candidate.
+//!
+//! # Platform notes
+//!
+//! | | Linux | macOS | Windows |
+//! |---|---|---|---|
+//! | backend | `inotify` | `FSEvents` | `ReadDirectoryChangesW` |
+//! | rename [`cookie`](FileEvent::cookie) | yes | no | no |
+//! | rename sides | reported by the kernel | inferred from whether the path exists | reported by the kernel |
+//! | new subdirectories under a recursive watch | watched automatically by `notify` | inherently recursive | inherently recursive |
+//! | non-recursive watches | native | narrowed by this crate | native |
+//! | event paths | as given | fully resolved (`/private/var/...`) | as given |
+//! | event ordering | chronological per watch | *not* chronological within a coalesced batch | chronological per watch |
+//! | [`EventKind`] | as the kernel reported it | re-derived from the path | as the kernel reported it |
+//!
+//! The macOS rows are two halves of one fact: `FSEvents` reports the union of flags that occurred
+//! for a path in a batch rather than a sequence of operations, and `notify` expands that union in a
+//! fixed order. One rewrite of an existing file therefore arrives as `Created` + `Metadata` +
+//! `Modified`, and a single `rm` as `Created` + `Deleted` + `Metadata`.
+//!
+//! Apple's guidance is that the flags are advisory and the file system is the authority, so this
+//! crate asks it. Every macOS event is checked against the path it names *before* it is queued,
+//! using the `stat` the watcher already performs for [`FileEvent::size`], and:
+//!
+//! - a `Created` for a path whose birth time predates the watch is delivered as `Modified`;
+//! - a kind the path outright contradicts — an arrival or a metadata change for something that is
+//!   not there — is dropped rather than forwarded, so a consumer is not told that a file it has
+//!   just been told to forget is back;
+//! - `Deleted` and `RenamedFrom` are kept apart, because absence corroborates both.
+//!
+//! What no layer above the kernel can reconstruct is the *order* inside a batch, since it was never
+//! recorded. Consumers that need ground truth for a path should still stat it (or hash it — see
+//! [`FileEventProcessor`]) rather than replaying event order.
+//!
+//! [`forbid(unsafe_code)`]: https://doc.rust-lang.org/reference/attributes/diagnostics.html
+//! [`notify-debouncer-full`]: https://docs.rs/notify-debouncer-full
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![warn(clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
+
+mod bounded;
+mod config;
+mod error;
+mod event;
+mod filter;
+mod hash;
+mod processor;
+mod queue;
+mod scan;
+mod watcher;
+
+pub use config::{Backend, WatcherConfig, WatcherStats, DEFAULT_CAPACITY, DEFAULT_DEBOUNCE};
+pub use error::WatchError;
+pub use event::{EventKind, FileEvent};
+pub use filter::EventFilter;
+pub use hash::{fnv1a_64, ContentHasher, Fnv1aHasher};
+pub use processor::{FileEventProcessor, ProcessedEvent, ProcessorConfig, ProcessorStats};
+pub use watcher::Watcher;

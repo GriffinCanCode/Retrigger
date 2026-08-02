@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1.7
+#
+# Linux verification image (musl / Alpine).
+#
+# Alpine is a distinct install-elsewhere risk from Debian, not a redundant one:
+# musl exercises a different libc, and the Node package's libc detection has to
+# resolve to the musl platform binaries rather than the glibc ones. That
+# detection has been wrong before, so it gets its own image.
+
+ARG NODE_MAJOR=22
+
+FROM alpine:3.24 AS build
+
+ENV CARGO_TERM_COLOR=always \
+    RUSTFLAGS="-C target-feature=-crt-static"
+
+RUN apk add --no-cache \
+        build-base \
+        clang \
+        clang-dev \
+        llvm-dev \
+        rust \
+        cargo \
+        nodejs \
+        npm \
+        python3 \
+        bash \
+        make \
+        git \
+        curl
+
+RUN cargo --version && rustc --version && node --version && npm --version && cc --version | head -1
+
+WORKDIR /src
+COPY . .
+
+RUN make build-core BUILD_TYPE=release
+RUN cargo build --workspace --release
+RUN cd src/bindings/nodejs && npm install --no-audit --no-fund
+
+COPY deploy/docker/run-tests.sh /usr/local/bin/run-tests
+RUN chmod +x /usr/local/bin/run-tests
+
+ENTRYPOINT ["/bin/bash", "/usr/local/bin/run-tests"]

@@ -1,93 +1,60 @@
-# Multi-stage Dockerfile for Retrigger
-# Builds C, Zig, Rust, and Node.js components in optimized layers
+# Multi-stage Dockerfile for Retrigger (glibc / Debian-family runtime).
+#
+# Two languages, not four: the C hash engine is compiled by retrigger-core's
+# build script and linked into the Rust binary, so the runtime image needs the
+# single `retrigger` executable and nothing else -- no shared objects, no
+# ldconfig, no Zig toolchain, and no liburing (nothing links against it since
+# the watcher moved to inotify via `notify`).
+#
+# Build from the repository root so the context contains src/:
+#   docker build -f deploy/docker/Dockerfile -t retrigger .
 
-# Stage 1: Build environment setup
-FROM ubuntu:22.04 as builder
-LABEL stage=builder
+FROM ubuntu:24.04 AS builder
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    clang \
-    llvm-dev \
-    pkg-config \
-    curl \
-    wget \
-    git \
-    ca-certificates \
-    liburing-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        clang \
+        pkg-config \
+        curl \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN rustup component add rustfmt clippy
 
-# Install Zig
-RUN wget -O zig.tar.xz https://ziglang.org/download/0.15.1/zig-linux-x86_64-0.15.1.tar.xz \
-    && tar -xf zig.tar.xz \
-    && mv zig-linux-x86_64-0.15.1 /opt/zig \
-    && ln -s /opt/zig/zig /usr/local/bin/zig \
-    && rm zig.tar.xz
-
-# Install Node.js
-RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
-    && apt-get install -y nodejs
-
-# Stage 2: Build Retrigger components
-FROM builder as build-stage
 WORKDIR /build
-
-# Copy source code
 COPY . .
 
-# Set build environment
-ENV BUILD_TYPE=release
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
-# Build all components
-RUN make clean && make all
+# Builds for whichever architecture the image is being built for, so the same
+# file works under `docker buildx --platform linux/amd64,linux/arm64`.
+RUN cargo build --release --bin retrigger \
+    && ./target/release/retrigger --version
 
-# Run tests during build
-RUN make test
-
-# Stage 3: Runtime environment
-FROM ubuntu:22.04 as runtime
+FROM ubuntu:24.04 AS runtime
 LABEL maintainer="Retrigger Team"
 LABEL description="Ultra-fast file system watcher with native performance"
 
-# Install minimal runtime dependencies
-RUN apt-get update && apt-get install -y \
-    liburing2 \
-    ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r retrigger \
     && useradd -r -g retrigger -s /bin/false retrigger
 
-# Copy built binaries and libraries
-COPY --from=build-stage /build/target/release/retrigger /usr/local/bin/retrigger
-COPY --from=build-stage /build/build/*/lib/libretrigger_hash.so /usr/local/lib/
-COPY --from=build-stage /build/system/zig/zig-out/lib/libretrigger_system.so /usr/local/lib/
+COPY --from=builder /build/target/release/retrigger /usr/local/bin/retrigger
 
-# Update library cache
-RUN ldconfig
-
-# Create directories for runtime
 RUN mkdir -p /etc/retrigger /var/lib/retrigger /var/log/retrigger \
     && chown -R retrigger:retrigger /var/lib/retrigger /var/log/retrigger
 
-# Copy default configuration
-COPY docker/retrigger.toml /etc/retrigger/retrigger.toml
+COPY deploy/docker/retrigger.toml /etc/retrigger/retrigger.toml
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD retrigger --version || exit 1
 
-# Expose ports
-EXPOSE 9090 9091
+# One port: the 2.0 daemon serves the control API, the SSE change stream and
+# /metrics from the same listener. 9091 was the old separate metrics port.
+EXPOSE 9090
 
-# Switch to non-root user
 USER retrigger
 
-# Default command
 CMD ["retrigger", "start", "--config", "/etc/retrigger/retrigger.toml", "--foreground"]

@@ -1,18 +1,22 @@
 {
-  "name": "benchmarks",
+  "name": "retrigger-benchmarks",
   "version": "1.0.0",
-  "description": "",
-  "main": "comparison.js",
+  "description": "Latency and throughput benchmarks for @retrigger/core",
+  "main": "benchmark.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "bench": "node benchmark.js",
+    "bench:hash": "node benchmark.js hash",
+    "bench:watch": "node benchmark.js watch"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "type": "commonjs",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "dependencies": {
-    "@parcel/watcher": "^2.5.1",
-    "chokidar": "^4.0.3",
-    "watchpack": "^2.4.4"
-  }
+    "@parcel/watcher": "^2.6.0",
+    "chokidar": "^5.0.0",
+    "watchpack": "^2.5.2"
+  },
+  "private": true
 }

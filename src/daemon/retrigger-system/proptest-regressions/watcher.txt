@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 72cc0d01bf13f65a427b0f43afbab540ec818bb536fd1bb4c57f72ea8990f1b4 # shrinks to debounce_ms = 1, stream = [("/x/f0.ts", Created, false), ("/x/f0.ts", Created, true)]

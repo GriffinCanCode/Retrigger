@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1.7
+#
+# Linux verification image (glibc / Debian).
+#
+# This exists so Linux can be proven from a macOS workstation instead of being
+# taken on faith until CI runs. It deliberately starts from source and builds
+# every layer inside the container: the .dockerignore excludes host build
+# outputs, so nothing that passes here can be a macOS artifact in disguise.
+#
+# Build for either architecture to exercise the corresponding SIMD dispatch:
+#   docker build --platform linux/arm64 -f deploy/docker/Dockerfile.test .   # NEON
+#   docker build --platform linux/amd64 -f deploy/docker/Dockerfile.test .   # SSE2/AVX2
+#
+# The image runs the full suite as its entrypoint, so `docker run` is the test.
+
+ARG RUST_VERSION=1
+ARG NODE_MAJOR=22
+
+FROM rust:${RUST_VERSION}-bookworm AS build
+ARG NODE_MAJOR
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_TERM_COLOR=always
+
+# clang compiles the C hash engine. libclang is deliberately NOT installed:
+# retrigger-core dropped bindgen in favour of hand-written FFI declarations
+# backed by layout assertions on both sides, precisely so that building from
+# source does not require libclang on every machine.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        clang \
+        pkg-config \
+        ca-certificates \
+        curl \
+        git \
+        python3 \
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo --version && rustc --version && node --version && npm --version && cc --version | head -1
+
+WORKDIR /src
+COPY . .
+
+# Build each layer separately so a failure names the layer that broke.
+RUN make build-core BUILD_TYPE=release
+RUN cargo build --workspace --release
+RUN cd src/bindings/nodejs && npm install --no-audit --no-fund
+
+# Build the Node addon here rather than leaving it to the test run. Without it
+# the JavaScript suite silently exercises the pure-JS fallback and the
+# native-parity file skips itself, so a green Linux run would say nothing about
+# the inotify path -- the one thing this image exists to prove.
+RUN cd src/bindings/nodejs && npm run build
+
+# inotify watch descriptors are a per-user kernel limit and containers inherit
+# the host's. Record what this environment actually allows so a watch-limit
+# failure is diagnosable rather than mysterious.
+RUN printf 'max_user_watches=%s max_user_instances=%s\n' \
+        "$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null || echo unknown)" \
+        "$(cat /proc/sys/fs/inotify/max_user_instances 2>/dev/null || echo unknown)"
+
+COPY deploy/docker/run-tests.sh /usr/local/bin/run-tests
+RUN chmod +x /usr/local/bin/run-tests
+
+ENTRYPOINT ["/usr/local/bin/run-tests"]

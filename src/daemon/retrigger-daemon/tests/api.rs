@@ -1,0 +1,460 @@
+//! End-to-end tests against a real daemon on a real socket.
+//!
+//! Nothing here is mocked: a watcher is attached to a temporary directory, the HTTP server is
+//! bound to an ephemeral port, and the assertions are made by talking to it the way another
+//! process would.
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use retrigger_daemon::client::{self, HttpResponse, Reply};
+use retrigger_daemon::config::{DaemonConfig, WatchPath};
+use retrigger_daemon::{api, Daemon};
+use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
+
+/// Generous, because the point is to fail on a broken daemon rather than on a loaded CI box.
+/// macOS FSEvents in particular batches with a latency measured in hundreds of milliseconds.
+const EVENT_BUDGET: Duration = Duration::from_secs(20);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct Harness {
+    dir: tempfile::TempDir,
+    daemon: Arc<Daemon>,
+    address: SocketAddr,
+    server: JoinHandle<Result<()>>,
+}
+
+impl Harness {
+    async fn start() -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+
+        let mut config = DaemonConfig::default();
+        config.server.port = 0;
+        // Zero debounce: these tests assert about individual writes, and a coalescing window
+        // would make "did the event arrive" a question about timing rather than about wiring.
+        config.watcher.debounce_ms = 0;
+        // The default excludes drop dotfiles-adjacent noise but not the temp tree itself; keep
+        // the filter empty so nothing under test is silently swallowed.
+        config.patterns.exclude.clear();
+        config.watcher.paths = vec![WatchPath {
+            path: dir.path().to_path_buf(),
+            recursive: true,
+        }];
+
+        let listener = tokio::net::TcpListener::bind(config.socket_addr()?).await?;
+        let address = listener.local_addr()?;
+
+        let daemon = Arc::new(Daemon::new(config)?);
+        daemon.set_address(address);
+        daemon.start()?;
+
+        let server = tokio::spawn(api::serve(Arc::clone(&daemon), listener));
+        Ok(Self {
+            dir,
+            daemon,
+            address,
+            server,
+        })
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+
+    async fn get(&self, path: &str) -> Result<HttpResponse> {
+        answered(client::get(self.address, path, REQUEST_TIMEOUT).await?)
+    }
+
+    async fn post(&self, path: &str) -> Result<HttpResponse> {
+        answered(client::post(self.address, path, REQUEST_TIMEOUT).await?)
+    }
+
+    /// `POST` with a JSON body. The shipped client deliberately cannot send bodies, so the
+    /// tests that need one speak HTTP directly.
+    async fn post_json(&self, path: &str, body: &str) -> Result<HttpResponse> {
+        let mut stream = TcpStream::connect(self.address).await?;
+        let request = format!(
+            "POST {path} HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.address,
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await?;
+        stream.flush().await?;
+
+        let mut raw = Vec::new();
+        tokio::time::timeout(REQUEST_TIMEOUT, stream.read_to_end(&mut raw))
+            .await
+            .context("the daemon did not answer")??;
+        let text = String::from_utf8_lossy(&raw);
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .context("no header terminator in the response")?;
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .context("no status code in the response")?;
+        Ok(HttpResponse {
+            status,
+            body: body.to_owned(),
+        })
+    }
+
+    async fn status(&self) -> Result<Value> {
+        Ok(serde_json::from_str(&self.get("/status").await?.body)?)
+    }
+
+    /// Wait for the connected-subscriber count to reach `expected`.
+    ///
+    /// Polled rather than asserted after a sleep: a subscriber is registered when its request
+    /// reaches the handler, which is soon but not synchronous with `connect`, and a fixed sleep
+    /// turns a loaded machine into a test failure.
+    async fn await_subscribers(&self, expected: u64, budget: Duration) -> Result<()> {
+        let deadline = Instant::now() + budget;
+        let mut last = None;
+        while Instant::now() < deadline {
+            last = self.status().await?["subscribers"].as_u64();
+            if last == Some(expected) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        bail!("expected {expected} subscribers within {budget:?}, last saw {last:?}")
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        self.daemon.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), self.server)
+            .await
+            .context("the server did not shut down")???;
+        Ok(())
+    }
+}
+
+fn answered(reply: Reply) -> Result<HttpResponse> {
+    match reply {
+        Reply::Answered(response) => Ok(response),
+        Reply::Unreachable(reason) => bail!("the daemon was unreachable: {reason}"),
+    }
+}
+
+/// Read server-sent events until `wanted` `change` payloads have arrived or the budget expires.
+///
+/// Speaks HTTP/1.1 by hand because this is a streaming response: the shipped client only knows
+/// how to read a response that ends.
+async fn stream_events(address: SocketAddr, wanted: usize, budget: Duration) -> Result<Vec<Value>> {
+    let mut stream = TcpStream::connect(address).await?;
+    stream
+        .write_all(
+            format!("GET /events HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    stream.flush().await?;
+
+    let deadline = Instant::now() + budget;
+    let mut buffered = String::new();
+    let mut chunk = [0_u8; 4096];
+    let mut events = Vec::new();
+
+    while Instant::now() < deadline && events.len() < wanted {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let read = match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => read,
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => break,
+        };
+        buffered.push_str(&String::from_utf8_lossy(&chunk[..read]));
+
+        // Chunked transfer framing is interleaved with the event text, but every SSE field
+        // starts at a line boundary, so scanning lines is enough to pull the payloads out.
+        for line in buffered.lines() {
+            if let Some(payload) = line.strip_prefix("data: ") {
+                if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                    events.push(value);
+                }
+            }
+        }
+        if !events.is_empty() {
+            buffered.clear();
+        }
+    }
+    Ok(events)
+}
+
+/// Keep touching files until the watcher reports something, so a slow backend costs time rather
+/// than a false failure.
+fn keep_writing(root: &Path, contents: Vec<u8>) -> tokio::task::JoinHandle<()> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        for index in 0..200 {
+            if std::fs::write(root.join(format!("change-{index}.txt")), &contents).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+}
+
+#[tokio::test]
+async fn health_reports_a_running_watcher() -> Result<()> {
+    let harness = Harness::start().await?;
+
+    let response = harness.get("/health").await?;
+    assert_eq!(response.status, 200);
+    let body: Value = serde_json::from_str(&response.body)?;
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["watching"], true);
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn status_describes_the_watcher_that_is_actually_running() -> Result<()> {
+    let harness = Harness::start().await?;
+
+    let status = harness.status().await?;
+    assert_eq!(status["running"], true);
+    assert_eq!(status["pid"], std::process::id());
+    assert_eq!(status["address"], harness.address.to_string());
+    assert_eq!(status["watched"].as_array().map(Vec::len), Some(1));
+    assert!(
+        status["backend"].is_string(),
+        "the backend in use must be reported, got {status:#}"
+    );
+    assert!(
+        status["processor"]["capacity"].as_u64().unwrap_or(0) > 0,
+        "the fingerprint cache must report its ceiling"
+    );
+
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn metrics_are_scrapeable() -> Result<()> {
+    let harness = Harness::start().await?;
+
+    let response = harness.get("/metrics").await?;
+    assert_eq!(response.status, 200);
+    assert!(response
+        .body
+        .contains("# TYPE retrigger_events_processed_total counter"));
+    assert!(
+        response.body.contains("\nretrigger_up 1\n"),
+        "a running daemon must say so:\n{}",
+        response.body
+    );
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn an_unknown_route_is_a_404_not_a_crash() -> Result<()> {
+    let harness = Harness::start().await?;
+    assert_eq!(harness.get("/nope").await?.status, 404);
+    // ... and the daemon is still serving afterwards.
+    assert_eq!(harness.get("/health").await?.status, 200);
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn a_watch_can_be_added_and_removed_at_runtime() -> Result<()> {
+    let harness = Harness::start().await?;
+    let extra = harness.path("extra");
+    std::fs::create_dir(&extra)?;
+
+    let added = harness
+        .post_json("/watch", &format!("{{\"path\":{:?}}}", extra.display()))
+        .await?;
+    assert_eq!(added.status, 200, "{}", added.body);
+    assert_eq!(
+        harness.status().await?["watched"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    let removed = harness
+        .post_json("/unwatch", &format!("{{\"path\":{:?}}}", extra.display()))
+        .await?;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert_eq!(
+        harness.status().await?["watched"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn bad_watch_requests_are_rejected_with_a_code_the_client_can_act_on() -> Result<()> {
+    let harness = Harness::start().await?;
+
+    let missing = harness
+        .post_json("/watch", "{\"path\":\"/definitely/not/here\"}")
+        .await?;
+    assert_eq!(missing.status, 404, "{}", missing.body);
+    assert!(missing.body.contains("error"), "{}", missing.body);
+
+    let unwatched = harness
+        .post_json("/unwatch", "{\"path\":\"/never/registered\"}")
+        .await?;
+    assert_eq!(unwatched.status, 404, "{}", unwatched.body);
+
+    for body in [
+        "not json at all",
+        "{}",
+        "{\"path\":\"/tmp\",\"recursve\":true}",
+        "[]",
+    ] {
+        let response = harness.post_json("/watch", body).await?;
+        assert!(
+            (400..500).contains(&response.status),
+            "a malformed body must be the client's fault, not a 500: {body:?} gave {} {}",
+            response.status,
+            response.body
+        );
+    }
+
+    // Every one of those was survivable.
+    assert_eq!(harness.get("/health").await?.status, 200);
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn a_file_change_reaches_a_subscriber_with_the_xxh3_digest() -> Result<()> {
+    let harness = Harness::start().await?;
+    let contents = b"the bytes that must be hashed".to_vec();
+    let expected = retrigger_core::hash(&contents);
+
+    let reader = tokio::spawn(stream_events(harness.address, 1, EVENT_BUDGET));
+    // Nothing is written until the subscription is registered, or the change could be missed.
+    harness
+        .await_subscribers(1, Duration::from_secs(10))
+        .await?;
+    let writer = keep_writing(harness.dir.path(), contents);
+
+    let events = reader.await??;
+    writer.abort();
+
+    let event = events
+        .first()
+        .context("no file event reached the subscriber within the budget")?;
+    assert_eq!(
+        event["hash"].as_u64(),
+        Some(expected),
+        "the daemon must report the XXH3-64 digest from retrigger-core, got {event:#}"
+    );
+    assert_eq!(event["content_changed"], true);
+    assert!(
+        event["event"]["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("change-"),
+        "the event should name the file that changed: {event:#}"
+    );
+
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn two_subscribers_see_the_same_change() -> Result<()> {
+    // This is the daemon's entire reason to exist: one set of kernel watches, one hash, many
+    // readers.
+    let harness = Harness::start().await?;
+    let contents = b"shared".to_vec();
+
+    let first = tokio::spawn(stream_events(harness.address, 1, EVENT_BUDGET));
+    let second = tokio::spawn(stream_events(harness.address, 1, EVENT_BUDGET));
+    harness
+        .await_subscribers(2, Duration::from_secs(10))
+        .await?;
+
+    let writer = keep_writing(harness.dir.path(), contents.clone());
+    let (first, second) = (first.await??, second.await??);
+    writer.abort();
+
+    let expected = retrigger_core::hash(&contents);
+    for events in [&first, &second] {
+        let event = events.first().context("a subscriber received nothing")?;
+        assert_eq!(event["hash"].as_u64(), Some(expected));
+    }
+
+    // The processor hashed once per event, not once per subscriber.
+    let status = harness.status().await?;
+    let hashed = status["processor"]["files_hashed"].as_u64().unwrap_or(0);
+    let processed = status["events_processed"].as_u64().unwrap_or(0);
+    assert!(
+        hashed <= processed,
+        "hashing should happen once per event ({hashed} hashes for {processed} events)"
+    );
+
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn the_subscriber_count_falls_when_a_client_disconnects() -> Result<()> {
+    let harness = Harness::start().await?;
+
+    // The reader waits for an event that never comes, then gives up and drops its socket.
+    let reader = tokio::spawn(stream_events(harness.address, 1, Duration::from_secs(3)));
+    harness
+        .await_subscribers(1, Duration::from_secs(10))
+        .await?;
+
+    let _ = reader.await?;
+    harness
+        .await_subscribers(0, Duration::from_secs(10))
+        .await
+        .context("the count never fell back to zero after the client went away")?;
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn shutdown_over_the_api_stops_the_server_even_with_a_stream_open() -> Result<()> {
+    // A subscriber holding an open connection must not be able to hold shutdown hostage.
+    let harness = Harness::start().await?;
+    let address = harness.address;
+
+    let reader = tokio::spawn(stream_events(address, 100, Duration::from_secs(30)));
+    harness
+        .await_subscribers(1, Duration::from_secs(10))
+        .await?;
+
+    let response = harness.post("/shutdown").await?;
+    assert_eq!(response.status, 202, "{}", response.body);
+
+    tokio::time::timeout(Duration::from_secs(10), harness.server)
+        .await
+        .context("the server did not stop while an event stream was open")???;
+
+    let _ = tokio::time::timeout(Duration::from_secs(10), reader).await;
+    assert!(
+        !client::is_listening(address, Duration::from_secs(1)).await,
+        "the port must be closed once the server has stopped"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_port_cannot_be_bound_twice() -> Result<()> {
+    let harness = Harness::start().await?;
+
+    let err = tokio::net::TcpListener::bind(harness.address)
+        .await
+        .expect_err("binding an address the daemon already holds must fail");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "expected an address-in-use error, got {err}"
+    );
+
+    harness.shutdown().await
+}

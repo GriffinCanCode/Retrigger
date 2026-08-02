@@ -2,188 +2,211 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to publish'
-        required: true
-        default: 'patch'
+      dry_run:
+        description: 'Build and verify without publishing'
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_DIR: src/bindings/nodejs
 
 jobs:
+  # Every target is built on a runner of that same OS and architecture rather
+  # than cross-compiled. That costs a few more runners and buys two things:
+  # the C hash engine needs no cross toolchain, and — more importantly — each
+  # artifact can be executed on its real platform before it is published.
+  # Publishing a binary nobody ever ran is how "works on my machine" ships.
+  #
+  # This matrix and package.json#napi.targets must list the same six targets.
+  # `napi artifacts` in CLI v3 fails on a configured target with no binary
+  # rather than skipping it the way v2 did, so a target added in one place and
+  # not the other breaks the release instead of silently shipping nothing.
+  #
+  # The three platforms in optionalDependencies that are absent here --
+  # x86_64/aarch64 musl and armv7 -- have never been built, so those packages
+  # have never been published and the loader falls back to the JavaScript
+  # engine there. Adding them needs alpine-container build jobs (the pattern
+  # CI's test-musl job already uses) rather than a line in this matrix.
   build:
-    name: Build ${{ matrix.settings.target }}
-    runs-on: ${{ matrix.settings.host }}
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
     strategy:
       fail-fast: false
       matrix:
-        settings:
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            build: npm run build --target x86_64-unknown-linux-gnu
-
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            build: |
-              sudo apt-get update
-              sudo apt-get install -y musl-tools
-              npm run build --target x86_64-unknown-linux-musl
-
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            build: |
-              sudo apt-get update
-              sudo apt-get install -y gcc-aarch64-linux-gnu
-              npm run build --target aarch64-unknown-linux-gnu
-
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            build: |
-              sudo apt-get update
-              sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
-              npm run build --target aarch64-unknown-linux-musl
-
-          - host: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            build: |
-              sudo apt-get update
-              sudo apt-get install -y gcc-arm-linux-gnueabihf
-              npm run build --target armv7-unknown-linux-gnueabihf
-
-          - host: macos-latest
-            target: x86_64-apple-darwin
-            build: npm run build --target x86_64-apple-darwin
-
-          - host: macos-latest
-            target: aarch64-apple-darwin
-            build: npm run build --target aarch64-apple-darwin
-
-          - host: windows-latest
-            target: x86_64-pc-windows-msvc
-            build: npm run build --target x86_64-pc-windows-msvc
-
-          - host: windows-latest
-            target: aarch64-pc-windows-msvc
-            build: npm run build --target aarch64-pc-windows-msvc
+        include:
+          - { host: ubuntu-latest,    target: x86_64-unknown-linux-gnu,   native: true }
+          - { host: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu,  native: true }
+          - { host: macos-13,         target: x86_64-apple-darwin,        native: true }
+          - { host: macos-latest,     target: aarch64-apple-darwin,       native: true }
+          - { host: windows-latest,   target: x86_64-pc-windows-msvc,     native: true }
+          # No aarch64 Windows runner exists yet, so this one is cross-built
+          # and therefore cannot be smoke-tested here. It is flagged as such.
+          - { host: windows-latest,   target: aarch64-pc-windows-msvc,    native: false }
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: 18
-        cache: npm
-        cache-dependency-path: src/bindings/nodejs/package-lock.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.settings.target }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-    - name: Install Zig
-      uses: goto-bus-stop/setup-zig@v2
-      with:
-        version: 0.11.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-    - name: Install system dependencies (Ubuntu)
-      if: matrix.settings.host == 'ubuntu-latest'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential clang llvm-dev pkg-config liburing-dev
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang
 
-    - name: Install system dependencies (macOS)
-      if: matrix.settings.host == 'macos-latest'
-      run: |
-        brew install llvm pkg-config
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: ${{ env.NODE_DIR }}
 
-    - name: Install dependencies
-      run: |
-        cd src/bindings/nodejs
-        npm ci
+      # Note the `--`: without it npm swallows the flag and silently builds for
+      # the host. That bug shipped host binaries under foreign platform names.
+      - name: Build native addon
+        run: npm run build -- --target ${{ matrix.target }}
+        working-directory: ${{ env.NODE_DIR }}
 
-    - name: Build native module
-      run: |
-        cd src/bindings/nodejs
-        ${{ matrix.settings.build }}
+      - name: Verify the artifact loads and computes
+        if: matrix.native
+        shell: bash
+        run: node scripts/verify-artifact.js
+        working-directory: ${{ env.NODE_DIR }}
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: bindings-${{ matrix.settings.target }}
-        path: src/bindings/nodejs/*.node
-        if-no-files-found: error
+      - name: Note unverified cross build
+        if: '!matrix.native'
+        run: echo "::warning::${{ matrix.target }} was cross-built and could not be executed on this runner."
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.target }}
+          path: ${{ env.NODE_DIR }}/*.node
+          if-no-files-found: error
 
   publish:
-    name: Publish to npm
+    name: Publish
     runs-on: ubuntu-latest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    
+    permissions:
+      contents: write
+      id-token: write
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: 18
-        registry-url: 'https://registry.npmjs.org'
-        cache: npm
-        cache-dependency-path: src/bindings/nodejs/package-lock.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: ${{ env.NODE_DIR }}
 
-    - name: Install dependencies
-      run: |
-        cd src/bindings/nodejs
-        npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ env.NODE_DIR }}/artifacts
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+      # `napi artifacts` copies each .node into its per-platform npm/<platform>/
+      # package directory, and it fails on a binary with no matching package
+      # rather than dropping it. That makes `create-npm-dirs` a prerequisite,
+      # not a convenience: npm/ is generated from napi.targets and is not
+      # committed. An earlier workflow copied the binaries to the package root
+      # and skipped both steps, so the platform packages it published were empty.
+      - name: Create the platform package directories
+        run: npx napi create-npm-dirs
+        working-directory: ${{ env.NODE_DIR }}
 
-    - name: Move artifacts to bindings directory
-      run: |
-        cd artifacts
-        for dir in bindings-*; do
-          if [ -d "$dir" ]; then
-            cp $dir/*.node ../src/bindings/nodejs/ 2>/dev/null || true
-          fi
-        done
-        cd ../src/bindings/nodejs
-        ls -la *.node
+      - name: Distribute artifacts into platform packages
+        run: npx napi artifacts --output-dir artifacts
+        working-directory: ${{ env.NODE_DIR }}
 
-    - name: Create npm packages
-      run: |
-        cd src/bindings/nodejs
-        npm run prepublishOnly
+      - name: Prepare platform packages
+        run: npx napi prepublish -t npm --no-gh-release
+        working-directory: ${{ env.NODE_DIR }}
 
-    - name: Publish to npm
-      run: |
-        cd src/bindings/nodejs
-        npm publish --access public
-      env:
-        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Show what would be published
+        run: |
+          echo "--- root package ---"
+          npm pack --dry-run
+          echo "--- platform packages ---"
+          ls -R npm 2>/dev/null || echo "(no npm/ directory)"
+        working-directory: ${{ env.NODE_DIR }}
 
-  create-release:
-    name: Create GitHub Release
+      - name: Publish
+        if: github.event_name == 'push' || inputs.dry_run == false
+        run: npm publish --access public --provenance
+        working-directory: ${{ env.NODE_DIR }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Installs the just-published package from the real registry on every OS and
+  # confirms it works there. Until this passes, a release is not proven; it is
+  # only uploaded.
+  verify-published:
+    name: Verify install / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: publish
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+    steps:
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+
+      - name: Wait for registry propagation
+        shell: bash
+        run: sleep 45
+
+      - name: Install from the registry into a clean project
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/verify" && cd "$RUNNER_TEMP/verify"
+          npm init -y >/dev/null
+          npm install "@retrigger/core@${GITHUB_REF_NAME#v}"
+
+      - name: Require it and exercise both engines
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/verify"
+          node -e "
+            const r = require('@retrigger/core');
+            const info = r.getEngineInfo();
+            console.log('engine:', JSON.stringify(info));
+            if (!r.hashBytesSync(Buffer.from('retrigger'))) throw new Error('hash failed');
+            if (info.engine !== 'native') {
+              throw new Error('expected the native engine on this platform, got ' + info.engine);
+            }
+            console.log('ok');
+          "
+
+  github-release:
+    name: GitHub release
     runs-on: ubuntu-latest
     needs: [build, publish]
     if: startsWith(github.ref, 'refs/tags/v')
-    
+    permissions:
+      contents: write
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ github.ref_name }}
-        name: Release ${{ github.ref_name }}
-        draft: false
-        prerelease: false
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with: { path: artifacts }
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: artifacts/**/*.node

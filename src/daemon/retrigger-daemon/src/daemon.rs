@@ -1,488 +1,559 @@
-//! Core daemon implementation
-//! Orchestrates all Retrigger components following the Dependency Inversion Principle
+//! The daemon itself: a watcher, a content hasher, and the thread that joins them.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use retrigger_system::{EnhancedFileEvent, FileEventProcessor, SystemWatcher};
-use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use retrigger_core::SimdLevel;
+use retrigger_system::{
+    Backend, EventKind, FileEventProcessor, ProcessedEvent, ProcessorStats, WatchError, Watcher,
+    WatcherStats,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, watch};
+use tracing::{debug, info, warn};
 
-use crate::config::{CompiledPatterns, ConfigManager, DaemonConfig};
-use crate::grpc::GrpcServer;
-use crate::ipc::{ZeroCopyConfig, ZeroCopyRing};
-use crate::metrics::MetricsCollector;
+use crate::config::DaemonConfig;
+use crate::hasher::Xxh3Hasher;
 
-// Import shutdown signal function
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
+/// The version reported by `--version`, `GET /health`, and `GET /status`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
+/// How long the pump waits for an event before checking whether it has been asked to stop.
+///
+/// This is the upper bound on how long [`Daemon::stop`] takes to join the pump when the tree is
+/// quiet, so it trades a negligible amount of idle wake-up against shutdown latency.
+const PUMP_TICK: Duration = Duration::from_millis(100);
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+/// Upper bound on the fan-out ring, independent of the queue.
+///
+/// The broadcast channel preallocates its ring, so a 100k-event queue must not imply 100k
+/// preallocated slots per subscriber generation. A subscriber that falls this far behind is told
+/// it lagged, which it must treat exactly like a rescan signal.
+const BROADCAST_LIMIT: usize = 1024;
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-}
-
-/// Main daemon orchestrator
+/// A watcher shared by every process that connects.
+///
+/// # Lifecycle
+///
+/// [`new`](Self::new) builds the watcher and registers the configured paths, so a path that
+/// cannot be watched fails here rather than after the socket is open. [`start`](Self::start)
+/// attaches the backend and spawns the pump; [`stop`](Self::stop) reverses it. Both are
+/// idempotent, and [`Drop`] stops the daemon so no thread outlives the value.
 pub struct Daemon {
-    config_manager: ConfigManager,
-    system_watcher: Arc<SystemWatcher>,
-    event_processor: Arc<FileEventProcessor>,
-    grpc_server: Option<GrpcServer>,
-    metrics_collector: Arc<MetricsCollector>,
-
-    // Zero-copy IPC system (2025 best practice)
-    ipc_ring: Option<Arc<ZeroCopyRing>>,
-
-    // Event channels
-    enhanced_event_sender: broadcast::Sender<EnhancedFileEvent>,
-    shutdown_sender: broadcast::Sender<()>,
+    config: DaemonConfig,
+    watcher: Arc<Watcher>,
+    processor: Arc<FileEventProcessor<Xxh3Hasher>>,
+    events: broadcast::Sender<ProcessedEvent>,
+    counters: Arc<Counters>,
+    started: Instant,
+    /// The address actually bound, which is only known after the listener exists — `port = 0`
+    /// means the OS picks it.
+    address: Mutex<Option<SocketAddr>>,
+    pumping: Arc<AtomicBool>,
+    pump: Mutex<Option<JoinHandle<()>>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl Daemon {
-    /// Create a new daemon instance
-    pub async fn new(config_manager: ConfigManager) -> Result<Self> {
-        let config = config_manager.get_config().await;
+    /// Build a daemon and register every configured watch path.
+    ///
+    /// # Errors
+    ///
+    /// If a glob in `[patterns]` does not compile, or a configured path does not exist, cannot
+    /// be inspected, or exhausts the kernel's watch descriptors.
+    pub fn new(config: DaemonConfig) -> Result<Self> {
+        let watcher = Watcher::new(config.watcher_config()?)
+            .context("could not create the file system watcher")?;
 
-        // Initialize core components
-        let mut system_watcher =
-            SystemWatcher::new().with_context(|| "Failed to create system watcher")?;
+        for entry in &config.watcher.paths {
+            watcher
+                .watch(&entry.path, entry.recursive)
+                .with_context(|| format!("could not watch {}", entry.path.display()))?;
+        }
 
-        // Apply config patterns to system watcher
-        system_watcher.update_event_filter(
-            config.patterns.include.clone(),
-            config.patterns.exclude.clone(),
-        );
-        let system_watcher = Arc::new(system_watcher);
-
-        // Initialize enhanced event processor with hierarchical caching built-in
-        let event_processor = Arc::new(FileEventProcessor::new());
-        let metrics_collector = Arc::new(MetricsCollector::new());
-
-        // Initialize zero-copy IPC ring buffer
-        let ipc_config = ZeroCopyConfig::default();
-        let ipc_ring = match ZeroCopyRing::create_producer(ipc_config) {
-            Ok(ring) => Some(Arc::new(ring)),
-            Err(e) => {
-                warn!(
-                    "Failed to create IPC ring buffer: {}, continuing without IPC",
-                    e
-                );
-                None
-            }
-        };
-
-        // Create event channels
-        let (enhanced_event_sender, _) = broadcast::channel(config.watcher.event_buffer_size);
-        let (shutdown_sender, _) = broadcast::channel(10);
-
-        // Initialize gRPC server if enabled
-        let grpc_server = if config.server.port > 0 {
-            Some(
-                GrpcServer::new(
-                    &config.server.bind_address,
-                    config.server.port,
-                    Arc::clone(&system_watcher),
-                    enhanced_event_sender.clone(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+        let processor = FileEventProcessor::with_config(Xxh3Hasher, config.processor_config());
+        let (events, _) =
+            broadcast::channel(config.watcher.queue_capacity.clamp(1, BROADCAST_LIMIT));
+        let (shutdown, _) = watch::channel(false);
 
         Ok(Self {
-            config_manager,
-            system_watcher,
-            event_processor,
-            grpc_server,
-            metrics_collector,
-            ipc_ring,
-            enhanced_event_sender,
-            shutdown_sender,
+            config,
+            watcher: Arc::new(watcher),
+            processor: Arc::new(processor),
+            events,
+            counters: Arc::new(Counters::default()),
+            started: Instant::now(),
+            address: Mutex::new(None),
+            pumping: Arc::new(AtomicBool::new(false)),
+            pump: Mutex::new(None),
+            shutdown,
         })
     }
 
-    /// Run the daemon
-    pub async fn run(mut self) -> Result<()> {
-        info!("Retrigger daemon starting...");
-
-        let config = self.config_manager.get_config().await;
-
-        // Setup initial watch directories
-        info!("Setting up {} watch directories", config.watcher.watch_paths.len());
-        for watch_path in &config.watcher.watch_paths {
-            if watch_path.enabled {
-                info!("Watching directory: {} (recursive: {})", watch_path.path.display(), watch_path.recursive);
-                self.system_watcher
-                    .watch_directory(&watch_path.path, watch_path.recursive)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to watch directory: {}", watch_path.path.display())
-                    })?;
-                info!("Successfully watching: {}", watch_path.path.display());
-            }
-        }
-        info!("Completed watch directory setup");
-
-        // Start core services
-        info!("Starting core services...");
-        self.start_event_processor().await?;
-        self.start_metrics_collector().await?;
-        self.start_config_monitor().await?;
-        self.start_cache_maintenance().await?;
-        info!("Core services started");
-
-        // Start system watcher
-        info!("Starting system watcher...");
-        self.system_watcher.start().await?;
-        info!("System watcher started");
-
-        // Start gRPC server
-        if let Some(ref mut grpc_server) = self.grpc_server {
-            info!("Starting gRPC server...");
-            grpc_server.start().await?;
-            info!("gRPC server started");
+    /// Attach the backend and start turning file events into content-change decisions.
+    ///
+    /// Idempotent: starting a running daemon is a no-op that returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// If the backend cannot be attached, a registered path has disappeared since it was
+    /// registered, or the pump thread cannot be spawned.
+    pub fn start(&self) -> Result<()> {
+        if self.pumping.swap(true, Ordering::AcqRel) {
+            return Ok(());
         }
 
-        info!("Retrigger daemon started successfully");
-
-        // Wait for shutdown signal
-        let mut shutdown_receiver = self.shutdown_sender.subscribe();
-
-        tokio::select! {
-            _ = shutdown_signal() => {
-                info!("Received shutdown signal");
-            }
-            _ = shutdown_receiver.recv() => {
-                info!("Received internal shutdown signal");
-            }
+        if let Err(err) = self.watcher.start() {
+            self.pumping.store(false, Ordering::Release);
+            return Err(err).context("could not start the file system watcher");
         }
 
-        // Graceful shutdown
-        self.shutdown().await?;
+        let watcher = Arc::clone(&self.watcher);
+        let processor = Arc::clone(&self.processor);
+        let events = self.events.clone();
+        let counters = Arc::clone(&self.counters);
+        let pumping = Arc::clone(&self.pumping);
 
+        // A dedicated OS thread rather than `spawn_blocking` per event, for two reasons the
+        // processor's own documentation implies: hashing is blocking, so it must not sit on a
+        // runtime worker; and one thread preserves the order events were observed in, which a
+        // pool of blocking tasks would not.
+        let handle = std::thread::Builder::new()
+            .name("retrigger-pump".to_owned())
+            .spawn(move || pump(&watcher, &processor, &events, &counters, &pumping));
+
+        match handle {
+            Ok(handle) => {
+                *lock(&self.pump) = Some(handle);
+                info!(
+                    backend = ?self.watcher.backend(),
+                    simd = %retrigger_core::active_level(),
+                    paths = self.watcher.watched().len(),
+                    "watching"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                self.pumping.store(false, Ordering::Release);
+                let _ = self.watcher.stop();
+                Err(err).context("could not spawn the event pump thread")
+            }
+        }
+    }
+
+    /// Stop the pump and detach the backend, joining both threads.
+    ///
+    /// Idempotent, and safe to call from any thread.
+    pub fn stop(&self) {
+        // Order matters: closing the pump's gate before the watcher stops means the pump always
+        // exits on its own timeout rather than spinning on a stopped watcher's empty queue.
+        let was_running = self.pumping.swap(false, Ordering::AcqRel);
+        if let Some(handle) = lock(&self.pump).take() {
+            // A pump that panicked has already stopped, which is all this needs; it must never
+            // turn into a hang.
+            if handle.join().is_err() {
+                warn!("the event pump thread panicked; events are no longer being processed");
+            }
+        }
+        if let Err(err) = self.watcher.stop() {
+            warn!(error = %err, "error while stopping the file system watcher");
+        }
+        if was_running {
+            info!("stopped watching");
+        }
+    }
+
+    /// Ask the daemon to shut down. Returns immediately; the HTTP server winds down on its own.
+    pub fn request_shutdown(&self) {
+        // `send_replace` rather than `send`: the latter refuses to update the value when no
+        // receiver happens to exist yet, which would lose a shutdown requested before the
+        // server started waiting for one.
+        self.shutdown.send_replace(true);
+    }
+
+    /// Resolves once [`request_shutdown`](Self::request_shutdown) has been called.
+    ///
+    /// Used both as the HTTP server's graceful-shutdown signal and as the terminator for
+    /// server-sent event streams, so that an open stream cannot hold shutdown open forever.
+    pub async fn shutdown_requested(&self) {
+        let mut receiver = self.shutdown.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        // An error means the sender is gone, which cannot happen while `&self` is alive; treating
+        // it as "shut down" is the safe reading either way.
+        let _ = receiver.wait_for(|requested| *requested).await;
+    }
+
+    /// Subscribe to processed events.
+    ///
+    /// Lossy by design: a subscriber more than the ring's capacity behind is told it lagged
+    /// rather than being allowed to stall the pump.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<ProcessedEvent> {
+        self.events.subscribe()
+    }
+
+    /// Count a connected event subscriber for as long as the returned guard lives.
+    #[must_use]
+    pub fn track_subscriber(&self) -> SubscriberGuard {
+        self.counters.subscribers.fetch_add(1, Ordering::Relaxed);
+        SubscriberGuard {
+            counters: Arc::clone(&self.counters),
+        }
+    }
+
+    /// Add a watch at runtime.
+    ///
+    /// # Errors
+    ///
+    /// If the path does not exist, cannot be inspected, or the kernel refuses another watch.
+    pub fn watch(&self, path: &Path, recursive: bool) -> Result<(), WatchError> {
+        self.watcher.watch(path, recursive)?;
+        info!(path = %path.display(), recursive, "added watch");
         Ok(())
     }
 
-    /// Start the event processing pipeline
-    async fn start_event_processor(&self) -> Result<()> {
-        info!("🔄 Starting event processor - subscribing to SystemWatcher events...");
-        let system_events = self.system_watcher.subscribe();
-        info!("🔄 Successfully subscribed to SystemWatcher event channel");
-        
-        let event_processor = Arc::clone(&self.event_processor);
-        let enhanced_sender = self.enhanced_event_sender.clone();
-        let metrics = Arc::clone(&self.metrics_collector);
-        let patterns = self.config_manager.get_patterns().await;
-        let ipc_ring = self.ipc_ring.clone();
-        
-        info!("🔄 IPC ring buffer available: {}", ipc_ring.is_some());
-
-        tokio::spawn(async move {
-            info!("🔄 Event processing task spawned - starting event loop...");
-            Self::event_processing_loop(
-                system_events,
-                event_processor,
-                enhanced_sender,
-                metrics,
-                patterns,
-                ipc_ring,
-            )
-            .await;
-            warn!("🔄 Event processing loop ended unexpectedly!");
-        });
-
-        info!("Started event processing pipeline");
+    /// Remove a watch at runtime.
+    ///
+    /// # Errors
+    ///
+    /// [`WatchError::NotFound`] if the path was never registered.
+    pub fn unwatch(&self, path: &Path) -> Result<(), WatchError> {
+        self.watcher.unwatch(path)?;
+        // Fingerprints for a tree nobody watches are memory spent on nothing, and would be stale
+        // if the path is watched again later.
+        self.processor.invalidate_tree(path);
+        info!(path = %path.display(), "removed watch");
         Ok(())
     }
 
-    /// Event processing loop with enhanced cache and IPC
-    async fn event_processing_loop(
-        mut system_events: broadcast::Receiver<retrigger_system::SystemEvent>,
-        event_processor: Arc<FileEventProcessor>,
-        enhanced_sender: broadcast::Sender<EnhancedFileEvent>,
-        metrics: Arc<MetricsCollector>,
-        patterns: CompiledPatterns,
-        ipc_ring: Option<Arc<ZeroCopyRing>>,
-    ) {
-        info!("🔄 Event processing loop started - waiting for SystemWatcher events...");
-        let mut batch = Vec::new();
-        let batch_size = 100;
-        let batch_timeout = Duration::from_millis(10);
-
-        let mut interval = tokio::time::interval(batch_timeout);
-        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(2));
-
-        loop {
-            tokio::select! {
-                // Heartbeat to prove loop is alive
-                _ = heartbeat_interval.tick() => {
-                    info!("🔄 Event processing loop: HEARTBEAT - loop is alive and waiting for events");
-                }
-                
-                // Collect events into batch
-                event_result = system_events.recv() => {
-                    info!("🔄 Event processing loop: Trying to receive from SystemWatcher...");
-                    match event_result {
-                        Ok(event) => {
-                            info!("🎯 Event processing loop: ✅ RECEIVED SystemWatcher event: {:?}", event.path);
-                            
-                            // Check if file should be processed based on patterns
-                            if patterns.should_watch(&event.path) {
-                                info!("🎯 Event processing loop: Event APPROVED by patterns, adding to batch");
-                                batch.push(event);
-
-                                // Process batch if full
-                                if batch.len() >= batch_size {
-                                    Self::process_event_batch(
-                                        &batch,
-                                        &event_processor,
-                                        &enhanced_sender,
-                                        &metrics,
-                                        &ipc_ring,
-                                    ).await;
-                                    batch.clear();
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Event receiver error: {}", e);
-                            break;
-                        }
-                    }
-                }
-
-                // Process batch on timeout
-                _ = interval.tick() => {
-                    if !batch.is_empty() {
-                        info!("🎯 Event processing loop: BATCH TIMEOUT - processing {} events", batch.len());
-                        Self::process_event_batch(
-                            &batch,
-                            &event_processor,
-                            &enhanced_sender,
-                            &metrics,
-                            &ipc_ring,
-                        ).await;
-                        info!("🎯 Event processing loop: BATCH PROCESSED - {} events sent to IPC", batch.len());
-                        batch.clear();
-                    }
-                }
-            }
-        }
+    /// Record the address the HTTP server actually bound.
+    pub fn set_address(&self, address: SocketAddr) {
+        *lock(&self.address) = Some(address);
     }
 
-    /// Process a batch of events with zero-copy IPC
-    async fn process_event_batch(
-        events: &[retrigger_system::SystemEvent],
-        processor: &FileEventProcessor,
-        sender: &broadcast::Sender<EnhancedFileEvent>,
-        metrics: &MetricsCollector,
-        ipc_ring: &Option<Arc<ZeroCopyRing>>,
-    ) {
-        let start_time = std::time::Instant::now();
-
-        for event in events {
-            match processor.process_event(event.clone()).await {
-                Ok(enhanced_event) => {
-                    // Send via zero-copy IPC if available
-                    if let Some(ring) = ipc_ring.as_ref() {
-                        if ring.push(&enhanced_event) {
-                            info!("🚀 Event processing: PUSHED to IPC ring buffer: {:?}", enhanced_event.system_event.path);
-                        } else {
-                            warn!("IPC ring buffer full, event dropped");
-                        }
-                    } else {
-                        warn!("No IPC ring buffer available - events not delivered to external clients");
-                    }
-
-                    metrics.record_event(&enhanced_event);
-
-                    if let Err(e) = sender.send(enhanced_event) {
-                        debug!("No enhanced event subscribers: {}", e);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to process event for {}: {}",
-                        event.path.display(),
-                        e
-                    );
-                    metrics.record_error();
-                }
-            }
-        }
-
-        let processing_time = start_time.elapsed();
-        metrics.record_batch_processing(events.len(), processing_time);
+    /// The configuration this daemon was built from.
+    #[must_use]
+    pub fn config(&self) -> &DaemonConfig {
+        &self.config
     }
 
-    /// Start metrics collection
-    async fn start_metrics_collector(&self) -> Result<()> {
-        let metrics = Arc::clone(&self.metrics_collector);
-        let system_watcher = Arc::clone(&self.system_watcher);
-        let event_processor = Arc::clone(&self.event_processor);
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-
-            loop {
-                interval.tick().await;
-
-                // Collect system metrics
-                let watcher_stats = system_watcher.get_stats().await;
-                metrics.update_watcher_stats(&watcher_stats);
-
-                // Collect cache metrics
-                let (cache_entries, cache_capacity) = event_processor.cache_stats();
-                metrics.update_cache_stats(cache_entries, cache_capacity);
-
-                // Cleanup old cache entries
-                event_processor
-                    .cleanup_cache(Duration::from_secs(3600))
-                    .await;
-            }
-        });
-
-        info!("Started metrics collection");
-        Ok(())
-    }
-
-    /// Start configuration monitoring
-    async fn start_config_monitor(&self) -> Result<()> {
-        let mut config_changes = self.config_manager.subscribe_changes();
-        let system_watcher = Arc::clone(&self.system_watcher);
-
-        tokio::spawn(async move {
-            while let Ok(new_config) = config_changes.recv().await {
-                info!("Configuration changed, applying updates");
-
-                // Apply configuration changes
-                if let Err(e) = Self::apply_config_changes(&new_config, &system_watcher).await {
-                    error!("Failed to apply configuration changes: {}", e);
-                }
-            }
-        });
-
-        info!("Started configuration monitoring");
-        Ok(())
-    }
-
-    /// Start cache maintenance (using enhanced FileEventProcessor cache)
-    async fn start_cache_maintenance(&self) -> Result<()> {
-        let event_processor = Arc::clone(&self.event_processor);
-
-        tokio::spawn(async move {
-            let mut cleanup_interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
-
-            loop {
-                cleanup_interval.tick().await;
-                debug!("Running cache cleanup");
-                // Use the enhanced cache's built-in cleanup
-                event_processor
-                    .cleanup_cache(Duration::from_secs(3600))
-                    .await;
-            }
-        });
-
-        info!("Started cache maintenance");
-        Ok(())
-    }
-
-    /// Apply configuration changes
-    async fn apply_config_changes(
-        config: &DaemonConfig,
-        system_watcher: &SystemWatcher,
-    ) -> Result<()> {
-        // Update watch directories
-        // Note: In a full implementation, this would:
-        // 1. Compare old vs new watch paths
-        // 2. Add new directories
-        // 3. Remove old directories
-        // 4. Update recursive settings
-
-        for watch_path in &config.watcher.watch_paths {
-            if watch_path.enabled {
-                // This is simplified - real implementation would check if already watching
-                system_watcher
-                    .watch_directory(&watch_path.path, watch_path.recursive)
-                    .await?;
-            }
-        }
-
-        info!("Applied configuration changes");
-        Ok(())
-    }
-
-    /// Graceful shutdown
-    async fn shutdown(self) -> Result<()> {
-        info!("Starting graceful shutdown...");
-
-        // Send shutdown signal to all components
-        let _ = self.shutdown_sender.send(());
-
-        // Stop system watcher first
-        if let Err(e) = self.system_watcher.stop().await {
-            warn!("Error stopping system watcher: {}", e);
-        }
-
-        // Stop gRPC server
-        if let Some(grpc_server) = self.grpc_server {
-            grpc_server.shutdown().await?;
-        }
-
-        // Cleanup would happen in Drop implementations
-
-        info!("Graceful shutdown completed");
-        Ok(())
-    }
-
-    /// Get daemon statistics
-    pub async fn get_stats(&self) -> DaemonStats {
-        let watcher_stats = self.system_watcher.get_stats().await;
-        let (cache_entries, cache_capacity) = self.event_processor.cache_stats();
-        let detailed_cache_stats = self.event_processor.detailed_cache_stats();
-        let metrics_stats = self.metrics_collector.get_stats();
-        let ipc_stats = self.ipc_ring.as_ref().map(|ring| ring.stats());
-
+    /// A point-in-time snapshot of everything the daemon knows about itself.
+    #[must_use]
+    pub fn stats(&self) -> DaemonStats {
         DaemonStats {
-            watcher_stats,
-            cache_entries,
-            cache_capacity,
-            detailed_cache_stats,
-            ipc_stats,
-            uptime_seconds: metrics_stats.uptime_seconds,
-            events_processed: metrics_stats.events_processed,
-            errors_count: metrics_stats.errors_count,
+            version: VERSION.to_owned(),
+            pid: std::process::id(),
+            uptime_seconds: self.started.elapsed().as_secs(),
+            address: lock(&self.address).map(|address| address.to_string()),
+            backend: self.watcher.backend(),
+            simd_level: retrigger_core::active_level(),
+            running: self.watcher.is_running() && self.pumping.load(Ordering::Acquire),
+            watched: self
+                .watcher
+                .watched()
+                .into_iter()
+                .map(|(path, recursive)| WatchedPath { path, recursive })
+                .collect(),
+            subscribers: self.counters.subscribers.load(Ordering::Relaxed),
+            events_processed: self.counters.events_processed.load(Ordering::Relaxed),
+            changes_detected: self.counters.changes_detected.load(Ordering::Relaxed),
+            rescans: self.counters.rescans.load(Ordering::Relaxed),
+            watcher: self.watcher.stats(),
+            processor: self.processor.stats(),
         }
     }
 }
 
-/// Daemon statistics
-#[derive(Debug, Clone)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl std::fmt::Debug for Daemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Daemon")
+            .field("address", &*lock(&self.address))
+            .field("running", &self.pumping.load(Ordering::Acquire))
+            .field("watcher", &self.watcher)
+            // The pump handle is a thread and the channels have no useful representation;
+            // `running` already says what a reader wants to know.
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read events, decide whether their contents changed, and fan the answer out.
+fn pump(
+    watcher: &Watcher,
+    processor: &FileEventProcessor<Xxh3Hasher>,
+    events: &broadcast::Sender<ProcessedEvent>,
+    counters: &Counters,
+    pumping: &AtomicBool,
+) {
+    while pumping.load(Ordering::Acquire) {
+        let Some(event) = watcher.recv_timeout(PUMP_TICK) else {
+            continue;
+        };
+
+        let rescan = event.kind == EventKind::RescanRequired;
+        let processed = processor.process(event);
+
+        counters.events_processed.fetch_add(1, Ordering::Relaxed);
+        if processed.content_changed {
+            counters.changes_detected.fetch_add(1, Ordering::Relaxed);
+        }
+        if rescan {
+            counters.rescans.fetch_add(1, Ordering::Relaxed);
+            warn!("events were lost; subscribers must re-scan the tree");
+        } else {
+            debug!(
+                path = %processed.event.path.display(),
+                kind = ?processed.event.kind,
+                changed = processed.content_changed,
+                "processed"
+            );
+        }
+
+        // No subscribers is not an error. A daemon nobody is listening to is still warming the
+        // fingerprint cache for whoever connects next.
+        let _ = events.send(processed);
+    }
+}
+
+/// Counters the daemon keeps that the watcher and processor do not.
+#[derive(Debug, Default)]
+struct Counters {
+    events_processed: AtomicU64,
+    changes_detected: AtomicU64,
+    rescans: AtomicU64,
+    subscribers: AtomicU64,
+}
+
+/// Decrements the connected-subscriber count when dropped.
+///
+/// "How many processes are sharing this watcher" is the one number that says whether running a
+/// daemon was worth it, so it has to be right even when a client disappears mid-stream.
+#[derive(Debug)]
+pub struct SubscriberGuard {
+    counters: Arc<Counters>,
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        // Saturating rather than wrapping: an underflow here would report billions of
+        // subscribers, which is a worse lie than an undercount.
+        let _ = self
+            .counters
+            .subscribers
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+}
+
+/// A path the daemon is watching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchedPath {
+    /// The registered path.
+    pub path: PathBuf,
+    /// Whether the whole subtree is watched.
+    pub recursive: bool,
+}
+
+/// Everything `GET /status` reports.
+///
+/// Deserializable as well as serializable, because the `status` subcommand is a client of this
+/// API like any other: it renders the same struct the server produced rather than picking
+/// fields out of untyped JSON, so a field that changes shape breaks the build instead of the
+/// output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStats {
-    pub watcher_stats: retrigger_system::WatcherStats,
-    pub cache_entries: usize,
-    pub cache_capacity: usize,
-    pub detailed_cache_stats: retrigger_system::DetailedCacheStats,
-    pub ipc_stats: Option<crate::ipc::RingStats>,
+    /// Daemon version.
+    pub version: String,
+    /// Process id, so a supervisor can find this process without a PID file.
+    pub pid: u32,
+    /// Seconds since the daemon was constructed.
     pub uptime_seconds: u64,
+    /// The address the HTTP API is bound to, once it is bound.
+    pub address: Option<String>,
+    /// The kernel facility doing the watching.
+    pub backend: Backend,
+    /// The hash kernel currently dispatching.
+    pub simd_level: SimdLevel,
+    /// Whether the backend is attached and the pump is running.
+    pub running: bool,
+    /// Registered watch roots.
+    pub watched: Vec<WatchedPath>,
+    /// Event streams currently connected.
+    pub subscribers: u64,
+    /// Events the pump has processed.
     pub events_processed: u64,
-    pub errors_count: u64,
+    /// Of those, how many were real content changes.
+    pub changes_detected: u64,
+    /// Rescan signals seen, each meaning events were lost somewhere below.
+    pub rescans: u64,
+    /// The watcher's own counters.
+    pub watcher: WatcherStats,
+    /// The content-fingerprint cache's counters.
+    pub processor: ProcessorStats,
+}
+
+/// Lock without inheriting poisoning: every mutex here guards a plain value, so a panic
+/// elsewhere makes the data no less valid, and refusing to serve `/status` because some other
+/// thread died is the opposite of useful in a long-running service.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::WatchPath;
+
+    fn config_for(dir: &Path) -> DaemonConfig {
+        let mut config = DaemonConfig::default();
+        config.server.port = 0;
+        config.watcher.debounce_ms = 0;
+        config.watcher.paths = vec![WatchPath {
+            path: dir.to_path_buf(),
+            recursive: true,
+        }];
+        config
+    }
+
+    #[test]
+    fn a_configured_path_that_does_not_exist_fails_construction() {
+        let mut config = DaemonConfig::default();
+        config.watcher.paths = vec![WatchPath {
+            path: PathBuf::from("/definitely/not/here"),
+            recursive: true,
+        }];
+
+        let err = Daemon::new(config).expect_err("an unwatchable path must fail loudly");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("/definitely/not/here"),
+            "the error must name the path, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn start_and_stop_are_idempotent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let daemon = Daemon::new(config_for(dir.path()))?;
+
+        assert!(!daemon.stats().running);
+        daemon.start()?;
+        daemon.start()?;
+        assert!(daemon.stats().running);
+
+        daemon.stop();
+        daemon.stop();
+        assert!(!daemon.stats().running);
+
+        // And it must come back up: stop cannot leave the watcher in an unusable state.
+        daemon.start()?;
+        assert!(daemon.stats().running);
+        Ok(())
+    }
+
+    #[test]
+    fn watch_and_unwatch_change_the_reported_set() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let daemon = Daemon::new(config_for(dir.path()))?;
+        let extra = dir.path().join("extra");
+        std::fs::create_dir(&extra)?;
+
+        daemon.watch(&extra, false)?;
+        assert_eq!(daemon.stats().watched.len(), 2);
+
+        daemon.unwatch(&extra)?;
+        assert_eq!(daemon.stats().watched.len(), 1);
+
+        assert!(
+            matches!(
+                daemon.unwatch(&extra),
+                Err(WatchError::NotFound(path)) if path == extra
+            ),
+            "unwatching twice must report that it was not registered"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn watching_a_path_that_does_not_exist_is_an_error_not_a_panic() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let daemon = Daemon::new(config_for(dir.path()))?;
+        assert!(matches!(
+            daemon.watch(Path::new("/definitely/not/here"), true),
+            Err(WatchError::NotFound(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stats_report_the_engine_that_is_actually_wired_in() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let daemon = Daemon::new(config_for(dir.path()))?;
+        let stats = daemon.stats();
+
+        assert_eq!(stats.version, VERSION);
+        assert_eq!(stats.pid, std::process::id());
+        assert_eq!(stats.watched.len(), 1);
+        assert_eq!(
+            stats.processor.capacity,
+            daemon.config().watcher.hash_cache_size
+        );
+        assert!(retrigger_core::available_levels().contains(&stats.simd_level));
+        Ok(())
+    }
+
+    #[test]
+    fn the_subscriber_count_returns_to_zero_when_a_client_goes_away() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let daemon = Daemon::new(config_for(dir.path()))?;
+        assert_eq!(daemon.stats().subscribers, 0);
+
+        let first = daemon.track_subscriber();
+        let second = daemon.track_subscriber();
+        assert_eq!(daemon.stats().subscribers, 2);
+
+        drop(first);
+        assert_eq!(daemon.stats().subscribers, 1);
+        drop(second);
+        assert_eq!(daemon.stats().subscribers, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_observable_before_and_after_it_is_requested() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let daemon = Daemon::new(config_for(dir.path()))?;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), daemon.shutdown_requested())
+                .await
+                .is_err(),
+            "shutdown must not resolve before it is asked for"
+        );
+
+        daemon.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), daemon.shutdown_requested())
+            .await
+            .context("shutdown signal was not observed")?;
+
+        // A second observer arriving after the fact must still see it, or a late-connecting
+        // stream would hang shutdown open.
+        tokio::time::timeout(Duration::from_secs(5), daemon.shutdown_requested())
+            .await
+            .context("a late observer missed the shutdown signal")?;
+        Ok(())
+    }
 }

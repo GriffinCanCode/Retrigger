@@ -67,65 +67,6 @@ install_rust() {
     log_success "Rust installed successfully"
 }
 
-# Install Zig
-install_zig() {
-    if command_exists zig; then
-        log_info "Zig already installed: $(zig version)"
-        return 0
-    fi
-    
-    log_info "Installing Zig..."
-    
-    local os=$(detect_os)
-    local arch=$(uname -m)
-    
-    case "$os" in
-        "linux")
-            if [[ "$arch" == "x86_64" ]]; then
-                local zig_url="https://ziglang.org/download/0.15.1/zig-linux-x86_64-0.15.1.tar.xz"
-                local zig_dir="zig-linux-x86_64-0.15.1"
-            elif [[ "$arch" == "aarch64" ]]; then
-                local zig_url="https://ziglang.org/download/0.15.1/zig-linux-aarch64-0.15.1.tar.xz"
-                local zig_dir="zig-linux-aarch64-0.15.1"
-            else
-                log_error "Unsupported Linux architecture: $arch"
-                return 1
-            fi
-            ;;
-        "macos")
-            if [[ "$arch" == "x86_64" ]]; then
-                local zig_url="https://ziglang.org/download/0.15.1/zig-macos-x86_64-0.15.1.tar.xz"
-                local zig_dir="zig-macos-x86_64-0.15.1"
-            elif [[ "$arch" == "arm64" ]]; then
-                local zig_url="https://ziglang.org/download/0.15.1/zig-macos-aarch64-0.15.1.tar.xz"
-                local zig_dir="zig-macos-aarch64-0.15.1"
-            else
-                log_error "Unsupported macOS architecture: $arch"
-                return 1
-            fi
-            ;;
-        *)
-            log_error "Unsupported OS for Zig installation: $os"
-            return 1
-            ;;
-    esac
-    
-    # Download and install
-    local temp_dir=$(mktemp -d)
-    cd "$temp_dir"
-    
-    curl -L "$zig_url" -o zig.tar.xz
-    tar -xf zig.tar.xz
-    
-    sudo mv "$zig_dir" /opt/zig
-    sudo ln -s /opt/zig/zig /usr/local/bin/zig
-    
-    cd - > /dev/null
-    rm -rf "$temp_dir"
-    
-    log_success "Zig installed successfully"
-}
-
 # Install Node.js
 install_node() {
     if command_exists node; then
@@ -239,13 +180,7 @@ cargo clippy --all-targets -- -D warnings
 # Format C code
 if command -v clang-format >/dev/null 2>&1; then
     echo "Checking C code formatting..."
-    find core -name "*.c" -o -name "*.h" | xargs clang-format --dry-run --Werror
-fi
-
-# Format Zig code
-if command -v zig >/dev/null 2>&1; then
-    echo "Checking Zig code formatting..."
-    find system/zig/src -name "*.zig" | xargs zig fmt --check
+    find src/core \( -name "*.c" -o -name "*.h" \) -print0 | xargs -0 clang-format --dry-run --Werror
 fi
 
 echo "Pre-commit checks passed!"
@@ -260,53 +195,48 @@ EOF
 create_dev_config() {
     log_info "Creating development configuration..."
     
+    # Unknown keys are rejected by the daemon, so this must track the schema in
+    # retrigger-daemon/src/config.rs. `retrigger validate -c retrigger-dev.toml`
+    # is the check; the block below is verified by the call right after it.
     cat > "retrigger-dev.toml" << 'EOF'
-# Retrigger Development Configuration
+# Retrigger development configuration, written by tools/scripts/dev-setup.sh.
 
 [server]
 bind_address = "127.0.0.1"
 port = 9090
-max_connections = 100
-request_timeout_ms = 30000
-enable_metrics = true
-metrics_port = 9091
 
 [watcher]
-watch_paths = [
-    { path = ".", recursive = true, enabled = true }
-]
-event_buffer_size = 8192
+queue_capacity = 8192
+debounce_ms = 50
+follow_symlinks = true
 hash_cache_size = 10000
 hash_cache_ttl_secs = 600
-hash_block_size = 4096
 
-[performance]
-worker_threads = 2
-enable_simd = true
-event_batch_size = 50
-poll_interval_us = 1000
-enable_zero_copy = true
-
-[logging]
-level = "debug"
-format = "pretty"
-structured = false
-file = "retrigger-dev.log"
+[[watcher.paths]]
+path = "."
+recursive = true
 
 [patterns]
-include = ["**/*.rs", "**/*.c", "**/*.h", "**/*.zig", "**/*.toml", "**/*.md"]
+include = []
 exclude = [
     "**/target/**",
     "**/node_modules/**",
     "**/.git/**",
-    "**/zig-cache/**",
     "**/build/**",
     "**/*.log",
-    "**/.*"
 ]
-max_file_size = 10485760  # 10MB
-ignore_binary = true
+
+[logging]
+level = "debug"
+format = "pretty"
 EOF
+
+    # Fail loudly if the generated file drifts from the daemon's schema, rather
+    # than handing a new contributor a config that only breaks at `start`.
+    if command_exists retrigger; then
+        retrigger validate -c retrigger-dev.toml >/dev/null 2>&1 \
+            || log_warning "retrigger-dev.toml was rejected by \`retrigger validate\`; the generator in this script has drifted from the daemon's schema."
+    fi
 
     log_success "Development configuration created: retrigger-dev.toml"
 }
@@ -325,17 +255,12 @@ setup_vscode() {
     "rust-analyzer.checkOnSave.command": "clippy",
     "rust-analyzer.cargo.features": "all",
     "C_Cpp.default.includePath": [
-        "${workspaceFolder}/core/include"
+        "${workspaceFolder}/src/core/include"
     ],
-    "files.associations": {
-        "*.zig": "zig"
-    },
     "editor.formatOnSave": true,
     "editor.rulers": [100],
     "files.exclude": {
         "**/target": true,
-        "**/zig-cache": true,
-        "**/zig-out": true,
         "**/build": true,
         "**/.git": true,
         "**/*.log": true
@@ -349,7 +274,6 @@ EOF
     "recommendations": [
         "rust-lang.rust-analyzer",
         "ms-vscode.cpptools",
-        "ziglang.vscode-zig",
         "vadimcn.vscode-lldb",
         "serayuzgur.crates",
         "tamasfe.even-better-toml"
@@ -419,7 +343,6 @@ main() {
     # Install dependencies
     install_system_deps
     install_rust
-    install_zig
     install_node
     
     # Setup project
