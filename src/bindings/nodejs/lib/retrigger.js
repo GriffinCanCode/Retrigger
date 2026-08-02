@@ -1,6 +1,7 @@
 'use strict';
 
 const { EventEmitter } = require('events');
+const { statSync } = require('fs');
 const path = require('path');
 
 const { ContentTracker } = require('./content');
@@ -182,6 +183,37 @@ class Retrigger extends EventEmitter {
       content: this._content ? this._content.stats() : null,
       metrics: this.metrics.snapshot(),
     };
+  }
+
+  /**
+   * Ask this watcher's content oracle whether a path *another* watcher just reported has really
+   * changed, against the same digest cache this watcher's own events are judged by.
+   *
+   * A dev server usually runs a second watcher that cannot be turned off — Vite's chokidar is the
+   * case this exists for. Its events reach the bundler whether or not the bytes changed, so
+   * hashing here decides nothing unless the other source is held to the same question. Sharing
+   * one cache is also what makes two sources idempotent rather than merely redundant: whichever
+   * observes a write first reports it and records the digest, and the second then finds that
+   * digest already current and is dropped.
+   *
+   * Answers `true` whenever it cannot tell, and `true` unconditionally when content hashing is
+   * off, because an unnecessary rebuild is the cheaper mistake.
+   *
+   * @param {string} target
+   * @param {string} [kind] contract event kind; anything but a removal is fingerprinted
+   * @returns {boolean}
+   */
+  hasContentChanged(target, kind = 'modified') {
+    if (!this._content) return true;
+    const resolved = path.resolve(target);
+    // The engine hands its own events a size, which is what keeps the tracker from reading a file
+    // too large to be worth hashing. An event from elsewhere arrives without one, so it is stat'd
+    // here rather than losing that ceiling and blocking the server on a large artifact.
+    const stat = statSync(resolved, { throwIfNoEntry: false });
+    const event = { path: resolved, kind, isDirectory: false, size: stat ? stat.size : undefined };
+    this._content.annotate(event);
+    if (event.contentChanged === false) this.metrics.recordUnchanged();
+    return event.contentChanged !== false;
   }
 
   /** @returns {object} */

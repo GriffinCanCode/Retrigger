@@ -231,11 +231,16 @@ export function runEngineSuite(engineName, makeRetrigger) {
       const dir = tempDir();
       const target = path.join(dir, 'burst.js');
       writeFile(target, 'v0');
-      const { events } = await start({ dir, debounceMs: 120 });
+      // The window has to outlast the slowest thing between a write and its notification, which is
+      // the backend rather than anything here: a stat differ reports on its own poll schedule and
+      // `fs.watch` on macOS delivers through a coalescing stream. At 120 ms the tail of the burst
+      // routinely landed after the window had already closed, which legitimately opens a second
+      // window and is the debouncer behaving correctly — so the test was measuring machine load.
+      const { events } = await start({ dir, debounceMs: 500 });
 
       // Spaced tightly enough that the whole burst, plus the lag before a backend reports its tail,
-      // lands well inside the 120 ms window. A write whose notification arrived *after* the window
-      // closed would legitimately open a second one, and this test is about the first.
+      // lands well inside the window. A write whose notification arrived *after* the window closed
+      // would legitimately open a second one, and this test is about the first.
       const last = 'v6'.padEnd(10, 'x');
       for (let i = 1; i <= 6; i += 1) {
         writeFile(target, i === 6 ? last : `v${i}`.padEnd(i + 4, 'x'));

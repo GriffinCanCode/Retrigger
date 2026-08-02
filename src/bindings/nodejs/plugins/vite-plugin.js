@@ -10,10 +10,16 @@
  * full-reload decisions all stay with Vite. The plugin never hand-rolls an
  * HMR payload when Vite can do it correctly.
  *
- * Vite's own chokidar watcher is deliberately left running. Whichever watcher
- * observes the write first wins the race; the other one is a no-op or a
- * redundant (idempotent) update. That redundancy is the price of never being
- * the reason a dev server stops reloading.
+ * Vite's own chokidar watcher is deliberately left running, so that a failure
+ * here is never the reason a dev server stops reloading. But a second source
+ * that reports every write unconditionally would defeat content hashing
+ * outright — chokidar would invalidate the module for a write whose bytes did
+ * not change, and the browser would reload anyway. So `server.watcher.emit` is
+ * *gated* rather than merely fed: an `add` or `change` for a file inside the
+ * watched roots is put to the same digest cache Retrigger's own events are put
+ * to. Whichever watcher observes a write first passes it on and records the
+ * digest; the second finds that digest current and is dropped, which is also
+ * what removes the duplicate update every real edit used to cause.
  *
  * Teardown uses `buildEnd` + `closeBundle` (Vite calls both on server close)
  * plus an `httpServer` close listener. The Rollup `closeWatcher` hook that the
@@ -27,6 +33,12 @@ const { createRetrigger } = require('../lib/retrigger');
 const { getEngineInfo } = require('../lib/engine');
 
 const DEFAULT_EXCLUDE = ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/.vite/**'];
+
+/**
+ * Emitter events the content gate applies to. A removal always counts as a change, and every
+ * other event on this emitter belongs to Vite rather than to the file system.
+ */
+const GATED_EVENTS = new Set(['add', 'change']);
 
 /**
  * Vite normalises every module-graph key with `path.posix.normalize` over a
@@ -67,6 +79,12 @@ function createRetriggerVitePlugin(options = {}) {
   let closeListener = null;
   const metrics = new Metrics();
   let degraded = false;
+  /** Undoes the `server.watcher.emit` gate, or null when none is installed. */
+  let removeGate = null;
+  /** True while this plugin is replaying its own event, which must not be re-gated. */
+  let replaying = false;
+  /** @type {string[]} resolved roots, cached: the gate consults them per event. */
+  let activeRoots = [];
 
   function log(message) {
     if (config.verbose) console.log(`[retrigger:vite] ${message}`);
@@ -105,7 +123,14 @@ function createRetriggerVitePlugin(options = {}) {
     if (viteWatcher && typeof viteWatcher.emit === 'function') {
       const viteEvent =
         event.kind === 'created' ? 'add' : event.kind === 'deleted' ? 'unlink' : 'change';
-      viteWatcher.emit(viteEvent, file);
+      // This event already carries the tracker's verdict; putting it back through the gate would
+      // only ask the same question of a digest we just recorded, and answer "unchanged".
+      replaying = true;
+      try {
+        viteWatcher.emit(viteEvent, file);
+      } finally {
+        replaying = false;
+      }
       metrics.recordTrigger(Date.now() - started);
       log(`${viteEvent} -> ${file}`);
       return 'watcher';
@@ -120,6 +145,61 @@ function createRetriggerVitePlugin(options = {}) {
     if (hot && typeof hot.send === 'function') hot.send({ type: 'full-reload', path: '*' });
     metrics.recordTrigger(Date.now() - started);
     return 'fallback';
+  }
+
+  /** @returns {boolean} whether `target` lies inside a root Retrigger was given */
+  function withinRoots(target) {
+    for (const root of activeRoots) {
+      if (target === root || target.startsWith(root + path.sep)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The gate. Answers whether an event chokidar raised should reach Vite.
+   *
+   * Deliberately narrow: only file events, only inside the roots this plugin was asked to watch,
+   * only while a healthy watcher is running. Anything else — Vite's config file, a plugin
+   * emitting by hand to force an update, a path nobody claimed — passes through untouched.
+   *
+   * @returns {boolean}
+   */
+  function forwards(viteEvent, file) {
+    if (!watcher || !watcher.isRunning) return true;
+    const target = path.resolve(file);
+    if (!withinRoots(target)) return true;
+    try {
+      return watcher.hasContentChanged(target, viteEvent === 'add' ? 'created' : 'modified');
+    } catch {
+      // Never be the reason an update is lost.
+      return true;
+    }
+  }
+
+  function installGate() {
+    const emitter = server && server.watcher;
+    if (removeGate || !config.contentHashing) return;
+    if (!emitter || typeof emitter.emit !== 'function') return;
+
+    const original = emitter.emit;
+    const gated = function (viteEvent, ...args) {
+      if (replaying || !GATED_EVENTS.has(viteEvent) || typeof args[0] !== 'string') {
+        return original.call(this, viteEvent, ...args);
+      }
+      if (!forwards(viteEvent, args[0])) {
+        metrics.recordUnchanged();
+        log(`unchanged (vite) -> ${args[0]}`);
+        return false;
+      }
+      return original.call(this, viteEvent, ...args);
+    };
+
+    emitter.emit = gated;
+    removeGate = () => {
+      // Only unwind our own layer: another plugin may have wrapped it since.
+      if (emitter.emit === gated) emitter.emit = original;
+      removeGate = null;
+    };
   }
 
   function start() {
@@ -145,8 +225,13 @@ function createRetriggerVitePlugin(options = {}) {
           if (hot && typeof hot.send === 'function') hot.send({ type: 'full-reload', path: '*' });
           return;
         }
-        if (event.isDirectory) return;
         metrics.recordEvent(event.kind);
+        // Vite's watcher is told about files; a directory event is one this plugin declined to
+        // pass on, which is not the same as one it never saw.
+        if (event.isDirectory) {
+          metrics.recordFiltered();
+          return;
+        }
         // The file was written with the bytes it already had — a formatter on save, a generator
         // that reran, a branch switch that restored what was there. Vite is not told, so the
         // module graph is not invalidated and the browser is not reloaded.
@@ -163,10 +248,12 @@ function createRetriggerVitePlugin(options = {}) {
         }
       });
 
-      for (const root of watchRoots()) instance.add(root, true);
+      activeRoots = watchRoots();
+      for (const root of activeRoots) instance.add(root, true);
       instance.start();
       watcher = instance;
       metrics.markStarted();
+      installGate();
 
       const info = engineReport();
       log(`engine=${info.engine} backend=${info.backend} hash=${info.hashAlgorithm}`);
@@ -176,6 +263,8 @@ function createRetriggerVitePlugin(options = {}) {
   }
 
   function teardown() {
+    // Before the watcher goes, so the gate can never outlive the cache it consults.
+    if (removeGate) removeGate();
     if (watcher) {
       try {
         watcher.close();

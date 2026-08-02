@@ -160,27 +160,62 @@ describe('vite plugin', () => {
     await waitFor(() => plugin.api.isWatching(), { message: 'watcher started' });
     await server.transformRequest('/mod.js');
 
+    const hashed = () => plugin.api.getStats().watcher.content.filesHashed;
     const contents = 'export const n = 7;\n';
     writeFile(project.mod, contents);
     await waitFor(() => plugin.api.getStats().metrics.triggers > 0, {
       timeout: 10000,
       message: 'the real edit reached Vite',
     });
+    // Let the real edit finish being observed before writing again. Two writes inside one
+    // observation window are legitimately reported as one event, and the second one would then
+    // never be classified at all — which is a property of this test's timing, not of the plugin.
+    await waitForQuiet(hashed, { quietMs: 300, timeout: 3000 });
 
-    // The plugin's own counter, not `server.watcher` emissions: Vite's chokidar is deliberately
-    // left running and will fire for this write too. What must not happen is Retrigger adding a
-    // dispatch of its own for a write that changed nothing.
+    // Everything reaching Vite is watched, not just what this plugin dispatches: Vite's own
+    // chokidar sees this write too, and an implementation that only declined to add a dispatch of
+    // its own would still let chokidar invalidate the module and reload the browser.
+    const emitted = [];
+    for (const name of ['add', 'change', 'unlink']) {
+      server.watcher.on(name, (file) => emitted.push(`${name} ${file}`));
+    }
     const before = plugin.api.getStats().metrics.triggers;
+    const hashesBefore = hashed();
+
     writeFile(project.mod, contents);
-    await waitFor(() => plugin.api.getStats().metrics.eventsUnchanged > 0, {
+
+    // The write was observed by somebody — otherwise the assertions below hold vacuously.
+    await waitFor(() => hashed() > hashesBefore, {
       timeout: 10000,
-      message: 'the no-op write was seen and classified',
+      message: 'the no-op write was observed',
     });
     const after = await waitForQuiet(() => plugin.api.getStats().metrics.triggers, {
       quietMs: 300,
       timeout: 3000,
     });
     expect(after, 'a rewrite with identical bytes must not reach Vite').toBe(before);
+    expect(emitted, 'no watcher event may escape to Vite for a no-op write').toEqual([]);
+    expect(plugin.api.getStats().metrics.eventsUnchanged).toBeGreaterThan(0);
+  });
+
+  it('reports one edit once, however many watchers observed it', async () => {
+    const project = fixture();
+    const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
+    const server = await startServer(project.dir, [plugin]);
+    live.add(server);
+    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started' });
+    await server.transformRequest('/mod.js');
+
+    const hashed = () => plugin.api.getStats().watcher.content.filesHashed;
+    // Two watchers see this write — Retrigger's and Vite's own chokidar — and both used to reach
+    // the module graph, so every save cost two invalidations and two HMR payloads.
+    const emitted = [];
+    server.watcher.on('change', (file) => emitted.push(file));
+    writeFile(project.mod, 'export const n = 11;\n');
+
+    await waitFor(() => emitted.length > 0, { timeout: 10000, message: 'the edit reached Vite' });
+    await waitForQuiet(hashed, { quietMs: 400, timeout: 5000 });
+    expect(emitted, 'one write, one invalidation').toEqual([normalizePath(project.mod)]);
   });
 
   it('routes a dispatched event through the watcher channel, not a hand-rolled payload', async () => {
