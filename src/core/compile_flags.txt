@@ -1,0 +1,9 @@
+-std=c11
+-Iinclude
+-Isrc
+-Itests
+-Wall
+-Wextra
+-Wshadow
+-Wstrict-prototypes
+-Wpointer-arith

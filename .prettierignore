@@ -1,0 +1,31 @@
+# Root-level companion to .prettierrc. src/bindings/nodejs has its own copy
+# because prettier runs from that directory in the npm scripts.
+
+# Dependencies and build output
+node_modules/
+**/node_modules/
+target/
+**/target/
+dist/
+**/dist/
+src/build/
+coverage/
+**/coverage/
+
+# Generated or vendored: not ours to format
+package-lock.json
+**/package-lock.json
+Cargo.lock
+**/Cargo.lock
+*.node
+*.tgz
+
+# Other toolchains own these
+*.c
+*.h
+*.rs
+
+# Assets and logs
+assets/
+*.log
+*.min.js

@@ -1,0 +1,38 @@
+# Style for src/core (C11). `make format` applies this; it is checked in so
+# that the formatter's opinion is a property of the repository rather than of
+# whichever clang-format happens to be on a contributor's PATH.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++11
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 80
+
+# The hash kernels are read side-by-side with the xxHash reference; keeping
+# every function body on its own lines makes that comparison mechanical.
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+
+PointerAlignment: Right
+DerivePointerAlignment: false
+AlignAfterOpenBracket: Align
+AlignTrailingComments: true
+AlignEscapedNewlines: Left
+AlignConsecutiveMacros: Consecutive
+
+BreakBeforeBraces: Attach
+IndentCaseLabels: false
+SpaceAfterCStyleCast: false
+SpacesBeforeTrailingComments: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+
+# The project header comes first, then the internal header, then the system
+# headers. Sorting inside each block only, so that ordering survives.
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
