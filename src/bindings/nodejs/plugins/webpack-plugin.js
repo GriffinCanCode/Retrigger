@@ -1,649 +1,391 @@
+'use strict';
+
 /**
- * Retrigger Webpack Plugin - Enhanced with SharedArrayBuffer and Advanced Integration
- * Replaces webpack's default file watching with ultra-fast native watching
+ * Retrigger webpack 5 plugin.
  *
- * Features:
- * - SharedArrayBuffer communication for sub-millisecond event propagation
- * - Complete webpack FileSystemWatcher interface implementation
- * - Advanced module invalidation with dependency tracking
- * - Performance monitoring and optimization
+ * Replaces webpack's `watchFileSystem` (Watchpack) with a Retrigger-backed
+ * implementation of the same contract:
+ *
+ *   watch(files, directories, missing, startTime, options, callback, callbackUndelayed)
+ *   callback(err, fileTimeInfoEntries, contextTimeInfoEntries, changedFiles, removedFiles)
+ *   callbackUndelayed(filePath, changeTime)
+ *
+ * Degradation rules, in priority order:
+ *   1. Nothing in this file may throw out of a webpack hook.
+ *   2. If the native engine is missing, the JavaScript engine is used instead.
+ *   3. If watching cannot be established at all, every call is delegated to
+ *      webpack's original `watchFileSystem`, so the build still works.
  */
 
 const path = require('path');
+const fsp = require('fs/promises');
 
-// Lazy load to avoid circular dependencies
-function getCreateRetrigger() {
-  return require('../index').createRetrigger;
-}
+const { Metrics } = require('../lib/metrics');
+const { createRetrigger } = require('../lib/retrigger');
+const { getEngineInfo } = require('../lib/engine');
 
-function getSharedBufferCommunicator() {
-  return require('../src-js/shared-buffer').SharedBufferCommunicator;
-}
+const PLUGIN = 'RetriggerWebpackPlugin';
 
-function getWebpackAdapter() {
-  return require('../src-js/bundler-adapters').WebpackAdapter;
-}
+/**
+ * Directory subtrees that are never recursed into. node_modules is excluded by
+ * default for the same reason every dev-server watcher excludes it: recursing
+ * it costs thousands of watch descriptors. The consequence is explicit — edits
+ * inside node_modules will not trigger a rebuild. Override with `exclude: []`.
+ */
+const DEFAULT_EXCLUDE = ['**/node_modules/**', '**/.git/**'];
+
+/**
+ * Timestamp entries retained per map.
+ *
+ * These maps are handed to webpack as `fileTimeInfoEntries` / `contextTimeInfoEntries`, and webpack
+ * treats a path it cannot find in them as one whose timestamp it does not know — which costs it a
+ * `stat` and nothing else. An eviction is therefore a slower answer, never a wrong one. Without a
+ * ceiling the maps record every path the watcher ever reported, including files webpack has no
+ * dependency on, and a long session across branch switches and generated output grows them without
+ * any bound but the disk.
+ */
+const TIME_INFO_LIMIT = 32768;
+
+/**
+ * Paths held over per set while webpack is busy compiling.
+ *
+ * A compilation of a large project takes seconds, and a `git checkout` landing inside one produces
+ * far more paths than webpack will ask about. Past this many the sets stop enumerating and the next
+ * session is told to invalidate its whole dependency set instead — over-reporting, which webpack
+ * answers with a rebuild, rather than discarding an edit.
+ */
+const PENDING_LIMIT = 16384;
 
 class RetriggerWebpackPlugin {
+  /**
+   * @param {{watchPaths?: string[], verbose?: boolean, debounceMs?: number,
+   *   include?: string[], exclude?: string[], engine?: 'auto'|'native'|'javascript',
+   *   replaceWatcher?: boolean, aggregateTimeout?: number, capacity?: number,
+   *   pollIntervalMs?: number}} [options]
+   */
   constructor(options = {}) {
+    const legacy = options.watchOptions || {};
     this.options = {
       watchPaths: options.watchPaths || [],
-      watchOptions: {
-        recursive: true,
-        exclude_patterns: [
-          '**/node_modules/**',
-          '**/.git/**',
-          '**/dist/**',
-          '**/build/**',
-          '**/*.log',
-          '**/.*',
-          ...((options.watchOptions && options.watchOptions.exclude_patterns) ||
-            []),
-        ],
-        include_patterns:
-          options.watchOptions && options.watchOptions.include_patterns,
-        enable_hashing: options.watchOptions?.enable_hashing ?? true,
-        hash_block_size: options.watchOptions?.hash_block_size || 4096,
-        ...options.watchOptions,
-      },
-      verbose: options.verbose || false,
-      debounceMs: options.debounceMs || 50,
-      enableHMR: options.enableHMR !== false,
-      useSharedBuffer: options.useSharedBuffer !== false,
-      sharedBufferSize: options.sharedBufferSize || 2 * 1024 * 1024, // 2MB
-      maxEventBatch: options.maxEventBatch || 200,
-      enableAdvancedInvalidation: options.enableAdvancedInvalidation !== false,
-      enableNativeWatching: options.enableNativeWatching !== false,
+      verbose: options.verbose === true,
+      debounceMs: options.debounceMs ?? 0,
+      include: options.include || legacy.include_patterns || [],
+      exclude: options.exclude || legacy.exclude_patterns || DEFAULT_EXCLUDE,
+      engine: options.engine || 'auto',
+      replaceWatcher: options.replaceWatcher !== false,
+      aggregateTimeout: options.aggregateTimeout ?? 20,
+      capacity: options.capacity ?? 16384,
+      pollIntervalMs: options.pollIntervalMs ?? 5,
     };
 
-    this.watcher = null;
     this.compiler = null;
-    this.bundlerAdapter = null;
-    this.isWatching = false;
-    this.changeBuffer = new Map();
-    this.debounceTimer = null;
-    this.sharedComm = null;
-    this.moduleGraph = new Map();
-    this.dependencyCache = new Map();
-    this.performanceMetrics = {
-      eventsProcessed: 0,
-      invalidationsTriggered: 0,
-      averageEventLatency: 0,
-      lastEventBatch: 0,
-    };
+    this.watcher = null;
+    this.metrics = new Metrics();
+    this.degraded = false;
+    this.degradedReason = null;
+
+    /** @type {Map<string, {safeTime: number, timestamp: number}>} */
+    this.fileTimeInfo = new Map();
+    /** @type {Map<string, {safeTime: number, timestamp: number}>} */
+    this.contextTimeInfo = new Map();
+    /** Changes observed while webpack was busy compiling. */
+    this.pendingChanges = new Set();
+    this.pendingRemovals = new Set();
+    /** Whether either pending set hit {@link PENDING_LIMIT} and is now incomplete. */
+    this.pendingOverflow = false;
+    /** @type {Set<object>} live watch sessions */
+    this.sessions = new Set();
+    /** @type {Map<string, boolean>} directories handed to the engine */
+    this.registered = new Map();
+    this._firstSession = true;
   }
 
   /**
-   * Apply the plugin to webpack compiler
-   * @param {Object} compiler - Webpack compiler instance
+   * @param {import('webpack').Compiler} compiler
    */
   apply(compiler) {
+    if (!compiler || !compiler.hooks) {
+      this._warn('invalid webpack compiler; plugin disabled');
+      return;
+    }
     this.compiler = compiler;
 
-    // Validate compiler has required structure
-    if (!compiler || !compiler.hooks) {
-      if (this.options.verbose) {
-        console.warn(
-          '[Retrigger] Invalid webpack compiler provided, plugin will not function'
-        );
+    compiler.hooks.watchRun.tapAsync(PLUGIN, (_compiler, callback) => {
+      // Never let plugin failure block the build: report and continue.
+      try {
+        this._ensureWatcher();
+      } catch (err) {
+        this._degrade(err);
       }
-      return;
-    }
-
-    // Skip bundler adapter when running inside webpack (prevents circular dependency)
-    this.bundlerAdapter = null;
-
-    // Initialize SharedArrayBuffer communication if enabled
-    if (this.options.useSharedBuffer) {
-      const SharedBufferCommunicator = getSharedBufferCommunicator();
-      this.sharedComm = new SharedBufferCommunicator(
-        this.options.sharedBufferSize
-      );
-    }
-
-    // Log plugin initialization (always register this hook for counting)
-    if (compiler.hooks.initialize) {
-      compiler.hooks.initialize.tap('RetriggerWebpackPlugin', () => {
-        if (this.options.verbose) {
-          console.log(
-            '[Retrigger] Initializing enhanced webpack plugin with SharedArrayBuffer'
-          );
-        }
-      });
-    }
-
-    // Setup compilation hooks for module tracking
-    this._setupCompilationHooks(compiler);
-
-    // Hook into webpack's watch mode
-    compiler.hooks.watchRun.tapAsync(
-      'RetriggerWebpackPlugin',
-      async (compilation, callback) => {
-        if (!this.isWatching) {
-          await this.startWatching(compilation);
-        }
-        callback();
-      }
-    );
-
-    // Clean up on watch close
-    compiler.hooks.watchClose.tap('RetriggerWebpackPlugin', () => {
-      this.stopWatching();
+      callback();
     });
 
-    // Replace webpack's file system with our enhanced version
-    compiler.watchFileSystem = new RetriggerFileSystem(
-      compiler.watchFileSystem,
-      this,
-      this.options
-    );
-
-    // Bundler adapter intentionally disabled to prevent circular dependencies when running inside webpack
-  }
-
-  /**
-   * Setup webpack compilation hooks for module tracking
-   * @param {Object} compiler - Webpack compiler instance
-   * @private
-   */
-  _setupCompilationHooks(compiler) {
-    // Hook into compilation for module graph tracking
-    compiler.hooks.compilation.tap('RetriggerWebpackPlugin', (compilation) => {
-      // Track module dependencies for advanced invalidation
-      compilation.hooks.buildModule.tap('RetriggerWebpackPlugin', (module) => {
-        if (module.resource && this.options.enableAdvancedInvalidation) {
-          this.moduleGraph.set(module.resource, {
-            dependencies: new Set(),
-            dependents: new Set(),
-            lastModified: Date.now(),
-          });
-        }
-      });
-
-      // Track dependency relationships
-      compilation.hooks.succeedModule.tap(
-        'RetriggerWebpackPlugin',
-        (module) => {
-          if (module.resource && module.dependencies) {
-            const moduleInfo = this.moduleGraph.get(module.resource);
-            if (moduleInfo) {
-              module.dependencies.forEach((dep) => {
-                if (dep.module && dep.module.resource) {
-                  moduleInfo.dependencies.add(dep.module.resource);
-
-                  // Add reverse dependency
-                  const depInfo = this.moduleGraph.get(dep.module.resource) || {
-                    dependencies: new Set(),
-                    dependents: new Set(),
-                    lastModified: Date.now(),
-                  };
-                  depInfo.dependents.add(module.resource);
-                  this.moduleGraph.set(dep.module.resource, depInfo);
-                }
-              });
-            }
-          }
-        }
-      );
+    compiler.hooks.watchClose.tap(PLUGIN, () => {
+      try {
+        this.stop();
+      } catch (err) {
+        this._warn(`error during shutdown: ${err.message}`);
+      }
     });
 
-    // SharedArrayBuffer communication setup
-    if (this.options.useSharedBuffer && this.sharedComm) {
-      this.sharedComm.on('file-event', (event) => {
-        this.handleSharedBufferEvent(event);
-      });
+    if (!this.options.replaceWatcher) return;
 
-      this.sharedComm.on('error', (error) => {
-        if (this.options.verbose) {
-          console.error('[Retrigger] SharedArrayBuffer error:', error);
-        }
-      });
-
-      // Initialize as main thread
-      this.sharedComm.initializeAsMain().catch((error) => {
-        if (this.options.verbose) {
-          console.error(
-            '[Retrigger] Failed to initialize SharedArrayBuffer:',
-            error
-          );
-        }
-      });
-    }
-  }
-
-  /**
-   * Handle events from SharedArrayBuffer communication
-   * @param {Object} event - File system event from shared buffer
-   * @private
-   */
-  handleSharedBufferEvent(event) {
-    if (!this.shouldIncludeFile(event.path)) return;
-
-    // Process with ultra-low latency
-    const processedEvent = {
-      ...event,
-      processedAt: process.hrtime.bigint(),
+    const install = () => {
+      const original = compiler.watchFileSystem;
+      if (!original || original instanceof RetriggerWatchFileSystem) return;
+      compiler.watchFileSystem = new RetriggerWatchFileSystem(original, this);
     };
+    install();
+    compiler.hooks.afterEnvironment.tap(PLUGIN, install);
+  }
 
-    // Update performance metrics
-    this.performanceMetrics.eventsProcessed++;
+  /** @returns {boolean} whether a Retrigger-backed watch can be attempted */
+  isUsable() {
+    return !this.degraded;
+  }
 
-    // Direct invalidation for maximum speed
-    if (this.options.enableAdvancedInvalidation) {
-      this.invalidateModuleTree(event.path);
+  /** Lazily create and start the shared watcher. */
+  _ensureWatcher() {
+    if (this.watcher || this.degraded) return this.watcher;
+    const watcher = createRetrigger({
+      include: this.options.include,
+      exclude: this.options.exclude,
+      debounceMs: this.options.debounceMs,
+      capacity: this.options.capacity,
+      pollIntervalMs: this.options.pollIntervalMs,
+      engine: this.options.engine,
+    });
+    watcher.on('error', (err) => {
+      this.metrics.recordError();
+      this._warn(`watcher error: ${err.message}`);
+    });
+    watcher.on('all', (event) => this._onEvent(event));
+    watcher.on('rescan', () => {
+      // The queue overflowed; the safest reaction is a full invalidation.
+      for (const session of this.sessions) session.forceAggregate();
+    });
+
+    for (const target of this.options.watchPaths) {
+      this._register(path.resolve(target), true, watcher);
+    }
+    watcher.start();
+    this.watcher = watcher;
+    this.metrics.markStarted();
+    if (this.options.verbose) {
+      const info = getEngineInfo();
+      this._log(`engine=${info.engine} backend=${info.backend} hash=${info.hashAlgorithm}`);
+    }
+    return watcher;
+  }
+
+  /**
+   * @param {string} dir
+   * @param {boolean} recursive
+   */
+  _register(dir, recursive, watcher = this.watcher) {
+    if (!watcher) return;
+    const existing = this.registered.get(dir);
+    if (existing === true || (existing === false && !recursive)) return;
+    try {
+      watcher.add(dir, recursive);
+      this.registered.set(dir, recursive);
+    } catch (err) {
+      // A directory that vanished between resolution and registration is
+      // normal during a rebuild; only surface it in verbose mode.
+      if (this.options.verbose) this._log(`cannot watch ${dir}: ${err.message}`);
+    }
+  }
+
+  _onEvent(event) {
+    if (event.kind === 'rescanRequired') return;
+    this.metrics.recordEvent(event.kind);
+    const target = event.path;
+    const time = Date.now();
+
+    if (event.kind === 'deleted') {
+      this.fileTimeInfo.delete(target);
+      this.contextTimeInfo.delete(target);
     } else {
-      this.triggerWebpackCompilation([processedEvent]);
+      const entry = { safeTime: time + 1, timestamp: time };
+      this._track(event.isDirectory ? this.contextTimeInfo : this.fileTimeInfo, target, entry);
     }
-  }
 
-  /**
-   * Intelligently invalidate module tree based on dependencies
-   * @param {string} changedFile - Path of changed file
-   * @private
-   */
-  invalidateModuleTree(changedFile) {
-    const moduleInfo = this.moduleGraph.get(changedFile);
-    if (!moduleInfo) {
-      // File not in module graph, trigger standard compilation
-      this.triggerWebpackCompilation([
-        { path: changedFile, event_type: 'modified' },
-      ]);
+    // An event a live session already accepted must not also be left pending:
+    // the next session would adopt it and webpack would rebuild twice for one
+    // edit. Only events nobody was listening for are held over.
+    let accepted = false;
+    for (const session of this.sessions) {
+      if (session.handle(target, event, time)) accepted = true;
+    }
+    if (accepted) {
+      this.pendingChanges.delete(target);
+      this.pendingRemovals.delete(target);
       return;
     }
 
-    // Collect all files that need invalidation
-    const toInvalidate = new Set([changedFile]);
+    // Only a WatchSession ever reads the held-over sets, and one exists only when this plugin owns
+    // webpack's watchFileSystem. Filling them anyway would grow two sets for the life of the
+    // process with nothing that could ever drain them.
+    if (!this.options.replaceWatcher) return;
 
-    // Add all dependents (files that import this file)
-    const addDependents = (filePath) => {
-      const info = this.moduleGraph.get(filePath);
-      if (info) {
-        info.dependents.forEach((dependent) => {
-          if (!toInvalidate.has(dependent)) {
-            toInvalidate.add(dependent);
-            addDependents(dependent); // Recursive dependency invalidation
-          }
-        });
-      }
+    const [pending, opposite] =
+      event.kind === 'deleted'
+        ? [this.pendingRemovals, this.pendingChanges]
+        : [this.pendingChanges, this.pendingRemovals];
+    opposite.delete(target);
+    if (pending.size >= PENDING_LIMIT && !pending.has(target)) {
+      this.pendingOverflow = true;
+      return;
+    }
+    pending.add(target);
+  }
+
+  /**
+   * Record `entry` for `target`, evicting the coldest entries past the ceiling.
+   *
+   * Re-inserting a key that is already present — delete, then set — makes the Map's insertion order
+   * an exact least-recently-touched order, so eviction is taking keys off the front of its iterator.
+   * That is O(1) per event with no sort and no second copy of the map, which a
+   * scan-and-drop-the-oldest strategy would need on every eviction.
+   *
+   * @param {Map<string, {safeTime: number, timestamp: number}>} map
+   * @param {string} target
+   * @param {{safeTime: number, timestamp: number}} entry
+   */
+  _track(map, target, entry) {
+    map.delete(target);
+    map.set(target, entry);
+    for (const key of map.keys()) {
+      if (map.size <= TIME_INFO_LIMIT) break;
+      map.delete(key);
+    }
+  }
+
+  /** Stop watching and release everything. Idempotent. */
+  stop() {
+    for (const session of [...this.sessions]) session.close();
+    this.sessions.clear();
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+    this.registered.clear();
+    // These describe a watch that is over. webpack is either using its own watcher now (the
+    // degraded path) or not watching at all, and re-stats whatever it is not given, so keeping a
+    // session's worth of timestamps and held-over paths would be retention with no reader.
+    this.fileTimeInfo.clear();
+    this.contextTimeInfo.clear();
+    this.pendingChanges.clear();
+    this.pendingRemovals.clear();
+    this.pendingOverflow = false;
+    this.metrics.markStopped();
+  }
+
+  /**
+   * @returns {object|null} measured statistics, or null before the first watch
+   */
+  getStats() {
+    if (!this.watcher) return null;
+    return {
+      ...this.watcher.getStats(),
+      plugin: this.metrics.snapshot(),
+      degraded: this.degraded,
+      degradedReason: this.degradedReason,
+      watchedDirectories: this.registered.size,
     };
-
-    addDependents(changedFile);
-
-    if (this.options.verbose) {
-      console.log(
-        `[Retrigger] Advanced invalidation: ${changedFile} affects ${toInvalidate.size - 1} dependent modules`
-      );
-    }
-
-    // Trigger webpack compilation with specific file set
-    const events = Array.from(toInvalidate).map((path) => ({
-      path,
-      event_type: 'modified',
-      timestamp: Date.now().toString(),
-    }));
-
-    this.performanceMetrics.invalidationsTriggered++;
-    this.triggerWebpackCompilation(events);
   }
 
-  /**
-   * Enhanced webpack compilation trigger with performance optimization
-   * @param {Array} events - Array of file events
-   * @private
-   */
-  triggerWebpackCompilation(events = []) {
-    if (!this.compiler || events.length === 0) return;
+  /** Back-compat alias for the name the README used. */
+  async getPerformanceStats() {
+    return this.getStats();
+  }
 
-    // Batch events if too many
-    const eventsToProcess = events.slice(0, this.options.maxEventBatch);
-
-    if (this.options.verbose) {
-      console.log(
-        `[Retrigger] Triggering compilation for ${eventsToProcess.length} file changes`
-      );
-      eventsToProcess.forEach((event) => {
-        console.log(`  - ${event.event_type}: ${event.path}`);
-      });
-    }
-
-    // Update performance metrics
-    const startTime = process.hrtime.bigint();
-
-    // Trigger webpack's invalidation
-    if (this.compiler.watching) {
-      const filePaths = eventsToProcess.map((event) => event.path);
-      this.compiler.watching.invalidate(filePaths);
-
-      // Calculate average event latency
-      const latency = Number(process.hrtime.bigint() - startTime) / 1000000; // Convert to milliseconds
-      this.performanceMetrics.averageEventLatency =
-        (this.performanceMetrics.averageEventLatency + latency) / 2;
+  _degrade(err) {
+    if (this.degraded) return;
+    this.degraded = true;
+    this.degradedReason = err && err.message ? err.message : String(err);
+    this._warn(`falling back to webpack's default watcher (${this.degradedReason})`);
+    try {
+      this.stop();
+    } catch {
+      /* already torn down */
     }
   }
 
-  /**
-   * Start file watching
-   * @param {Object} compilation - Webpack compilation
-   */
-  async startWatching(compilation) {
-    if (this.isWatching) return;
+  _log(message) {
+    console.log(`[retrigger:webpack] ${message}`);
+  }
 
-    // Skip native watching if disabled
-    if (!this.options.enableNativeWatching) {
-      if (this.options.verbose) {
-        console.log(
-          '[Retrigger] Native watching disabled, using webpack default watching'
-        );
-      }
-      this.isWatching = true;
-      return;
+  _warn(message) {
+    if (process.env.RETRIGGER_SILENT === '1') return;
+    console.warn(`[retrigger:webpack] ${message}`);
+  }
+}
+
+/**
+ * Implements webpack's WatchFileSystem interface on top of the plugin's shared
+ * Retrigger instance, delegating wholesale to the original implementation
+ * whenever Retrigger cannot serve the request.
+ */
+class RetriggerWatchFileSystem {
+  /**
+   * @param {object} original webpack's NodeWatchFileSystem
+   * @param {RetriggerWebpackPlugin} plugin
+   */
+  constructor(original, plugin) {
+    this.original = original;
+    this.plugin = plugin;
+    // webpack reads this property directly in some code paths.
+    this.inputFileSystem = original && original.inputFileSystem;
+    this.watcherOptions = original && original.watcherOptions;
+  }
+
+  watch(files, directories, missing, startTime, options, callback, callbackUndelayed) {
+    validate(files, directories, missing, startTime, options, callback, callbackUndelayed);
+
+    if (!this.plugin.isUsable()) return this._delegate(arguments);
+
+    let watcher;
+    try {
+      watcher = this.plugin._ensureWatcher();
+    } catch (err) {
+      this.plugin._degrade(err);
+      return this._delegate(arguments);
     }
+    if (!watcher) return this._delegate(arguments);
 
     try {
-      const createRetrigger = getCreateRetrigger();
-      this.watcher = createRetrigger();
-      this.isWatching = true;
-
-      // Determine paths to watch
-      const watchPaths = this.getWatchPaths(compilation);
-
-      if (this.options.verbose) {
-        console.log(`[Retrigger] Watching ${watchPaths.length} directories:`);
-        watchPaths.forEach((p) => console.log(`  - ${p}`));
-      }
-
-      // Watch directories
-      for (const watchPath of watchPaths) {
-        await this.watcher.watch(watchPath, this.options.watchOptions);
-      }
-
-      // Set up event handlers
-      this.setupEventHandlers();
-
-      // Start watching
-      await this.watcher.start();
-
-      if (this.options.verbose) {
-        const stats = await this.watcher.getStats();
-        const simdLevel = this.watcher.getSimdLevel();
-        console.log(`[Retrigger] Started with SIMD level: ${simdLevel}`);
-        console.log(
-          `[Retrigger] Watching ${stats.watched_directories} directories`
-        );
-      }
-    } catch (error) {
-      console.error('[Retrigger] Failed to start watching:', error);
-      this.isWatching = false;
-      throw error;
-    }
-  }
-
-  /**
-   * Stop file watching
-   */
-  stopWatching() {
-    if (this.watcher && this.isWatching) {
-      this.watcher.stop();
-      this.watcher = null;
-      this.isWatching = false;
-
-      if (this.debounceTimer) {
-        clearTimeout(this.debounceTimer);
-        this.debounceTimer = null;
-      }
-
-      if (this.options.verbose) {
-        console.log('[Retrigger] Stopped watching');
-      }
-    }
-  }
-
-  /**
-   * Get directories to watch based on webpack context
-   * @param {Object} compilation - Webpack compilation
-   * @returns {string[]} Array of paths to watch
-   */
-  getWatchPaths(compilation) {
-    const paths = new Set();
-
-    // Add explicitly configured paths
-    this.options.watchPaths.forEach((p) => paths.add(path.resolve(p)));
-
-    // Add webpack context
-    if (compilation.compiler.context) {
-      paths.add(compilation.compiler.context);
-    }
-
-    // Add entry points
-    if (compilation.entries) {
-      compilation.entries.forEach((entry) => {
-        if (entry.resource) {
-          paths.add(path.dirname(path.resolve(entry.resource)));
-        }
-      });
-    }
-
-    // Default to current working directory if no paths found
-    if (paths.size === 0) {
-      paths.add(process.cwd());
-    }
-
-    return Array.from(paths);
-  }
-
-  /**
-   * Set up file change event handlers
-   */
-  setupEventHandlers() {
-    // Handle file changes with debouncing
-    this.watcher.on('file-changed', (event) => {
-      this.handleFileChange(event);
-    });
-
-    // Handle errors
-    this.watcher.on('error', (error) => {
-      console.error('[Retrigger] Watcher error:', error);
-    });
-
-    // Log stats periodically if verbose
-    if (this.options.verbose) {
-      this.watcher.on('stats', (stats) => {
-        console.log(
-          `[Retrigger] Stats - Pending: ${stats.pending_events}, Total: ${stats.total_events}`
-        );
-      });
-    }
-  }
-
-  /**
-   * Handle file change events with debouncing
-   * @param {Object} event - File change event
-   */
-  handleFileChange(event) {
-    // Skip directories
-    if (event.is_directory) return;
-
-    // Filter files based on webpack's module resolution
-    if (!this.shouldIncludeFile(event.path)) {
-      return;
-    }
-
-    // Add to change buffer
-    this.changeBuffer.set(event.path, {
-      event,
-      timestamp: Date.now(),
-    });
-
-    // Debounce compilation trigger
-    if (this.debounceTimer) {
-      clearTimeout(this.debounceTimer);
-    }
-
-    this.debounceTimer = setTimeout(() => {
-      this.triggerWebpackCompilation();
-    }, this.options.debounceMs);
-  }
-
-  /**
-   * Check if file should trigger webpack recompilation
-   * @param {string} filePath - File path to check
-   * @returns {boolean} Whether file should be included
-   */
-  shouldIncludeFile(filePath) {
-    // Skip common non-source files
-    const skipExtensions = ['.log', '.lock', '.tmp', '.swp', '.DS_Store'];
-    const skipPatterns = [/node_modules/, /\.git/, /dist/, /build/, /coverage/];
-
-    const basename = path.basename(filePath);
-
-    // Check extensions
-    if (skipExtensions.some((ext) => basename.endsWith(ext))) {
-      return false;
-    }
-
-    // Check patterns
-    if (skipPatterns.some((pattern) => pattern.test(filePath))) {
-      return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * Trigger webpack compilation
-   */
-  triggerWebpackCompilation() {
-    if (!this.compiler || this.changeBuffer.size === 0) {
-      return;
-    }
-
-    const changes = Array.from(this.changeBuffer.values());
-    this.changeBuffer.clear();
-
-    if (this.options.verbose) {
-      console.log(
-        `[Retrigger] Triggering compilation for ${changes.length} changes`
-      );
-      changes.forEach(({ event }) => {
-        console.log(`  - ${event.event_type}: ${event.path}`);
-      });
-    }
-
-    // Trigger webpack's invalidation
-    if (this.compiler.watching) {
-      const filePaths = changes.map(({ event }) => event.path);
-      this.compiler.watching.invalidate(filePaths);
-    }
-  }
-
-  /**
-   * Get performance statistics
-   * @returns {Promise<Object>} Performance stats
-   */
-  async getPerformanceStats() {
-    if (!this.watcher) return null;
-
-    const stats = await this.watcher.getStats();
-    const simdLevel = this.watcher.getSimdLevel();
-
-    return {
-      simd_level: simdLevel,
-      watched_directories: parseInt(stats.watched_directories),
-      pending_events: stats.pending_events,
-      total_events: parseInt(stats.total_events),
-      dropped_events: parseInt(stats.dropped_events),
-      buffer_utilization:
-        stats.buffer_capacity > 0
-          ? ((stats.pending_events / stats.buffer_capacity) * 100).toFixed(1) +
-            '%'
-          : '0%',
-    };
-  }
-}
-
-/**
- * Enhanced FileSystem implementation that fully replaces webpack's default watcher
- * Implements the complete webpack watchFileSystem interface
- */
-class RetriggerFileSystem {
-  constructor(originalFs, plugin, options) {
-    this.originalFs = originalFs;
-    this.plugin = plugin;
-    this.options = options;
-    this.watchers = new Map();
-    this.watcherCounter = 0;
-  }
-
-  /**
-   * Main watch method that webpack calls
-   * Fully implements webpack's FileSystemWatcher interface
-   */
-  watch(files, dirs, missing, startTime, options, callback, callbackUndelayed) {
-    const watcherId = ++this.watcherCounter;
-
-    if (this.options.verbose) {
-      console.log(
-        `[Retrigger] FileSystem.watch() #${watcherId} - Files: ${files.length}, Dirs: ${dirs.length}, Missing: ${missing.length}`
-      );
-    }
-
-    // Create a comprehensive watcher that handles all webpack requirements
-    const watcher = new RetriggerWatcher({
-      id: watcherId,
-      files: new Set(files),
-      directories: new Set(dirs),
-      missing: new Set(missing),
-      startTime,
-      options,
-      callback,
-      callbackUndelayed,
-      plugin: this.plugin,
-      verbose: this.options.verbose,
-    });
-
-    this.watchers.set(watcherId, watcher);
-
-    // Initialize the watcher
-    watcher.initialize().catch((error) => {
-      if (this.options.verbose) {
-        console.error(
-          `[Retrigger] Failed to initialize watcher #${watcherId}:`,
-          error
-        );
-      }
-      // Fallback to original file system on error
-      this.originalFs.watch(
-        files,
-        dirs,
-        missing,
+      const session = new WatchSession({
+        plugin: this.plugin,
+        files: toSet(files),
+        directories: toSet(directories),
+        missing: toSet(missing),
         startTime,
-        options,
+        options: options || {},
         callback,
-        callbackUndelayed
-      );
-    });
+        callbackUndelayed,
+      });
+      this.plugin.sessions.add(session);
+      session.begin();
+      return session.handleForWebpack();
+    } catch (err) {
+      this.plugin._degrade(err);
+      return this._delegate(arguments);
+    }
+  }
 
-    // Return watcher with close method
-    return {
-      close: () => {
-        watcher.close();
-        this.watchers.delete(watcherId);
-      },
-      pause: () => watcher.pause(),
-      getContextTimeInfoEntries: () => watcher.getContextTimeInfoEntries(),
-      getFileTimeInfoEntries: () => watcher.getFileTimeInfoEntries(),
-      getInfo: () => watcher.getInfo(),
-    };
+  _delegate(args) {
+    return this.original.watch(...args);
   }
 }
 
 /**
- * Individual watcher instance that handles a specific watch request
- * Implements webpack's watcher interface completely
+ * One webpack watch cycle. webpack calls `watch()` again after every rebuild,
+ * so a session fires its callback at most once and is then discarded.
  */
-class RetriggerWatcher {
+class WatchSession {
   constructor(config) {
-    this.id = config.id;
+    this.plugin = config.plugin;
     this.files = config.files;
     this.directories = config.directories;
     this.missing = config.missing;
@@ -651,210 +393,278 @@ class RetriggerWatcher {
     this.options = config.options;
     this.callback = config.callback;
     this.callbackUndelayed = config.callbackUndelayed;
-    this.plugin = config.plugin;
-    this.verbose = config.verbose;
 
-    this.watcher = null;
-    this.isActive = true;
-    this.isPaused = false;
-    this.fileTimeInfoEntries = new Map();
-    this.contextTimeInfoEntries = new Map();
-    this.removedFiles = new Set();
-    this.changedFiles = new Set();
-    this.eventBuffer = [];
-    this.processingTimeout = null;
+    this.changed = new Set();
+    this.removed = new Set();
+    this.closed = false;
+    this.paused = false;
+    this.fired = false;
+    this.undelayedSent = false;
+    this.timer = null;
+    this.aggregateTimeout = numberOr(
+      this.options.aggregateTimeout,
+      this.plugin.options.aggregateTimeout
+    );
   }
 
-  async initialize() {
-    if (!this.plugin.watcher) {
-      throw new Error('Retrigger watcher not initialized');
-    }
-
-    // Use the plugin's existing watcher
-    this.watcher = this.plugin.watcher;
-
-    // Set up event handling for this specific watcher
-    this.watcher.on('file-changed', (event) => {
-      this.handleFileEvent(event);
-    });
-
-    if (this.verbose) {
-      console.log(`[Retrigger] Watcher #${this.id} initialized successfully`);
-    }
-  }
-
-  handleFileEvent(event) {
-    if (!this.isActive || this.isPaused) return;
-
-    const eventPath = path.resolve(event.path);
-    const isRelevant = this.isRelevantFile(eventPath);
-
-    if (!isRelevant) return;
-
-    // Update time info
-    const timestamp = parseInt(event.timestamp) / 1000000; // Convert nanoseconds to milliseconds
-
-    if (event.event_type === 'deleted') {
-      this.removedFiles.add(eventPath);
-      this.fileTimeInfoEntries.delete(eventPath);
-    } else {
-      this.changedFiles.add(eventPath);
-      this.fileTimeInfoEntries.set(eventPath, {
-        safeTime: timestamp,
-        timestamp: timestamp,
+  begin() {
+    this._registerDirectories();
+    this._adoptPending();
+    if (this.plugin._firstSession) {
+      this.plugin._firstSession = false;
+      // Only the first cycle can miss edits made before the watcher existed.
+      this._scanForStartTimeGap().catch(() => {
+        /* best effort; webpack re-stats anything we do not report */
       });
     }
-
-    // Handle directory changes
-    if (event.is_directory && this.directories.has(eventPath)) {
-      this.contextTimeInfoEntries.set(eventPath, {
-        safeTime: timestamp,
-        timestamp: timestamp,
-      });
-    }
-
-    // Handle missing files that are now created
-    if (event.event_type === 'created' && this.missing.has(eventPath)) {
-      this.missing.delete(eventPath);
-      this.files.add(eventPath);
-    }
-
-    // Buffer events for batch processing
-    this.eventBuffer.push({
-      path: eventPath,
-      type: event.event_type,
-      timestamp,
-      isDirectory: event.is_directory,
-    });
-
-    // Debounce the callback
-    this.scheduleCallback();
   }
 
-  isRelevantFile(filePath) {
-    // Check if file is in our watch list
-    if (this.files.has(filePath)) return true;
+  /**
+   * Directory coverage: every context dependency recursively, plus the parent
+   * of every file and missing entry non-recursively. This mirrors what
+   * Watchpack covers while keeping the descriptor count bounded by webpack's
+   * own dependency set.
+   */
+  _registerDirectories() {
+    for (const dir of this.directories) this.plugin._register(dir, true);
+    const parents = new Set();
+    for (const file of this.files) parents.add(path.dirname(file));
+    for (const file of this.missing) parents.add(path.dirname(file));
+    // Kept for O(1) relevance checks; rebuilt per session because webpack's
+    // dependency set changes between compilations.
+    this.fileParents = parents;
+    for (const parent of parents) {
+      if (this._coveredByDirectory(parent)) continue;
+      this.plugin._register(parent, false);
+    }
+  }
 
-    // Check if file is within watched directories
+  _coveredByDirectory(target) {
     for (const dir of this.directories) {
-      if (filePath.startsWith(dir + path.sep) || filePath === dir) {
-        return true;
-      }
+      if (target === dir || target.startsWith(dir + path.sep)) return true;
     }
-
-    // Check if file is in missing files list
-    if (this.missing.has(filePath)) return true;
-
     return false;
   }
 
-  scheduleCallback() {
-    if (this.processingTimeout) {
-      clearTimeout(this.processingTimeout);
+  /** Replay anything that changed while webpack was compiling. */
+  _adoptPending() {
+    let found = false;
+    for (const target of this.plugin.pendingChanges) {
+      if (!this._isRelevant(target)) continue;
+      this.changed.add(target);
+      found = true;
     }
+    for (const target of this.plugin.pendingRemovals) {
+      if (!this._isRelevant(target)) continue;
+      this.removed.add(target);
+      found = true;
+    }
+    this.plugin.pendingChanges.clear();
+    this.plugin.pendingRemovals.clear();
 
-    this.processingTimeout = setTimeout(() => {
-      this.processEvents();
-    }, this.options.aggregateTimeout || 20);
+    // The sets stopped enumerating at their ceiling, so they are known to be missing paths and
+    // there is no way to tell which. Naming every file webpack depends on turns an unidentifiable
+    // loss into a rebuild: webpack re-stats what it is handed, so an unchanged file costs a stat
+    // and a changed one is no longer missed.
+    if (this.plugin.pendingOverflow) {
+      this.plugin.pendingOverflow = false;
+      for (const target of this.files) this.changed.add(target);
+      if (this.changed.size > 0) found = true;
+    }
+    if (found) this._schedule(0);
   }
 
-  processEvents() {
-    if (!this.isActive || this.eventBuffer.length === 0) return;
+  /**
+   * Stat everything webpack listed and report anything already newer than the
+   * compilation's start time. Without this, an edit landing between webpack
+   * reading a file and the watcher attaching would be lost until the next one.
+   */
+  async _scanForStartTimeGap() {
+    const targets = [...this.files];
+    const limit = 64;
+    let index = 0;
+    let missed = false;
 
-    const changes = this.eventBuffer.slice();
-    this.eventBuffer = [];
-
-    const removedFiles = Array.from(this.removedFiles);
-    const changedFiles = Array.from(this.changedFiles);
-
-    // Clear change sets
-    this.removedFiles.clear();
-    this.changedFiles.clear();
-
-    if (this.verbose) {
-      console.log(
-        `[Retrigger] Watcher #${this.id} processing ${changes.length} events - Changed: ${changedFiles.length}, Removed: ${removedFiles.length}`
-      );
-    }
-
-    // Update plugin performance metrics
-    this.plugin.performanceMetrics.eventsProcessed += changes.length;
-    this.plugin.performanceMetrics.lastEventBatch = changes.length;
-
-    // Call webpack's callback with changes
-    const aggregatedChanges = {
-      changedFiles,
-      removedFiles,
-      changes,
-      startTime: this.startTime,
+    const worker = async () => {
+      while (index < targets.length) {
+        const target = targets[index++];
+        try {
+          const stat = await fsp.stat(target);
+          const timestamp = Math.floor(stat.mtimeMs);
+          this.plugin._track(this.plugin.fileTimeInfo, target, {
+            safeTime: timestamp + 1,
+            timestamp,
+          });
+          if (typeof this.startTime === 'number' && timestamp > this.startTime) {
+            this.changed.add(target);
+            missed = true;
+          }
+        } catch {
+          /* removed underneath us; webpack will notice via `missing` */
+        }
+      }
     };
 
-    // Call immediate callback if provided
-    if (this.callbackUndelayed) {
+    await Promise.all(Array.from({ length: Math.min(limit, targets.length) }, worker));
+    if (missed && !this.closed && !this.fired) this._schedule(0);
+  }
+
+  /**
+   * @param {string} target
+   * @param {object} event
+   * @param {number} time
+   * @returns {boolean} whether this session took responsibility for the event
+   */
+  handle(target, event, time) {
+    if (this.closed || this.paused || this.fired) return false;
+    if (!this._isRelevant(target)) return false;
+
+    if (event.kind === 'deleted') {
+      this.removed.add(target);
+      this.changed.delete(target);
+    } else {
+      this.changed.add(target);
+      this.removed.delete(target);
+    }
+
+    if (!this.undelayedSent && this.callbackUndelayed) {
+      this.undelayedSent = true;
       try {
-        this.callbackUndelayed(null, aggregatedChanges);
-      } catch (error) {
-        console.error('[Retrigger] Error in undelayed callback:', error);
+        this.callbackUndelayed(target, time);
+      } catch (err) {
+        this.plugin._warn(`undelayed callback threw: ${err.message}`);
       }
     }
 
-    // Call main callback
-    if (this.callback) {
-      try {
-        this.callback(null, aggregatedChanges);
-      } catch (error) {
-        console.error('[Retrigger] Error in main callback:', error);
-      }
-    }
+    this._schedule(this.aggregateTimeout);
+    return true;
   }
 
-  pause() {
-    this.isPaused = true;
-    if (this.verbose) {
-      console.log(`[Retrigger] Watcher #${this.id} paused`);
-    }
+  /** Used when the event queue overflowed and state must be re-read. */
+  forceAggregate() {
+    if (this.closed || this.fired) return;
+    this._schedule(0);
   }
 
-  resume() {
-    this.isPaused = false;
-    if (this.verbose) {
-      console.log(`[Retrigger] Watcher #${this.id} resumed`);
+  _isRelevant(target) {
+    if (this.files.has(target) || this.missing.has(target)) return true;
+    for (const dir of this.directories) {
+      if (target === dir || target.startsWith(dir + path.sep)) return true;
+    }
+    // A sibling of a file webpack depends on: newly added source files land
+    // here before they appear in any dependency set.
+    return this.fileParents ? this.fileParents.has(path.dirname(target)) : false;
+  }
+
+  _schedule(delay) {
+    if (this.closed || this.fired) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => this._fire(), Math.max(0, delay));
+  }
+
+  _fire() {
+    this.timer = null;
+    if (this.closed || this.fired) return;
+    if (this.changed.size === 0 && this.removed.size === 0) return;
+    this.fired = true;
+
+    const changed = this.changed;
+    const removed = this.removed;
+    this.changed = new Set();
+    this.removed = new Set();
+
+    // webpack's own NodeWatchFileSystem purges its input cache here; skipping
+    // it would serve stale file contents to the next compilation.
+    const fs = this.plugin.compiler && this.plugin.compiler.inputFileSystem;
+    if (fs && typeof fs.purge === 'function') {
+      for (const item of changed) fs.purge(item);
+      for (const item of removed) fs.purge(item);
+    }
+
+    const started = Date.now();
+    try {
+      this.callback(null, this.plugin.fileTimeInfo, this.plugin.contextTimeInfo, changed, removed);
+      this.plugin.metrics.recordTrigger(Date.now() - started);
+    } catch (err) {
+      // webpack owns this callback; if it throws, the build is already in
+      // trouble and re-throwing here would only lose the reason.
+      this.plugin._warn(`webpack watch callback threw: ${err.message}`);
     }
   }
 
   close() {
-    this.isActive = false;
-
-    if (this.processingTimeout) {
-      clearTimeout(this.processingTimeout);
-      this.processingTimeout = null;
+    if (this.closed) return;
+    this.closed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
     }
+    this.plugin.sessions.delete(this);
+  }
 
-    // Process any remaining events
-    if (this.eventBuffer.length > 0) {
-      this.processEvents();
-    }
-
-    if (this.verbose) {
-      console.log(`[Retrigger] Watcher #${this.id} closed`);
+  pause() {
+    this.paused = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
     }
   }
 
-  getFileTimeInfoEntries() {
-    return this.fileTimeInfoEntries;
-  }
-
-  getContextTimeInfoEntries() {
-    return this.contextTimeInfoEntries;
-  }
-
-  getInfo() {
+  /** @returns {object} the object webpack expects back from `watch()` */
+  handleForWebpack() {
     return {
-      changes: this.eventBuffer.length,
-      changedFiles: this.changedFiles.size,
-      removedFiles: this.removedFiles.size,
+      close: () => this.close(),
+      pause: () => this.pause(),
+      getAggregatedChanges: () => this.changed,
+      getAggregatedRemovals: () => this.removed,
+      getFileTimeInfoEntries: () => this.plugin.fileTimeInfo,
+      getContextTimeInfoEntries: () => this.plugin.contextTimeInfo,
+      getInfo: () => ({
+        changes: this.changed,
+        removals: this.removed,
+        fileTimeInfoEntries: this.plugin.fileTimeInfo,
+        contextTimeInfoEntries: this.plugin.contextTimeInfo,
+      }),
     };
   }
 }
 
+/** Mirrors webpack's own argument validation so misuse fails the same way. */
+function validate(files, directories, missing, startTime, options, callback, callbackUndelayed) {
+  if (!files || typeof files[Symbol.iterator] !== 'function') {
+    throw new Error("Invalid arguments: 'files'");
+  }
+  if (!directories || typeof directories[Symbol.iterator] !== 'function') {
+    throw new Error("Invalid arguments: 'directories'");
+  }
+  if (!missing || typeof missing[Symbol.iterator] !== 'function') {
+    throw new Error("Invalid arguments: 'missing'");
+  }
+  if (typeof callback !== 'function') {
+    throw new Error("Invalid arguments: 'callback'");
+  }
+  if (typeof startTime !== 'number' && startTime) {
+    throw new Error("Invalid arguments: 'startTime'");
+  }
+  if (typeof options !== 'object') {
+    throw new Error("Invalid arguments: 'options'");
+  }
+  if (typeof callbackUndelayed !== 'function' && callbackUndelayed) {
+    throw new Error("Invalid arguments: 'callbackUndelayed'");
+  }
+}
+
+function toSet(iterable) {
+  const set = new Set();
+  for (const item of iterable) set.add(path.resolve(item));
+  return set;
+}
+
+function numberOr(value, fallback) {
+  return Number.isFinite(value) ? value : fallback;
+}
+
 module.exports = RetriggerWebpackPlugin;
+module.exports.RetriggerWebpackPlugin = RetriggerWebpackPlugin;
+module.exports.RetriggerWatchFileSystem = RetriggerWatchFileSystem;
+module.exports.DEFAULT_EXCLUDE = DEFAULT_EXCLUDE;

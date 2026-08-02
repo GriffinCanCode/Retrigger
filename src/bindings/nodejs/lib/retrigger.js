@@ -1,0 +1,298 @@
+'use strict';
+
+const { EventEmitter } = require('events');
+const path = require('path');
+
+const { getEngine, getEngineInfo } = require('./engine');
+const { Metrics } = require('./metrics');
+
+const DEFAULT_POLL_INTERVAL_MS = 5;
+
+/** Contract event kind -> public event name. */
+const KIND_TO_EVENT = {
+  created: 'add',
+  modified: 'change',
+  deleted: 'unlink',
+  renamedFrom: 'unlink',
+  renamedTo: 'add',
+  metadata: 'change',
+};
+
+/**
+ * The public watcher. Wraps an engine (native or JavaScript) that exposes the
+ * poll-based addon contract and turns it into an EventEmitter.
+ *
+ * Emits:
+ *   'add'     (path, event)  file created (or the target half of a rename)
+ *   'change'  (path, event)  file modified or metadata changed
+ *   'unlink'  (path, event)  file deleted (or the source half of a rename)
+ *   'all'     (event)        every event, including directory and rescan events
+ *   'rescan'  (event)        the queue overflowed; re-read state from disk
+ *   'error'   (error)        engine or listener failure; never thrown
+ *   'ready'   ()             emitted once after a successful start()
+ */
+class Retrigger extends EventEmitter {
+  /**
+   * @param {{paths?: string|string[], recursive?: boolean, include?: string[],
+   *   exclude?: string[], debounceMs?: number, capacity?: number,
+   *   pollIntervalMs?: number, engine?: 'auto'|'native'|'javascript',
+   *   emitDirectories?: boolean, unref?: boolean}} [options]
+   */
+  constructor(options = {}) {
+    super();
+    this.options = {
+      recursive: options.recursive !== false,
+      include: options.include || [],
+      exclude: options.exclude || [],
+      debounceMs: options.debounceMs ?? 0,
+      capacity: options.capacity ?? 8192,
+      pollIntervalMs: options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      emitDirectories: options.emitDirectories === true,
+      unref: options.unref === true,
+    };
+
+    this.engine = getEngine({ prefer: options.engine || 'auto' });
+    this.metrics = new Metrics();
+
+    this._watcher = this.engine.createWatcher({
+      capacity: this.options.capacity,
+      debounceMs: this.options.debounceMs,
+      include: this.options.include,
+      exclude: this.options.exclude,
+    });
+
+    this._timer = null;
+    this._draining = false;
+    this._drainQueued = false;
+    this._started = false;
+
+    // The JavaScript engine can nudge us the moment an event lands; the native
+    // engine has no such hook and is served by the interval alone.
+    if (typeof this._watcher.setNotifier === 'function') {
+      this._watcher.setNotifier(() => this._scheduleDrain());
+    }
+
+    const initial = options.paths ?? options.path;
+    if (initial) {
+      for (const p of Array.isArray(initial) ? initial : [initial]) {
+        this.add(p, this.options.recursive);
+      }
+    }
+  }
+
+  /** @returns {boolean} */
+  get isRunning() {
+    return this._started;
+  }
+
+  /**
+   * Register a path. Throws only for genuinely invalid input (bad type, or a
+   * path that does not exist) — the same failure the native engine reports.
+   * @param {string} target
+   * @param {boolean} [recursive]
+   * @returns {this}
+   */
+  add(target, recursive = this.options.recursive) {
+    this._watcher.watch(path.resolve(target), recursive !== false);
+    return this;
+  }
+
+  /** Alias kept because both bundler plugins and the README use `watch()`. */
+  watch(target, recursive) {
+    return this.add(target, recursive);
+  }
+
+  /**
+   * @param {string} target
+   * @returns {this}
+   */
+  unwatch(target) {
+    this._watcher.unwatch(path.resolve(target));
+    return this;
+  }
+
+  /** @returns {this} */
+  start() {
+    if (this._started) return this;
+    this._watcher.start();
+    this._started = true;
+    this.metrics.markStarted();
+    this._timer = setInterval(() => this._drain(), this.options.pollIntervalMs);
+    if (this.options.unref && typeof this._timer.unref === 'function') this._timer.unref();
+    queueMicrotask(() => {
+      if (this._started) this.emit('ready');
+    });
+    return this;
+  }
+
+  /**
+   * Stop watching and release every handle and timer this instance owns.
+   * Safe to call repeatedly and safe to call before `start()`.
+   * @returns {this}
+   */
+  stop() {
+    if (this._timer) {
+      clearInterval(this._timer);
+      this._timer = null;
+    }
+    if (this._started) {
+      try {
+        this._watcher.stop();
+      } catch (err) {
+        this._fail(err);
+      }
+    }
+    this._started = false;
+    this.metrics.markStopped();
+    return this;
+  }
+
+  /** Stop and drop all listeners. */
+  close() {
+    this.stop();
+    this.removeAllListeners();
+    return this;
+  }
+
+  /**
+   * @returns {object} engine queue statistics merged with measured metrics
+   */
+  getStats() {
+    const engineStats = this._watcher.stats();
+    return {
+      engine: this.engine.name,
+      backend: this._watcher.backend(),
+      ...normaliseStats(engineStats),
+      metrics: this.metrics.snapshot(),
+    };
+  }
+
+  /** @returns {object} */
+  getEngineInfo() {
+    return getEngineInfo();
+  }
+
+  /** @returns {string} */
+  getSimdLevel() {
+    return this.engine.getSimdSupport();
+  }
+
+  // ----------------------------------------------------------------- private
+
+  /**
+   * Ask for a drain on the next microtask, with at most one ever outstanding.
+   *
+   * The JavaScript engine notifies once per enqueued event, so a burst across a
+   * large tree would otherwise put one closure per event onto the microtask
+   * queue — which has no bound — for all but the first to wake up and find the
+   * queue already drained. One drain empties the queue regardless of how many
+   * events prompted it, because nothing can enqueue while it runs.
+   */
+  _scheduleDrain() {
+    if (!this._started || this._draining || this._drainQueued) return;
+    this._drainQueued = true;
+    queueMicrotask(() => {
+      this._drainQueued = false;
+      this._drain();
+    });
+  }
+
+  _drain() {
+    if (this._draining || !this._started) return;
+    this._draining = true;
+    try {
+      if (typeof this._watcher.drainErrors === 'function') {
+        for (const err of this._watcher.drainErrors()) this._fail(err);
+      }
+      // Bounded per tick so a flood cannot starve the event loop.
+      for (let i = 0; i < this.options.capacity; i += 1) {
+        const event = this._watcher.poll();
+        if (!event) break;
+        this._dispatch(event);
+      }
+    } catch (err) {
+      this._fail(err);
+    } finally {
+      this._draining = false;
+    }
+  }
+
+  _dispatch(event) {
+    this.metrics.recordEvent(event.kind);
+
+    if (event.kind === 'rescanRequired') {
+      this._safeEmit('rescan', event);
+      this._safeEmit('all', event);
+      return;
+    }
+
+    if (event.isDirectory && !this.options.emitDirectories) {
+      this.metrics.recordFiltered();
+      this._safeEmit('all', event);
+      return;
+    }
+
+    const name = KIND_TO_EVENT[event.kind];
+    if (name) {
+      this.metrics.recordEmitted();
+      this._safeEmit(name, event.path, event);
+    }
+    this._safeEmit('all', event);
+  }
+
+  /**
+   * A throwing listener must not take down the watcher, and must not recurse
+   * into 'error' if it was the 'error' listener that threw.
+   */
+  _safeEmit(name, ...args) {
+    try {
+      this.emit(name, ...args);
+    } catch (err) {
+      if (name === 'error') return;
+      this._fail(err);
+    }
+  }
+
+  _fail(err) {
+    this.metrics.recordError();
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (this.listenerCount('error') > 0) {
+      try {
+        this.emit('error', error);
+      } catch {
+        /* listener threw while handling an error; nothing left to do */
+      }
+    }
+  }
+}
+
+/**
+ * Engines are allowed to return extra keys; the seven contract keys are
+ * normalised so callers see one shape regardless of engine.
+ */
+function normaliseStats(stats = {}) {
+  return {
+    eventsQueued: numberOr(stats.eventsQueued, 0),
+    eventsDropped: numberOr(stats.eventsDropped, 0),
+    eventsDelivered: numberOr(stats.eventsDelivered, 0),
+    watchedPaths: numberOr(stats.watchedPaths, 0),
+    queuePending: numberOr(stats.queuePending, 0),
+    queueCapacity: numberOr(stats.queueCapacity, 0),
+    isRunning: Boolean(stats.isRunning),
+  };
+}
+
+function numberOr(value, fallback) {
+  const n = typeof value === 'bigint' ? Number(value) : Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * @param {object} [options]
+ * @returns {Retrigger}
+ */
+function createRetrigger(options) {
+  return new Retrigger(options);
+}
+
+module.exports = { KIND_TO_EVENT, Retrigger, createRetrigger, normaliseStats };
