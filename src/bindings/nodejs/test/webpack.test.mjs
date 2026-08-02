@@ -128,6 +128,57 @@ describe('webpack 5 integration', () => {
     expect(errors).toEqual([]);
   });
 
+  it('does not rebuild for unrelated activity beside a dependency', async () => {
+    // Node's resolver probes for `package.json` in every directory from the importer up to the
+    // filesystem root, and each miss lands in webpack's `missing` set. Watching the parent of each
+    // one puts a watch on `/`, on the home directory and on `/tmp` — and if any sibling in a
+    // watched directory counts as a dependency, an idle dev server rebuilds all day for other
+    // people's temp files.
+    const project = fixture();
+    const plugin = new RetriggerWebpackPlugin({
+      watchPaths: [project.src],
+      aggregateTimeout: 10,
+    });
+    const compiler = compilerFor(project, plugin);
+
+    const builds = [];
+    // What webpack was told changed, which is the claim under test. Counting rebuilds instead would
+    // also count one provoked by any other path, and the fallback engine forwards a first sighting
+    // of a path it has no digest for on trust — a question this test is not about.
+    const blamed = [];
+    compiler.hooks.watchRun.tap('retrigger-test', (c) => {
+      for (const file of c.modifiedFiles || []) blamed.push(file);
+      for (const file of c.removedFiles || []) blamed.push(file);
+    });
+    const watching = compiler.watch({ aggregateTimeout: 10, poll: false }, (err, stats) => {
+      if (!err) builds.push(stats);
+    });
+    live.add(() => closeWatching(watching, compiler));
+    await waitFor(() => builds.length >= 1, { message: 'initial build' });
+
+    const registered = [...plugin.registered.keys()];
+    const root = path.resolve(project.dir);
+    const above = registered.filter((dir) => dir !== root && root.startsWith(dir + path.sep));
+    expect(above, 'no directory above the project root may be watched').toEqual([]);
+
+    // A file webpack has never heard of, in a directory it does depend on.
+    const sentinel = path.join(project.src, 'live.probe');
+    await waitFor(
+      () => {
+        writeFile(sentinel, `probe ${Date.now()}`);
+        return plugin.fileTimeInfo.has(sentinel);
+      },
+      { timeout: 15000, interval: 50, message: 'watcher delivering events' }
+    );
+    const unrelated = path.join(project.dir, 'unrelated.log');
+    writeFile(unrelated, `noise ${Date.now()}`);
+    await waitForQuiet(() => builds.length, { quietMs: 400, timeout: 4000 });
+    expect(blamed, 'a write webpack does not depend on must not be reported to it').not.toContain(
+      unrelated
+    );
+    expect(blamed, 'nor may the probe beside its sources').not.toContain(sentinel);
+  });
+
   it('still builds when the native engine is unavailable', async () => {
     // The whole point of the fallback: no addon, no behavioural difference.
     const project = fixture();

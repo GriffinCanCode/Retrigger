@@ -145,6 +145,15 @@ class RetriggerWebpackPlugin {
     return !this.degraded;
   }
 
+  /**
+   * The project root, as webpack resolves module paths against it.
+   * @returns {string}
+   */
+  root() {
+    const context = this.compiler && this.compiler.context;
+    return path.resolve(typeof context === 'string' && context ? context : process.cwd());
+  }
+
   /** Lazily create and start the shared watcher. */
   _ensureWatcher() {
     if (this.watcher || this.degraded) return this.watcher;
@@ -435,17 +444,22 @@ class WatchSession {
    * of every file and missing entry non-recursively. This mirrors what
    * Watchpack covers while keeping the descriptor count bounded by webpack's
    * own dependency set.
+   *
+   * With one exception. `missing` is mostly the trail of Node's resolver, which probes for
+   * `package.json` and `node_modules` in every directory from the importer up to the filesystem
+   * root — so registering the parent of each one puts a watch on `/`, on the home directory, and
+   * on `/tmp`. Those are among the busiest directories on any machine, and watching them means a
+   * dev server that nobody is editing still wakes up all day. Every one of them is a strict
+   * ancestor of the project root, and none of them can hold a source file, so they are skipped.
    */
   _registerDirectories() {
     for (const dir of this.directories) this.plugin._register(dir, true);
     const parents = new Set();
     for (const file of this.files) parents.add(path.dirname(file));
     for (const file of this.missing) parents.add(path.dirname(file));
-    // Kept for O(1) relevance checks; rebuilt per session because webpack's
-    // dependency set changes between compilations.
-    this.fileParents = parents;
+    const root = this.plugin.root();
     for (const parent of parents) {
-      if (this._coveredByDirectory(parent)) continue;
+      if (this._coveredByDirectory(parent) || isAboveRoot(parent, root)) continue;
       this.plugin._register(parent, false);
     }
   }
@@ -557,14 +571,22 @@ class WatchSession {
     this._schedule(0);
   }
 
+  /**
+   * A directory is watched so that events for the files webpack named inside it are seen; it is
+   * not a licence to report everything else that happens there. Treating any sibling of a
+   * dependency as relevant made an unrelated write next door — a lockfile, an editor's swap file,
+   * a temp file — indistinguishable from an edit, and rebuilt the project for it.
+   *
+   * A newly created file still gets through the two ways it can matter: as a `missing` entry, when
+   * something already imports the path and the resolver came up empty, and as a member of a
+   * context dependency, which is watched recursively.
+   */
   _isRelevant(target) {
     if (this.files.has(target) || this.missing.has(target)) return true;
     for (const dir of this.directories) {
       if (target === dir || target.startsWith(dir + path.sep)) return true;
     }
-    // A sibling of a file webpack depends on: newly added source files land
-    // here before they appear in any dependency set.
-    return this.fileParents ? this.fileParents.has(path.dirname(target)) : false;
+    return false;
   }
 
   _schedule(delay) {
@@ -663,6 +685,15 @@ function validate(files, directories, missing, startTime, options, callback, cal
   if (typeof callbackUndelayed !== 'function' && callbackUndelayed) {
     throw new Error("Invalid arguments: 'callbackUndelayed'");
   }
+}
+
+/**
+ * @param {string} dir
+ * @param {string} root
+ * @returns {boolean} whether `dir` strictly contains `root`
+ */
+function isAboveRoot(dir, root) {
+  return Boolean(root) && dir !== root && root.startsWith(dir + path.sep);
 }
 
 function toSet(iterable) {
