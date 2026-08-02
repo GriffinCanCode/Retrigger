@@ -1,75 +1,80 @@
-# Rust
-target/
-Cargo.lock
-*.lock
+# Ignore rules are deliberately anchored (leading "/") or path-qualified rather
+# than bare directory names. The previous version ignored "bin/", "lib/", and
+# "obj/" globally, which silently excluded src/daemon/bin/retrigger -- the very
+# file the daemon package declares in its "files" list. Keep patterns specific.
 
-# Build artifacts
-build/
-lib/
-bin/
-obj/
-out/
-dist/
-*/node_modules/*
+# --- Rust ---------------------------------------------------------------
+/target/
+**/target/
 
-# Executables and binaries
-*.exe
+# Cargo.lock IS tracked. This repository ships a binary (the retrigger daemon),
+# and a committed lockfile is what makes its builds reproducible across
+# machines. Do not add it back to this file.
+
+# --- C core -------------------------------------------------------------
+/src/build/
+/src/core/build/
 *.o
-*.so
+*.d
+*.gcda
+*.gcno
+
+# Compiled libraries (sources live in src/core/src, never commit outputs)
 *.a
+*.so
+*.so.*
 *.dylib
 *.dll
-*_benchmark
-*_test
-direct_neon_benchmark
-native_hash_benchmark
-simd_optimized_benchmark
-simple_simd_test
+*.lib
+*.pdb
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# --- Node ---------------------------------------------------------------
+node_modules/
+*.node
+*.tgz
+.npm/
+npm-debug.log*
+.vitest/
+/coverage/
+**/coverage/
 
-# OS
-.DS_Store
-Thumbs.db
+# --- Build outputs ------------------------------------------------------
+/dist/
+**/dist/
+/out/
 
-# Logs
-*.log
-logs/
-
-# Temporary files
+# --- Test scratch -------------------------------------------------------
+/test-output/
+/test-results/
+.tmp/
 *.tmp
-*.temp
-tmp/
-temp/
 
-# Environment
-.env
-.env.local
-
-# Performance and profiling
+# --- Profiling ----------------------------------------------------------
 *.prof
 perf.data*
 flamegraph.svg
+*.profraw
 
-# Test outputs
-test_output/
-test_results/
-
-# Cache directories  
-.cache/
-cache/
-.pytest_cache/
-
-# Backup files
-*.bak
-*.backup
+# --- Editors / OS -------------------------------------------------------
+# Personal editor state stays out, but the two files that describe the project
+# rather than the developer are tracked. The pattern is ".vscode/*" and not
+# ".vscode/" because git will not descend into an excluded directory, and a
+# negation below an excluded directory never matches.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.zed/
+*.swp
+*.swo
+*~
 *.orig
+*.rej
+.DS_Store
+Thumbs.db
 
-# Documentation build
-docs/_build/
-docs/build/
+# --- Logs / env ---------------------------------------------------------
+*.log
+logs/
+.env
+.env.local
