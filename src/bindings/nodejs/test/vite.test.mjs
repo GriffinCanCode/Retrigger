@@ -209,13 +209,47 @@ describe('vite plugin', () => {
     const hashed = () => plugin.api.getStats().watcher.content.filesHashed;
     // Two watchers see this write — Retrigger's and Vite's own chokidar — and both used to reach
     // the module graph, so every save cost two invalidations and two HMR payloads.
+    const edited = normalizePath(project.mod);
     const emitted = [];
     server.watcher.on('change', (file) => emitted.push(file));
     writeFile(project.mod, 'export const n = 11;\n');
 
-    await waitFor(() => emitted.length > 0, { timeout: 10000, message: 'the edit reached Vite' });
+    await waitFor(() => emitted.includes(edited), {
+      timeout: 10000,
+      message: 'the edit reached Vite',
+    });
     await waitForQuiet(hashed, { quietMs: 400, timeout: 5000 });
-    expect(emitted, 'one write, one invalidation').toEqual([normalizePath(project.mod)]);
+    // Counted for the edited path rather than asserted over the whole stream. What is being pinned
+    // down is that one write is reported once; whether some *other* path is mentioned is a question
+    // about the operating system's attribution, which the fallback engine takes on trust and which
+    // this plugin answers separately by hashing.
+    const times = emitted.filter((file) => file === edited).length;
+    expect(times, 'one write, one invalidation').toBe(1);
+  });
+
+  it('keeps watching the roots that exist when one of them does not', async () => {
+    // A typo, or a package nobody checked out. Losing every root over one of them means the whole
+    // feature silently turns itself off for a mistake the message already explains.
+    const project = fixture();
+    const plugin = createRetriggerVitePlugin({
+      engine: 'javascript',
+      watchPaths: [project.dir, path.join(project.dir, 'no-such-directory')],
+    });
+    const server = await startServer(project.dir, [plugin]);
+    live.add(server);
+
+    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started despite a bad root' });
+    const stats = plugin.api.getStats();
+    expect(stats.degraded).toBe(false);
+    expect(stats.roots).toEqual([project.dir]);
+
+    const seen = [];
+    server.watcher.on('change', (file) => seen.push(file));
+    writeFile(project.mod, 'export const n = 5;\n');
+    await waitFor(() => seen.length > 0, {
+      timeout: 10000,
+      message: 'the good root still delivers',
+    });
   });
 
   it('routes a dispatched event through the watcher channel, not a hand-rolled payload', async () => {

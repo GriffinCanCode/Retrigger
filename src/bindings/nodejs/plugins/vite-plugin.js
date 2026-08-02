@@ -204,8 +204,9 @@ function createRetriggerVitePlugin(options = {}) {
 
   function start() {
     if (watcher || degraded || !server) return;
+    let instance = null;
     try {
-      const instance = createRetrigger({
+      instance = createRetrigger({
         include: config.include,
         exclude: config.exclude,
         debounceMs: config.debounceMs,
@@ -248,8 +249,20 @@ function createRetriggerVitePlugin(options = {}) {
         }
       });
 
-      activeRoots = watchRoots();
-      for (const root of activeRoots) instance.add(root, true);
+      // One unwatchable root — a typo, a package nobody checked out, a directory removed since the
+      // config was written — must not cost the other roots their watcher. The webpack plugin
+      // already skips and carries on per directory; only having nothing left to watch is fatal.
+      activeRoots = [];
+      for (const root of watchRoots()) {
+        try {
+          instance.add(root, true);
+          activeRoots.push(root);
+        } catch (err) {
+          warn(`not watching ${root}: ${err.message}`);
+        }
+      }
+      if (activeRoots.length === 0)
+        throw new Error('none of the configured paths could be watched');
       instance.start();
       watcher = instance;
       metrics.markStarted();
@@ -258,6 +271,14 @@ function createRetriggerVitePlugin(options = {}) {
       const info = engineReport();
       log(`engine=${info.engine} backend=${info.backend} hash=${info.hashAlgorithm}`);
     } catch (err) {
+      // The instance may hold an engine handle even though it never started.
+      if (instance && instance !== watcher) {
+        try {
+          instance.close();
+        } catch {
+          /* nothing started, nothing to release */
+        }
+      }
       degrade(err);
     }
   }
@@ -304,7 +325,9 @@ function createRetriggerVitePlugin(options = {}) {
       engine: engineReport(),
       watching: Boolean(watcher),
       degraded,
-      roots: watchRoots(),
+      // What is being watched, which is not always what was asked for: a root that could not be
+      // watched is reported by its absence rather than as though it had been.
+      roots: watcher ? activeRoots : watchRoots(),
       watcher: watcher ? watcher.getStats() : null,
       metrics: metrics.snapshot(),
     };
