@@ -133,6 +133,57 @@ describe('instance surface', () => {
   });
 });
 
+describe('options that came from a config file', () => {
+  /**
+   * Every value here is one somebody writes by accident: a trailing comma, an unset environment
+   * variable, a knob set to zero because zero looked like "no limit". None of them can express an
+   * intention, and none of them may cost the caller a working watcher — the native engine rejects
+   * a glob list outright if one member is not a string, and a capacity of zero would bound the
+   * drain loop to zero events while every counter still reported the watcher healthy.
+   */
+  it('drops list entries that cannot be patterns', () => {
+    const w = core.createRetrigger({
+      engine: 'javascript',
+      include: ['**/*.js', null, undefined, '', 7],
+      exclude: null,
+    });
+    expect(w.options.include).toEqual(['**/*.js']);
+    expect(w.options.exclude).toEqual([]);
+    w.close();
+  });
+
+  it('reads a size of zero as unspecified and a negative duration as none', () => {
+    const w = core.createRetrigger({
+      engine: 'javascript',
+      capacity: 0,
+      pollIntervalMs: -1,
+      debounceMs: -5,
+    });
+    expect(w.options.capacity).toBe(8192);
+    expect(w.options.pollIntervalMs).toBeGreaterThan(0);
+    expect(w.options.debounceMs).toBe(0);
+    // The engine's own queue is sized the same way; the two must not disagree, because the drain
+    // loop is bounded by one of them and the queue by the other.
+    expect(w.getStats().queueCapacity).toBe(w.options.capacity);
+    w.close();
+  });
+
+  it('still honours the values a careful caller passes', () => {
+    const w = core.createRetrigger({
+      engine: 'javascript',
+      capacity: 64,
+      pollIntervalMs: 25,
+      debounceMs: 30,
+      include: ['src/**'],
+    });
+    expect(w.options.capacity).toBe(64);
+    expect(w.options.pollIntervalMs).toBe(25);
+    expect(w.options.debounceMs).toBe(30);
+    expect(w.options.include).toEqual(['src/**']);
+    w.close();
+  });
+});
+
 describe('package manifest', () => {
   it('ships every file the exports map points at', () => {
     const targets = new Set();

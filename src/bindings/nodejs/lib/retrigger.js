@@ -9,6 +9,7 @@ const { getEngine, getEngineInfo } = require('./engine');
 const { Metrics } = require('./metrics');
 
 const DEFAULT_POLL_INTERVAL_MS = 5;
+const DEFAULT_CAPACITY = 8192;
 
 /** Contract event kind -> public event name. */
 const KIND_TO_EVENT = {
@@ -51,11 +52,15 @@ class Retrigger extends EventEmitter {
     super();
     this.options = {
       recursive: options.recursive !== false,
-      include: options.include || [],
-      exclude: options.exclude || [],
-      debounceMs: options.debounceMs ?? 0,
-      capacity: options.capacity ?? 8192,
-      pollIntervalMs: options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      include: patterns(options.include),
+      exclude: patterns(options.exclude),
+      debounceMs: atLeast(options.debounceMs, 0),
+      // Both engines already read a non-positive capacity as "unspecified" and size their queue at
+      // the default. This has to agree with them: the drain loop is bounded by the value kept here,
+      // and a literal 0 would bound it to zero iterations — a watcher that runs, reports itself
+      // healthy, and delivers nothing.
+      capacity: positiveOr(options.capacity, DEFAULT_CAPACITY),
+      pollIntervalMs: positiveOr(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS),
       emitDirectories: options.emitDirectories === true,
       unref: options.unref === true,
       contentHashing: options.contentHashing !== false,
@@ -338,6 +343,42 @@ function normaliseStats(stats = {}) {
 function numberOr(value, fallback) {
   const n = typeof value === 'bigint' ? Number(value) : Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * Glob lists arrive from user configuration, where an unset variable is `undefined` and a disabled
+ * entry is `null`. Neither expresses a pattern, and neither is worth losing a watcher over: the
+ * native engine rejects the whole list if one member is not a string, which turns a stray comma
+ * into a silent fallback to the bundler's own watcher.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function patterns(value) {
+  if (typeof value === 'string') return value ? [value] : [];
+  if (!Array.isArray(value)) return [];
+  return value.filter((p) => typeof p === 'string' && p.length > 0);
+}
+
+/**
+ * A duration where zero is a meaningful answer: clamped up, never replaced.
+ * @param {unknown} value
+ * @param {number} floor
+ * @returns {number}
+ */
+function atLeast(value, floor) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > floor ? n : floor;
+}
+
+/**
+ * A size where zero means nothing at all, and is therefore read as "not specified".
+ * @param {unknown} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function positiveOr(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 /**
