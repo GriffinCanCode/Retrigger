@@ -470,10 +470,7 @@ fn burst_writes(root: &Path, count: usize) -> JoinHandle<()> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         for index in 0..count {
-            let _ = std::fs::write(
-                root.join(format!("burst-{index}.txt")),
-                index.to_le_bytes(),
-            );
+            let _ = std::fs::write(root.join(format!("burst-{index}.txt")), index.to_le_bytes());
         }
     })
 }
@@ -491,7 +488,10 @@ async fn toxic_paths_and_oversized_bodies_are_refused_without_taking_the_daemon_
         format!("{{\"path\":{overlong:?}}}"),
         r#"{"path":"../../../../../../etc/passwd"}"#.to_owned(),
         r#"{"path":"/tmp/has\u0000nul"}"#.to_owned(),
-        format!("{{\"path\":\"/tmp\",\"junk\":\"{}\"}}", "x".repeat(256 * 1024)),
+        format!(
+            "{{\"path\":\"/tmp\",\"junk\":\"{}\"}}",
+            "x".repeat(256 * 1024)
+        ),
         format!("{{\"path\":\"{}\"", "\"".repeat(1024)), // truncated, never closes
     ];
     for body in &toxic_bodies {
@@ -583,7 +583,9 @@ async fn a_subscriber_that_never_reads_cannot_stall_the_daemon() -> Result<()> {
         )
         .await?;
     deadbeat.flush().await?;
-    harness.await_subscribers(1, Duration::from_secs(10)).await?;
+    harness
+        .await_subscribers(1, Duration::from_secs(10))
+        .await?;
 
     // Enough events to overflow the 64-slot client buffer several times over.
     let writer = burst_writes(harness.dir.path(), 500);
