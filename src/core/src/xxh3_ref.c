@@ -46,11 +46,21 @@ const uint8_t rtr_xxh3_ksecret[RTR_SECRET_DEFAULT_SIZE] = {
 #define RTR_BIG_ENDIAN 1
 #endif
 
+/* MSVC has no __builtin_bswap; its spelling lives in <stdlib.h>. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <stdlib.h>
+#define RTR_BSWAP32(v) _byteswap_ulong(v)
+#define RTR_BSWAP64(v) _byteswap_uint64(v)
+#else
+#define RTR_BSWAP32(v) __builtin_bswap32(v)
+#define RTR_BSWAP64(v) __builtin_bswap64(v)
+#endif
+
 static inline uint32_t rtr_read32le(const uint8_t *p) {
     uint32_t v;
     memcpy(&v, p, sizeof v);
 #ifdef RTR_BIG_ENDIAN
-    v = __builtin_bswap32(v);
+    v = RTR_BSWAP32(v);
 #endif
     return v;
 }
@@ -59,20 +69,20 @@ static inline uint64_t rtr_read64le(const uint8_t *p) {
     uint64_t v;
     memcpy(&v, p, sizeof v);
 #ifdef RTR_BIG_ENDIAN
-    v = __builtin_bswap64(v);
+    v = RTR_BSWAP64(v);
 #endif
     return v;
 }
 
 static inline void rtr_write64le(uint8_t *p, uint64_t v) {
 #ifdef RTR_BIG_ENDIAN
-    v = __builtin_bswap64(v);
+    v = RTR_BSWAP64(v);
 #endif
     memcpy(p, &v, sizeof v);
 }
 
-static inline uint32_t rtr_swap32(uint32_t v) { return __builtin_bswap32(v); }
-static inline uint64_t rtr_swap64(uint64_t v) { return __builtin_bswap64(v); }
+static inline uint32_t rtr_swap32(uint32_t v) { return RTR_BSWAP32(v); }
+static inline uint64_t rtr_swap64(uint64_t v) { return RTR_BSWAP64(v); }
 
 static inline uint64_t rtr_rotl64(uint64_t v, unsigned r) {
     return (v << r) | (v >> (64 - r));

@@ -116,6 +116,12 @@ fn main() {
 
     let base = |b: &mut cc::Build| {
         b.include(&include).opt_level(3).warnings(false);
+        // MSVC compiles as C89 unless told otherwise, and the headers assert their ABI with
+        // _Static_assert. Without this the layout checks read as a function declaration and the
+        // build fails on the very lines that exist to keep Rust and C agreeing.
+        if is_msvc {
+            b.flag("/std:c11");
+        }
         for d in &disabled {
             b.define(d, "0");
         }

@@ -19,6 +19,8 @@
 #define RTR_X86 1
 #if defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
+#else
+#include <intrin.h>
 #endif
 #endif
 
@@ -39,12 +41,35 @@ typedef _Atomic int rtr_atomic_int;
 #ifdef RTR_X86
 /* XCR0 bits: 1 = SSE state, 2 = YMM state, 5..7 = opmask/ZMM_hi256/hi16_ZMM. */
 static uint64_t rtr_xgetbv0(void) {
+#if defined(__GNUC__) || defined(__clang__)
     uint32_t eax, edx;
     /* Encoded by hand so this TU never needs -mxsave. */
     __asm__ __volatile__(".byte 0x0f, 0x01, 0xd0"
                          : "=a"(eax), "=d"(edx)
                          : "c"(0));
     return ((uint64_t)edx << 32) | eax;
+#else
+    return _xgetbv(0);
+#endif
+}
+
+/*
+ * One spelling of CPUID for both toolchains, with GCC's out-of-range contract:
+ * 0 when the leaf does not exist. MSVC's __cpuidex has no such check and would
+ * hand back another leaf's registers, which here would mean inventing AVX-512
+ * support out of whatever leaf 7 aliased to.
+ */
+static int rtr_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t regs[4]) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __get_cpuid_count(leaf, subleaf, &regs[0], &regs[1], &regs[2], &regs[3]);
+#else
+    int info[4];
+    __cpuid(info, (int)(leaf & 0x80000000u));
+    if ((uint32_t)info[0] < leaf) return 0;
+    __cpuidex(info, (int)leaf, (int)subleaf);
+    for (int i = 0; i < 4; i++) regs[i] = (uint32_t)info[i];
+    return 1;
+#endif
 }
 #endif
 
@@ -62,12 +87,12 @@ static uint32_t rtr_detect_levels(void) {
 #endif
 #if RTR_ENABLE_AVX2 || RTR_ENABLE_AVX512
     {
-        uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+        uint32_t regs[4] = {0, 0, 0, 0};
         int have_osxsave = 0, have_avx = 0;
 
-        if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-            have_osxsave = (ecx & (1u << 27)) != 0;
-            have_avx = (ecx & (1u << 28)) != 0;
+        if (rtr_cpuid(1, 0, regs)) {
+            have_osxsave = (regs[2] & (1u << 27)) != 0;
+            have_avx = (regs[2] & (1u << 28)) != 0;
         }
         /* OSXSAVE plus the XCR0 bits: the CPU can have AVX while the kernel
          * has not enabled the register state, and using it then is a SIGILL. */
@@ -76,16 +101,16 @@ static uint32_t rtr_detect_levels(void) {
             int const ymm_ok = (xcr0 & 0x6u) == 0x6u;
             int const zmm_ok = (xcr0 & 0xE6u) == 0xE6u;
 
-            eax = ebx = ecx = edx = 0;
-            if (ymm_ok && __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+            regs[0] = regs[1] = regs[2] = regs[3] = 0;
+            if (ymm_ok && rtr_cpuid(7, 0, regs)) {
 #if RTR_ENABLE_AVX2
-                if (ebx & (1u << 5))
+                if (regs[1] & (1u << 5))
                     mask |= 1u << RTR_SIMD_AVX2;
 #endif
 #if RTR_ENABLE_AVX512
                 /* AVX-512F plus BW, matching what the kernel TU is built with.
                  */
-                if (zmm_ok && (ebx & (1u << 16)) && (ebx & (1u << 30)))
+                if (zmm_ok && (regs[1] & (1u << 16)) && (regs[1] & (1u << 30)))
                     mask |= 1u << RTR_SIMD_AVX512;
 #else
                 (void)zmm_ok;

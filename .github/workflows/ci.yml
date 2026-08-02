@@ -152,6 +152,13 @@ jobs:
     container:
       image: node:22-alpine
     steps:
+      # Before the checkout, deliberately. Without git in the image the action
+      # falls back to the REST tarball, which is `git archive` and therefore
+      # honours the export-ignore rules in .gitattributes -- so this job alone
+      # would run against a tree missing tools/benchmarks and fail on the
+      # scripts-point-at-real-files check for a reason that is not a defect.
+      - name: Install git so the checkout is a clone, not an export
+        run: apk add --no-cache git
       - uses: actions/checkout@v7
       - name: Install toolchain
         run: apk add --no-cache build-base clang clang-dev llvm-dev rust cargo make bash python3
@@ -205,11 +212,15 @@ jobs:
       - name: Remove this package's native artifacts
         run: find . -name '*.node' -not -path './node_modules/*' -print -delete
         working-directory: src/bindings/nodejs
+      # Deliberately without RETRIGGER_FORCE_JS. The absent binary above is the
+      # real condition being proved; the environment override is a different
+      # guarantee, is covered in loader.test.mjs, and setting it here also
+      # disabled the mock addon that the parity suite installs to exercise the
+      # native path -- so those tests failed asking for an engine this job had
+      # forbidden. `parity-native.test.mjs` skips itself when no addon exists.
       - name: Suite must pass with no addon
         run: npm test
         working-directory: src/bindings/nodejs
-        env:
-          RETRIGGER_FORCE_JS: '1'
 
   # ------------------------------------------------------------------- MSRV
   msrv:

@@ -155,6 +155,15 @@ async fn raw_post_json(address: SocketAddr, path: &str, body: &str) -> Result<Ht
 ///
 /// Speaks HTTP/1.1 by hand because this is a streaming response: the shipped client only knows
 /// how to read a response that ends.
+/// Read server-sent events until `wanted` file `change` payloads have arrived or the budget
+/// expires.
+///
+/// Events for directories are read past rather than counted. The watch root is itself a directory
+/// inside the temp tree, and the backends report structural changes to it — on macOS, FSEvents
+/// delivers a `Modified` and a `Metadata` for the root within milliseconds of the watch being
+/// installed. Counting those would end a one-event read before the test that spawned it had
+/// looked at the subscriber count even once, which is exactly the failure this replaced: a
+/// subscriber that connected, was served, and left, all between two polls.
 async fn stream_events(address: SocketAddr, wanted: usize, budget: Duration) -> Result<Vec<Value>> {
     let mut stream = TcpStream::connect(address).await?;
     stream
@@ -185,6 +194,9 @@ async fn stream_events(address: SocketAddr, wanted: usize, budget: Duration) -> 
         for line in buffered.lines() {
             if let Some(payload) = line.strip_prefix("data: ") {
                 if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                    if value["event"]["is_directory"] == Value::Bool(true) {
+                        continue;
+                    }
                     events.push(value);
                 }
             }
