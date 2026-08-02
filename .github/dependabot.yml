@@ -1,0 +1,66 @@
+version: 2
+
+# Three ecosystems live in this tree and each has its own manifest location.
+# Grouping is used heavily on purpose: an ungrouped watcher project produces a
+# steady drip of single-crate PRs, every one of which has to re-run a nine-cell
+# OS/arch/Node matrix. Batched updates cost one matrix run instead of ten.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      rust-patch-and-minor:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: 'deps(rust)'
+    # Major bumps still arrive as individual PRs; they can move the MSRV.
+
+  - package-ecosystem: npm
+    directory: /src/bindings/nodejs
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      js-dev-dependencies:
+        dependency-type: development
+        update-types: [minor, patch]
+    commit-message:
+      prefix: 'deps(node)'
+    ignore:
+      # The platform packages are republished by the release workflow in
+      # lockstep with the parent version. Dependabot bumping one of them alone
+      # would produce a combination that was never built.
+      - dependency-name: '@retrigger/core-*'
+
+  - package-ecosystem: npm
+    directory: /src/daemon
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: 'deps(daemon)'
+    ignore:
+      - dependency-name: '@retrigger/daemon-*'
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ['*']
+    commit-message:
+      prefix: 'deps(ci)'
+
+  - package-ecosystem: docker
+    directory: /deploy/docker
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: 'deps(docker)'

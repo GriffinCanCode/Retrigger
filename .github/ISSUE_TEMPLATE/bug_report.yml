@@ -1,0 +1,111 @@
+name: Bug report
+description: Something behaves differently than documented
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        A file watcher fails in ways that depend heavily on the platform, the
+        filesystem, and the editor doing the writing. The environment fields
+        below are what make a report reproducible rather than a guess.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: >
+        Smallest sequence that shows it. A repository link beats a description.
+      placeholder: |
+        1. npm install @retrigger/core
+        2. watch ./src with { ... }
+        3. save a file in an editor that writes atomically
+        4. no change event arrives
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Where does it surface
+      options:
+        - JavaScript API (@retrigger/core)
+        - webpack plugin
+        - vite plugin
+        - Standalone daemon (@retrigger/daemon)
+        - Native addon fails to load / install
+        - Hash values look wrong
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: macOS 15.5 arm64 / Ubuntu 24.04 x64 / Windows 11 x64 / Alpine 3.20
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      placeholder: 'node --version'
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Retrigger version
+      placeholder: '@retrigger/core 2.0.0'
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Native addon or JavaScript fallback
+      description: >
+        The package logs which engine it selected on load. If you are unsure,
+        run with RETRIGGER_DEBUG=1 and paste the first lines below.
+      options:
+        - Native addon
+        - JavaScript fallback
+        - Unknown
+    validations:
+      required: true
+
+  - type: input
+    id: filesystem
+    attributes:
+      label: Filesystem and path
+      description: >
+        Network mounts, Docker bind mounts on macOS or Windows, and WSL paths
+        change which kernel notifications arrive at all.
+      placeholder: APFS local / ext4 in Docker bind mount / SMB share / WSL2 /mnt/c
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output with RETRIGGER_DEBUG=1 set. Automatically formatted.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues
+          required: true
+        - label: I am on the latest release, or I said above why I cannot be
+          required: true

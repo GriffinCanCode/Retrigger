@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose a capability that does not exist yet
+labels: [enhancement, needs-triage]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you unable to do today? Describe the situation, not the API
+        you have in mind — the best solution is often not the one requested.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: Sketch the API or behaviour if you have one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >
+        Workarounds, other libraries, or why the existing options fall short.
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer
+      options:
+        - JavaScript API / plugins
+        - Rust watcher or daemon
+        - C hash engine
+        - Packaging and distribution
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints this has to respect
+      description: >
+        Check any that your proposal would touch, so the tradeoff is on the
+        table from the start.
+      options:
+        - label: >-
+            Would change hash output or the IPC/on-disk format (a cache key
+            that changes silently is a stale build that looks fresh)
+        - label: Would add a runtime dependency
+        - label: Would only work on some platforms
+        - label: Would require the native addon (no JavaScript fallback)

@@ -1,0 +1,17 @@
+# Every path has an owner so that a review request is never routed to nobody.
+# The later match wins, so the catch-all goes first.
+
+*                           @GriffinCanCode
+
+# The C hash engine is the correctness core: its output is a cache key, and a
+# wrong byte there is a stale build that looks fresh.
+/src/core/                  @GriffinCanCode
+
+# The published surface. Changing these changes what users install.
+/src/bindings/nodejs/package.json  @GriffinCanCode
+/src/daemon/package.json           @GriffinCanCode
+/Cargo.toml                        @GriffinCanCode
+
+# Release and CI plumbing.
+/.github/workflows/         @GriffinCanCode
+/deploy/                    @GriffinCanCode

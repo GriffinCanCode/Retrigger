@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or usage help
+    url: https://github.com/GriffinCanCode/Retrigger/discussions
+    about: >-
+      Setup help, "is this the right tool", and integration questions. Faster
+      than an issue, and the answer stays searchable.
+  - name: Security vulnerability
+    url: https://github.com/GriffinCanCode/Retrigger/security/advisories/new
+    about: >-
+      Report privately. Do not open a public issue for a vulnerability.
