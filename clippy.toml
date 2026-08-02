@@ -1,0 +1,9 @@
+# Keep clippy's suggestions inside the MSRV the workspace advertises. Without
+# this, clippy proposes rewrites using APIs newer than rust-version = "1.75",
+# and CI's `-D warnings` turns that suggestion into a failure the MSRV job then
+# contradicts.
+msrv = "1.75"
+
+# A file watcher walks paths constantly; the default threshold flags the
+# recursive descent helpers without saying anything useful about them.
+too-many-arguments-threshold = 8

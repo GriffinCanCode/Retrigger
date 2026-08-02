@@ -1,0 +1,10 @@
+# Deliberately close to rustfmt's defaults. `cargo fmt --all -- --check` is a
+# required CI gate, so every option added here has to be one the existing tree
+# already satisfies -- otherwise the first effect of this file is a red build
+# and a reformat commit that buries the next real diff.
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+hard_tabs = false
+newline_style = "Unix"
+use_small_heuristics = "Default"

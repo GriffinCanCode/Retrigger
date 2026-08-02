@@ -1,0 +1,20 @@
+# Intentionally free of [build] rustflags. This crate graph compiles a C hash
+# engine with runtime SIMD dispatch; a repo-wide -C target-cpu would let the
+# compiler emit AVX2 into the dispatcher itself, and the binary would then
+# crash on the machine it was shipped to instead of falling back.
+
+[alias]
+# The same commands CI runs, so a local check and a red build mean the same
+# thing.
+lint = "clippy --workspace --all-targets -- -D warnings"
+fmt-check = "fmt --all -- --check"
+t = "test --workspace"
+xtest = "test --workspace --release"
+
+[term]
+color = "auto"
+
+[net]
+# Uses the system git, which picks up the user's existing credentials and
+# proxy configuration rather than requiring a second setup.
+git-fetch-with-cli = true
