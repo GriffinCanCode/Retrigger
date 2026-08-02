@@ -122,6 +122,13 @@ Everything the daemon exposes is on one port (`9090` by default, loopback only).
   fingerprints.
 - **`POST /shutdown`** — shuts down gracefully, and is what `retrigger stop` calls.
 
+A path sent to `/watch` or `/unwatch` must be absolute and must name its target directly: a
+`.` or `..` component earns a 400 rather than being resolved. This is a rule about how a
+request is phrased, not a confinement boundary — any absolute path the daemon's user can read
+is still watchable, so keep the bind address in mind. Roots configured in
+`[[watcher.paths]]` are resolved relative to the working directory as before; the rule applies
+only to what arrives over the network.
+
 An event on `/events` looks like this.
 
 ```

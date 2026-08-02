@@ -30,6 +30,10 @@ machine it was built on.
   is native Rust over `notify`, and `zig` is no longer a build dependency.
 - The gRPC and IPC surfaces and the `src-js` modules are removed.
 - The daemon configuration schema has changed.
+- `POST /watch` and `POST /unwatch` now require an absolute path that names its
+  target directly; a `.` or `..` component is answered with a 400 instead of
+  being resolved. Roots configured in `[[watcher.paths]]` are unaffected, as is
+  every in-process caller of the `retrigger-system` API.
 
 ### Added
 

@@ -11,6 +11,12 @@
  * into the cross-platform build.
  */
 
+/* Before any include. The suite builds with -std=c11, which defines
+ * __STRICT_ANSI__ and so stops glibc from declaring `symlink` -- an implicit
+ * declaration, and therefore an error under -Werror. macOS declares it either
+ * way, which is why this only ever failed on Linux. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "rtr_test.h"
 
 #if defined(_WIN32)
@@ -29,7 +35,11 @@ int main(void) {
 #include <sys/stat.h>
 #include <unistd.h>
 
-static char g_dir[512];
+/* Deliberately a quarter of the buffers built from it below, so that
+ * "<g_dir>/<name>" provably fits and -Wformat-truncation has nothing to
+ * report. A temp directory needing more than 255 bytes is not a case worth
+ * carrying warning suppressions for. */
+static char g_dir[256];
 
 static void path_in(char *out, size_t cap, const char *name) {
     snprintf(out, cap, "%s/%s", g_dir, name);
@@ -140,10 +150,7 @@ int main(void) {
     printf("test_file_adversarial\n");
 
     {
-        const char *tmp = getenv("TMPDIR");
-        if (tmp == NULL || tmp[0] == '\0')
-            tmp = "/tmp";
-        snprintf(g_dir, sizeof g_dir, "%s/rtr_file_adv_%ld", tmp,
+        snprintf(g_dir, sizeof g_dir, "%s/rtr_file_adv_%ld", rtr_test_tmpdir(),
                  (long)getpid());
         if (mkdir(g_dir, 0755) != 0 && errno != EEXIST) {
             fprintf(stderr, "test_file_adversarial: could not create %s: %s\n",

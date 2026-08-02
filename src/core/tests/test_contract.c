@@ -128,8 +128,12 @@ static void null_with_length_aborts(void) {
     pid_t const pid = fork();
     if (pid == 0) {
         /* Child: silence stderr, then make the forbidden call. If it returns,
-         * exit 0 so the parent sees the contract was violated. */
-        freopen("/dev/null", "w", stderr);
+         * exit 0 so the parent sees the contract was violated. glibc marks
+         * freopen warn_unused_result, and a bare (void) cast does not satisfy
+         * it, so the result is bound before it is discarded. Failing to
+         * silence stderr only makes the output noisier, never wrong. */
+        FILE *const devnull = freopen("/dev/null", "w", stderr);
+        (void)devnull;
         volatile uint64_t sink = rtr_hash64(NULL, 8);
         (void)sink;
         _exit(0);

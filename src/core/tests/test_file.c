@@ -190,11 +190,9 @@ static void file_hash_agrees_across_levels(void) {
 }
 
 int main(void) {
-    const char *tmp = getenv("TMPDIR");
-
     printf("test_file\n");
-    if (tmp == NULL || tmp[0] == '\0') tmp = "/tmp";
-    snprintf(g_dir, sizeof g_dir, "%s/rtr_hash_test_%d", tmp, (int)rtr_getpid());
+    snprintf(g_dir, sizeof g_dir, "%s/rtr_hash_test_%d", rtr_test_tmpdir(),
+             (int)rtr_getpid());
     if (rtr_mkdir(g_dir) != 0 && errno != EEXIST) {
         fprintf(stderr, "cannot create %s: %s\n", g_dir, strerror(errno));
         return 1;

@@ -113,7 +113,7 @@ fn every_file_of_a_burst_into_a_new_directory_is_reported() {
             "round {round}: {} of {FILES} files written into a brand-new directory were lost \
              silently. missing (first 5): {:?}",
             missing.len(),
-            &missing.iter().take(5).collect::<Vec<_>>()
+            missing.iter().take(5).collect::<Vec<_>>()
         );
     }
 }

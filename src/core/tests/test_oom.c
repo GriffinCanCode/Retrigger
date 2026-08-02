@@ -80,10 +80,8 @@ static void rtr_oom_disarm(void) { rtr_oom_countdown = -1; }
 static char g_fixture[600];
 
 static void rtr_init_fixture_path(void) {
-    const char *tmp = getenv("TMPDIR");
-
-    if (tmp == NULL || tmp[0] == '\0') tmp = "/tmp";
-    snprintf(g_fixture, sizeof g_fixture, "%s/rtr_oom_%d.bin", tmp, (int)rtr_getpid());
+    snprintf(g_fixture, sizeof g_fixture, "%s/rtr_oom_%d.bin", rtr_test_tmpdir(),
+             (int)rtr_getpid());
 }
 
 static const char *rtr_temp_path(void) { return g_fixture; }

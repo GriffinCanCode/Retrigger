@@ -198,8 +198,13 @@ jobs:
           cache-dependency-path: src/bindings/nodejs/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: src/bindings/nodejs
-      - name: Remove any native artifacts
-        run: find . -name '*.node' -delete
+      # Scoped to this package's own artifacts. The unqualified sweep this
+      # replaces also deleted node_modules/@rollup/*/rollup.*.node, and vitest
+      # loads its config through vite, so the suite died at startup with
+      # MODULE_NOT_FOUND instead of proving anything about the fallback.
+      - name: Remove this package's native artifacts
+        run: find . -name '*.node' -not -path './node_modules/*' -print -delete
+        working-directory: src/bindings/nodejs
       - name: Suite must pass with no addon
         run: npm test
         working-directory: src/bindings/nodejs

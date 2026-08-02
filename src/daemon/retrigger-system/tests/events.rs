@@ -387,7 +387,7 @@ fn rapid_churn_either_reports_everything_or_asks_for_a_rescan() {
         "{} of {FILES} files produced no event and no rescan was requested; \
          silent loss is the one outcome that is not allowed. missing (first 5): {:?}",
         missing.len(),
-        &missing.iter().take(5).collect::<Vec<_>>()
+        missing.iter().take(5).collect::<Vec<_>>()
     );
 
     let stats = watcher.stats();

@@ -101,6 +101,37 @@ static inline int rtr_report_(const char *suite) {
 /* ------------------------------------------------------------ fixtures */
 
 /*
+ * A directory this process may create fixture files in.
+ *
+ * Windows has no /tmp and does not set TMPDIR -- it sets TEMP and TMP -- so a
+ * bare `getenv("TMPDIR")` with a "/tmp" fallback resolves to a path that cannot
+ * be opened there, and every case needing a fixture fails for a reason that has
+ * nothing to do with hashing. TMPDIR is checked last on Windows rather than
+ * first because under MSYS it can hold an MSYS path that a native binary built
+ * by mingw cannot resolve.
+ *
+ * Mixed separators in the result are deliberate and fine: Win32 accepts '/'.
+ */
+static inline const char *rtr_test_tmpdir(void) {
+    static const char *const vars[] = {
+#if defined(_WIN32)
+        "TEMP", "TMP", "TMPDIR"
+#else
+        "TMPDIR", "TMP"
+#endif
+    };
+    for (size_t i = 0; i < sizeof vars / sizeof *vars; i++) {
+        const char *const value = getenv(vars[i]);
+        if (value != NULL && value[0] != '\0') return value;
+    }
+#if defined(_WIN32)
+    return ".";
+#else
+    return "/tmp";
+#endif
+}
+
+/*
  * The xxHash sanity-check byte generator: an LCG seeded with PRIME32_1, taking
  * the high byte of each state. Reference vectors in test_vectors.c are tied to
  * this exact sequence, so it must not change.

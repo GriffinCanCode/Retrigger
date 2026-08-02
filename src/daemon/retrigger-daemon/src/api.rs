@@ -24,7 +24,7 @@
 //! the daemon's user can read, and can read the change stream of everything it watches.
 
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -162,10 +162,58 @@ async fn events(State(daemon): State<Arc<Daemon>>) -> impl IntoResponse {
     Sse::new(ReceiverStream::new(stream)).keep_alive(KeepAlive::default())
 }
 
+/// The shape a path must have to be accepted over HTTP.
+///
+/// This is the daemon's trust boundary: the library beneath takes whatever the program embedding
+/// it asks for, because that caller is already trusted, while this surface accepts JSON from
+/// anything that can reach the port. So the vetting lives here and not in `retrigger-system`,
+/// which would break an in-process caller's perfectly reasonable `watch("./src")`.
+///
+/// The rule is lexical on purpose — absolute, and no `.` or `..` components — so it gives the
+/// same answer on every platform and needs no I/O. It deliberately does *not* require the path
+/// to equal its canonical form: on macOS a temporary directory is reached through `/var`, which
+/// is a symlink to `/private/var`, and rejecting that would refuse ordinary paths.
+///
+/// A traversal expression is refused because a request naming `../../../etc/passwd` is a request
+/// whose author does not know what they are asking for. This is not a confinement boundary and
+/// does not pretend to be one: an absolute path is still accepted, so this narrows the ways to
+/// say a thing, not the things that can be said. Confinement, if it is ever wanted, belongs in
+/// configuration next to `bind_address`.
+fn vet(path: &Path) -> Result<(), ApiError> {
+    let refuse = |reason: &str| {
+        Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            error: format!("{}: {reason}", path.display()),
+        })
+    };
+
+    // A NUL can never appear in a real path, and without this it reaches the filesystem call and
+    // comes back as an unclassified error — a 500 for what is plainly a bad request.
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return refuse("a watch path must not contain a NUL byte");
+    }
+    if !path.is_absolute() {
+        return refuse("a watch path must be absolute");
+    }
+    // Scanning the raw segments rather than `Path::components`, which quietly folds away a `.`
+    // and so would report a path free of the very thing being looked for.
+    let separators: &[u8] = if cfg!(windows) { b"/\\" } else { b"/" };
+    if path
+        .as_os_str()
+        .as_encoded_bytes()
+        .split(|byte| separators.contains(byte))
+        .any(|segment| segment == b"." || segment == b"..")
+    {
+        return refuse("a watch path must name its target directly: '.' and '..' are not accepted");
+    }
+    Ok(())
+}
+
 async fn watch(
     State(daemon): State<Arc<Daemon>>,
     Json(request): Json<WatchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    vet(&request.path)?;
     daemon.watch(&request.path, request.recursive)?;
     Ok(Json(json!({ "watched": daemon.stats().watched })))
 }
@@ -174,6 +222,7 @@ async fn unwatch(
     State(daemon): State<Arc<Daemon>>,
     Json(request): Json<UnwatchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    vet(&request.path)?;
     daemon.unwatch(&request.path)?;
     Ok(Json(json!({ "watched": daemon.stats().watched })))
 }
@@ -476,5 +525,48 @@ mod tests {
             "a misspelled key must not silently mean the default"
         );
         assert!(serde_json::from_str::<WatchRequest>("{}").is_err());
+    }
+
+    #[test]
+    fn a_watch_path_must_name_its_target_directly() {
+        // What counts as absolute is the platform's business, so the accepted shapes differ.
+        let accepted: &[&str] = if cfg!(windows) {
+            &[r"C:\Windows\Temp", r"C:\a\b.c\d-e_f"]
+        } else {
+            &["/tmp", "/var/folders/zz/T/retrigger", "/a/b.c/d-e_f"]
+        };
+        for path in accepted {
+            assert!(
+                vet(Path::new(path)).is_ok(),
+                "{path} is an ordinary absolute path and must be accepted"
+            );
+        }
+
+        // Every one of these is refused on every platform: the Unix-shaped ones fail the
+        // traversal rule where paths are Unix-shaped and the absoluteness rule where they aren't.
+        for refused in [
+            "../../../../../../etc/passwd",
+            "/tmp/../etc/passwd",
+            "/tmp/./x",
+            "relative/path",
+            "",
+        ] {
+            let err = vet(Path::new(refused))
+                .expect_err("a path that does not name its target must be refused");
+            assert_eq!(
+                err.status,
+                StatusCode::BAD_REQUEST,
+                "{refused} is the client's mistake, not the server's"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nul_in_a_path_is_the_clients_fault_not_a_server_error() {
+        // Without an explicit check this reaches the filesystem call and returns an unclassified
+        // 500, which tells a client the daemon broke rather than that the request was nonsense.
+        // A Rust string literal may hold a NUL, so this needs no platform-specific construction.
+        let err = vet(Path::new("/tmp/has\0nul")).expect_err("an embedded NUL must be refused");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 }

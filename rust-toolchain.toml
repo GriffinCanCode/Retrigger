@@ -2,7 +2,7 @@
 # fail with "rustfmt is not installed" on a fresh machine.
 #
 # The channel is "stable" rather than a pinned version on purpose: the MSRV job
-# in CI is what defends rust-version = "1.75", and pinning here would only
+# in CI is what defends the workspace's rust-version, and pinning here would only
 # create a second, silently diverging answer to the same question. CI's
 # toolchain actions set RUSTUP_TOOLCHAIN, which takes precedence over this
 # file, so the MSRV job still gets the older compiler it asks for.
