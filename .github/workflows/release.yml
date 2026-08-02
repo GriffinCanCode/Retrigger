@@ -248,8 +248,31 @@ jobs:
         run: npx napi artifacts --output-dir artifacts
         working-directory: ${{ env.NODE_DIR }}
 
-      - name: Prepare platform packages
-        run: npx napi prepublish -t npm --no-gh-release
+      # `prepublish` does two separable things: it rewrites each platform
+      # package's version, and — unless `--skip-optional-publish` — it npm
+      # publishes them. Both halves matter here.
+      #
+      # The publishing half needs a registry token of its own. Without one the
+      # eight platform packages never reach npm, and the root package below
+      # still ships optionalDependencies naming them: every install then
+      # resolves no native package and degrades to the JavaScript engine while
+      # looking like a clean install. That is exactly how 1.0.4 shipped.
+      #
+      # The publishing half must also not run on a dry run. Publishing is the
+      # one step in this workflow that cannot be undone — npm refuses to reuse
+      # a version — so a dry run that published the platform packages would
+      # burn the version it was meant to rehearse.
+      - name: Prepare and publish the platform packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PUBLISHING: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+        run: |
+          if [ "$PUBLISHING" = true ]; then
+            npx napi prepublish -t npm --no-gh-release
+          else
+            npx napi prepublish -t npm --no-gh-release --skip-optional-publish
+          fi
         working-directory: ${{ env.NODE_DIR }}
 
       - name: Show what would be published
@@ -260,6 +283,9 @@ jobs:
           ls -R npm 2>/dev/null || echo "(no npm/ directory)"
         working-directory: ${{ env.NODE_DIR }}
 
+      # Last, and only after the platform packages are on the registry: the
+      # root package is the one that points at them, so publishing it first
+      # would leave a window where installs resolve nothing native.
       - name: Publish
         if: github.event_name == 'push' || inputs.dry_run == false
         run: npm publish --access public --provenance
