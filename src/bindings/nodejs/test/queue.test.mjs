@@ -176,16 +176,20 @@ describe('bounded queue under real filesystem pressure', () => {
         'rescanRequired'
       );
 
-      // The point of re-arming: the stream is still live afterwards.
-      fs.writeFileSync(path.join(dir, 'after-the-fault.js'), 'x');
+      // The point of re-arming: the stream is still live afterwards. Written repeatedly under a
+      // fresh name rather than once, because macOS brings the replacement stream up on another
+      // thread and a single write racing that can be missed outright rather than merely delayed --
+      // which would make this assert how promptly the watch re-arms, not whether it did.
+      let attempt = 0;
       await waitFor(
         () => {
+          fs.writeFileSync(path.join(dir, `after-the-fault-${(attempt += 1)}.js`), 'x');
           for (let event = watcher.poll(); event; event = watcher.poll()) {
-            if (event.path.endsWith('after-the-fault.js')) return true;
+            if (event.path.includes('after-the-fault')) return true;
           }
           return false;
         },
-        { message: 'nothing was reported after the watch was re-armed' }
+        { interval: 100, message: 'nothing was reported after the watch was re-armed' }
       );
     } finally {
       watcher.stop();
