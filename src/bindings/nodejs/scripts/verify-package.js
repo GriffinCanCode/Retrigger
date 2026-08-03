@@ -40,13 +40,25 @@ function check(name, fn) {
 const NPM_TIMEOUT_MS = 180_000;
 const NODE_TIMEOUT_MS = 30_000;
 
+/**
+ * npm is `npm.cmd` on Windows, and Node refuses to spawn a `.cmd` without a shell, so there the
+ * command has to go through one. Its arguments then travel as a single command line rather than as
+ * a vector, which is why they are quoted: every path passed below sits under the temp directory,
+ * and on a machine whose user name contains a space one argument would otherwise arrive as two.
+ */
 function npm(args, cwd) {
-  const result = spawnSync('npm', args, {
-    cwd,
-    encoding: 'utf8',
-    timeout: NPM_TIMEOUT_MS,
-    env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' },
-  });
+  const windows = process.platform === 'win32';
+  const result = spawnSync(
+    windows ? 'npm.cmd' : 'npm',
+    windows ? args.map((arg) => (/\s/.test(arg) ? `"${arg}"` : arg)) : args,
+    {
+      cwd,
+      encoding: 'utf8',
+      timeout: NPM_TIMEOUT_MS,
+      shell: windows,
+      env: { ...process.env, npm_config_audit: 'false', npm_config_fund: 'false' },
+    }
+  );
   if (result.error) throw new Error(`npm ${args.join(' ')}: ${result.error.message}`);
   if (result.status !== 0) {
     throw new Error(`npm ${args.join(' ')} failed (${result.status})\n${result.stderr}`);

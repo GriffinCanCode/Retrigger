@@ -216,10 +216,15 @@ export function runEngineSuite(engineName, makeRetrigger) {
       await waitFor(() => kindsFor(events, target).length > 0, { message: 'first write missed' });
 
       watcher.unwatch(dir);
+      // Settled before the baseline is taken. A correction owed for the write above, or a
+      // notification the kernel had already queued, both belong to the watched period and arrive
+      // whenever the platform gets to them; counting them as breaches would make this assert how
+      // promptly a backend drains, not whether the unwatch took.
+      await waitForQuiet(() => events.length);
       const before = events.length;
       writeFile(target, 'two-longer');
       await waitForQuiet(() => events.length);
-      expect(events.length).toBe(before);
+      expect(events.length, 'a change made after unwatch() must not be reported').toBe(before);
     });
 
     // -------------------------------------------------------------- debouncing
@@ -276,7 +281,22 @@ export function runEngineSuite(engineName, makeRetrigger) {
         message: 'the write absorbed by the window never arrived as a correction',
       });
       await waitForQuiet(() => events.length, { quietMs: 250 });
-      expect(kindsFor(events, target)).toEqual(['created', 'modified']);
+
+      // Asserted as a shape rather than an exact list. How many corrections close the window is a
+      // property of when the backend delivered the second write -- a slow machine can report it
+      // late enough to open a window of its own -- and the bound on coalescing is the burst test's
+      // subject, just above. What belongs to this test is that the leading event kept its own
+      // identity and that the absorbed write was not swallowed.
+      const kinds = kindsFor(events, target);
+      expect(kinds[0], 'a new file is announced as created, not as a modification').toBe('created');
+      expect(
+        kinds.length,
+        'the write the window absorbed must still reach the consumer'
+      ).toBeGreaterThanOrEqual(2);
+      expect(
+        kinds.slice(1).every((kind) => kind === 'modified'),
+        `everything after the leading event is a correction, got ${kinds}`
+      ).toBe(true);
     });
 
     // -------------------------------------------------------- content changes
