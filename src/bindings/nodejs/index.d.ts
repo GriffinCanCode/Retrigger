@@ -248,6 +248,12 @@ export declare class Retrigger extends EventEmitter {
    * crawl begins so nothing created during the crawl is lost.
    */
   watchWithSnapshot(target: string, recursive?: boolean): Promise<SnapshotEnvelope>;
+  /**
+   * Compare two snapshots' `entries` — from either `snapshot()`/`watchWithSnapshot()`, on either
+   * engine — and describe what changed between them in the same event vocabulary `on('all', ...)`
+   * reports. Pure data comparison; no watcher instance is needed, hence `static`.
+   */
+  static diffSnapshots(oldEntries: SnapshotEntry[], newEntries: SnapshotEntry[]): FileEvent[];
   start(): this;
   stop(): this;
   close(): this;

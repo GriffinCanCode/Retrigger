@@ -7,6 +7,7 @@ const path = require('path');
 const { ContentTracker } = require('./content');
 const { getEngine, getEngineInfo } = require('./engine');
 const { Metrics } = require('./metrics');
+const { getNative } = require('./native');
 
 const DEFAULT_POLL_INTERVAL_MS = 5;
 const DEFAULT_CAPACITY = 8192;
@@ -174,7 +175,9 @@ class Retrigger extends EventEmitter {
    * The result is a self-describing envelope — `{ algorithm, version, entries }` — so it can be
    * persisted (to disk, to a database) and loaded back later without guessing which crate version
    * or digest algorithm produced it. Comparing two of them to recover what changed between them is
-   * `retrigger_system::diff_snapshots`'s job on the Rust side; this package does not duplicate it.
+   * `Retrigger.diffSnapshots(oldEntries, newEntries)` — a native-backed binding of
+   * `retrigger_system::diff_snapshots` with a pure-JS fallback, so it works with either engine's
+   * snapshots and without a native addon at all.
    * @param {string} target
    * @returns {Promise<{algorithm: string, version: number, entries: Array<{path: string,
    *   isDirectory: boolean, size: number, modifiedNs: bigint|null}>}>}
@@ -192,6 +195,31 @@ class Retrigger extends EventEmitter {
    */
   watchWithSnapshot(target, recursive = this.options.recursive) {
     return this._watcher.watchWithSnapshot(path.resolve(target), recursive !== false);
+  }
+
+  /**
+   * Compare two snapshots' `entries` — each as {@link Retrigger#snapshot} or
+   * {@link Retrigger#watchWithSnapshot} resolved with, from either engine — and describe what
+   * changed between them in the same event vocabulary `on('all', ...)` reports: a path only in
+   * `newEntries` is `created`, a path only in `oldEntries` is `deleted`, and a path in both is
+   * `modified` when its size or `modifiedNs` differs and silent when they agree. See
+   * `retrigger_system::diff_snapshots` for the full classification rules this mirrors.
+   *
+   * Pure data comparison, so no watcher instance is needed — this is a static method, not an
+   * instance one. Prefers the native addon's own implementation when it is loaded, so it shares
+   * one code path with no drift risk; falls back to an equivalent pure-JavaScript
+   * reimplementation otherwise, so the operation itself never requires the native addon,
+   * regardless of which engine produced either snapshot.
+   * @param {Array<{path: string, isDirectory: boolean, size: number, modifiedNs: bigint|null}>} oldEntries
+   * @param {Array<{path: string, isDirectory: boolean, size: number, modifiedNs: bigint|null}>} newEntries
+   * @returns {Array<{path: string, kind: 'created'|'modified'|'deleted', timestampNs: bigint,
+   *   size: number, isDirectory: boolean, cookie: null}>}
+   */
+  static diffSnapshots(oldEntries, newEntries) {
+    const { binding } = getNative();
+    return binding && typeof binding.diffSnapshots === 'function'
+      ? binding.diffSnapshots(toNativeEntries(oldEntries), toNativeEntries(newEntries))
+      : diffSnapshotsJs(oldEntries, newEntries);
   }
 
   /** @returns {this} */
@@ -456,6 +484,69 @@ class Retrigger extends EventEmitter {
       }
     }
   }
+}
+
+/**
+ * The native addon accepts an absent `Option<BigInt>` field but rejects an explicit `null` for
+ * one with `BigintExpected` -- and a real `snapshot()`/`watchWithSnapshot()` result always spells
+ * "the file system reported no modification time" as literal `null`, not an absent key. This
+ * reconciles that mismatch on the way in, so the binding's `Option<BigInt>` -- otherwise the
+ * right type for the field -- does not have to.
+ * @param {Array<{modifiedNs: bigint|null}>} entries
+ * @returns {Array<object>}
+ */
+function toNativeEntries(entries) {
+  return entries.map((entry) =>
+    entry.modifiedNs === null ? { ...entry, modifiedNs: undefined } : entry
+  );
+}
+
+/**
+ * Pure-JavaScript equivalent of `retrigger_system::diff_snapshots`, used by
+ * {@link Retrigger.diffSnapshots} when the native addon is not loaded. A directory's entries
+ * compare equal to themselves in every field but `modifiedNs` (its `size` is always `0`), so no
+ * special-casing is needed to give one "changes only by modification time" the same way the Rust
+ * implementation does.
+ * @param {Array<{path: string, isDirectory: boolean, size: number, modifiedNs: bigint|null}>} oldEntries
+ * @param {Array<{path: string, isDirectory: boolean, size: number, modifiedNs: bigint|null}>} newEntries
+ * @returns {Array<object>} see {@link Retrigger.diffSnapshots}
+ */
+function diffSnapshotsJs(oldEntries, newEntries) {
+  const before = new Map(oldEntries.map((entry) => [entry.path, entry]));
+  const after = new Map(newEntries.map((entry) => [entry.path, entry]));
+  const events = [];
+  for (const entry of newEntries) {
+    const previous = before.get(entry.path);
+    if (!previous) {
+      events.push(diffEvent(entry, 'created'));
+    } else if (
+      previous.size !== entry.size ||
+      !sameModifiedNs(previous.modifiedNs, entry.modifiedNs)
+    ) {
+      events.push(diffEvent(entry, 'modified'));
+    }
+  }
+  for (const entry of oldEntries) {
+    if (!after.has(entry.path)) events.push(diffEvent({ ...entry, size: 0 }, 'deleted'));
+  }
+  return events;
+}
+
+/** @returns {boolean} whether two `modifiedNs` values (each `bigint|null|undefined`) agree */
+function sameModifiedNs(a, b) {
+  const normalised = (v) => (v === null || v === undefined ? null : BigInt(v));
+  return normalised(a) === normalised(b);
+}
+
+function diffEvent(entry, kind) {
+  return {
+    path: entry.path,
+    kind,
+    timestampNs: process.hrtime.bigint(),
+    size: Number(entry.size) || 0,
+    isDirectory: Boolean(entry.isDirectory),
+    cookie: null,
+  };
 }
 
 /**

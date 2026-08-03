@@ -692,6 +692,47 @@ impl Task for SnapshotTask {
     }
 }
 
+/// [`retrigger_system::diff_snapshots`], taking the plain `entries` arrays [`Watcher::snapshot`]
+/// and [`Watcher::watch_with_snapshot`] resolve with — from either engine this package ships,
+/// since a snapshot is just data once it has been crawled. Needs no watcher instance, so this is
+/// a free function rather than a method, mirroring the Rust side exactly.
+#[napi]
+pub fn diff_snapshots(
+    old_entries: Vec<JsSnapshotEntry>,
+    new_entries: Vec<JsSnapshotEntry>,
+) -> Vec<JsFileEvent> {
+    let old: Vec<_> = old_entries
+        .into_iter()
+        .map(snapshot_entry_from_js)
+        .collect();
+    let new: Vec<_> = new_entries
+        .into_iter()
+        .map(snapshot_entry_from_js)
+        .collect();
+    retrigger_system::diff_snapshots(&old, &new)
+        .into_iter()
+        .map(convert)
+        .collect()
+}
+
+/// Reverse of [`JsSnapshotEnvelope::from`]: the one place a snapshot crosses back from JavaScript
+/// into Rust, rather than the other way round.
+fn snapshot_entry_from_js(entry: JsSnapshotEntry) -> retrigger_system::SnapshotEntry {
+    retrigger_system::SnapshotEntry {
+        path: PathBuf::from(entry.path),
+        is_directory: entry.is_directory,
+        size: as_u64(entry.size),
+        modified_ns: entry.modified_ns.map(|ns| {
+            let (negative, value, _lossless) = ns.get_u64();
+            if negative {
+                0
+            } else {
+                value
+            }
+        }),
+    }
+}
+
 /// Parse [`WatcherOptions::backend`] into a [`BackendMode`], or throw a `TypeError` for anything
 /// but `"auto"`, `"poll"`, or absent (which is `"auto"`).
 fn backend_mode(
@@ -849,6 +890,12 @@ fn as_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// Reverse of [`as_i64`]: a negative `size` cannot come from a genuine snapshot, so it is read as
+/// `0` rather than trapped on.
+fn as_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -871,6 +918,32 @@ mod tests {
         assert_eq!(as_i64(7), 7);
         assert_eq!(as_i64(u64::MAX), i64::MAX);
         assert_eq!(as_u32(usize::MAX), u32::MAX);
+        assert_eq!(as_u64(7), 7);
+        assert_eq!(as_u64(-1), 0);
+    }
+
+    #[test]
+    fn diff_snapshots_matches_the_underlying_crate_for_a_created_and_a_deleted_path() {
+        let old = vec![JsSnapshotEntry {
+            path: "/a".to_owned(),
+            is_directory: false,
+            size: 4,
+            modified_ns: Some(BigInt::from(1u64)),
+        }];
+        let new = vec![JsSnapshotEntry {
+            path: "/b".to_owned(),
+            is_directory: false,
+            size: 1,
+            modified_ns: Some(BigInt::from(2u64)),
+        }];
+        let events = diff_snapshots(old, new);
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .any(|event| event.path == "/a" && event.kind == "deleted"));
+        assert!(events
+            .iter()
+            .any(|event| event.path == "/b" && event.kind == "created"));
     }
 
     #[test]
