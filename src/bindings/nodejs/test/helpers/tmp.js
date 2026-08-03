@@ -121,6 +121,18 @@ async function waitUntilLive(dir, events, { timeout = 10000, attemptMs = 300 } =
 }
 
 /**
+ * Whether the JavaScript engine's `fs.watch`-based watcher is supported on this platform.
+ *
+ * False on FreeBSD: Node's `fs.watch` cannot back it reliably on BSD -- there is no recursive
+ * mode, and a directory watch delivers neither the changed filename nor content-modification
+ * events (kqueue signals only that the directory's own entry list changed). The package supports
+ * FreeBSD through the native addon instead, which ships for `freebsd-x64`. Suites that start a
+ * JS-engine watcher gate on this so they skip rather than fail there, the same "green on every
+ * environment this package supports" contract the Node-version and Watchman gates already use.
+ */
+const JS_WATCHER_SUPPORTED = process.platform !== 'freebsd';
+
+/**
  * Write a file and make sure the bytes reached the filesystem before the test
  * continues, so watcher latency is the only variable left.
  */
@@ -137,6 +149,7 @@ function writeFile(target, contents) {
 
 module.exports = {
   cleanupTempDirs,
+  JS_WATCHER_SUPPORTED,
   sleep,
   tempDir,
   waitFor,

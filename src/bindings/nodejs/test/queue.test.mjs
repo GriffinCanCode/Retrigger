@@ -8,7 +8,7 @@ process.env.RETRIGGER_NATIVE_PATH = path.join(HERE, 'helpers', 'mock-native.js')
 process.env.RETRIGGER_SILENT = '1';
 
 import { JsWatcher } from '../lib/js-watcher.js';
-import { cleanupTempDirs, tempDir, waitFor } from './helpers/tmp.js';
+import { cleanupTempDirs, JS_WATCHER_SUPPORTED, tempDir, waitFor } from './helpers/tmp.js';
 import mockNative from './helpers/mock-native.js';
 
 afterAll(cleanupTempDirs);
@@ -175,42 +175,45 @@ describe('bounded queue under real filesystem pressure', () => {
    * can ask for on demand and the other platforms do not produce at all. Emitting it directly is
    * the only way to hold every platform to the same answer.
    */
-  it('re-arms a directory watch that faulted, and declares the gap', async () => {
-    const dir = tempDir();
-    const watcher = new JsWatcher({ capacity: 64 });
-    watcher.watch(dir, true);
-    watcher.start();
-    try {
-      expect(watcher.openDirectoryCount).toBe(1);
-      const faulted = watcher._dirWatchers.get(dir);
-      faulted.emit('error', Object.assign(new Error('handle fell over'), { code: 'EPERM' }));
+  it.skipIf(!JS_WATCHER_SUPPORTED)(
+    're-arms a directory watch that faulted, and declares the gap',
+    async () => {
+      const dir = tempDir();
+      const watcher = new JsWatcher({ capacity: 64 });
+      watcher.watch(dir, true);
+      watcher.start();
+      try {
+        expect(watcher.openDirectoryCount).toBe(1);
+        const faulted = watcher._dirWatchers.get(dir);
+        faulted.emit('error', Object.assign(new Error('handle fell over'), { code: 'EPERM' }));
 
-      expect(watcher.openDirectoryCount, 'the directory must be watched again').toBe(1);
-      const kinds = [];
-      for (let event = watcher.poll(); event; event = watcher.poll()) kinds.push(event.kind);
-      expect(kinds, 'changes during the gap were unobservable, so a rescan is owed').toContain(
-        'rescanRequired'
-      );
+        expect(watcher.openDirectoryCount, 'the directory must be watched again').toBe(1);
+        const kinds = [];
+        for (let event = watcher.poll(); event; event = watcher.poll()) kinds.push(event.kind);
+        expect(kinds, 'changes during the gap were unobservable, so a rescan is owed').toContain(
+          'rescanRequired'
+        );
 
-      // The point of re-arming: the stream is still live afterwards. Written repeatedly under a
-      // fresh name rather than once, because macOS brings the replacement stream up on another
-      // thread and a single write racing that can be missed outright rather than merely delayed --
-      // which would make this assert how promptly the watch re-arms, not whether it did.
-      let attempt = 0;
-      await waitFor(
-        () => {
-          fs.writeFileSync(path.join(dir, `after-the-fault-${(attempt += 1)}.js`), 'x');
-          for (let event = watcher.poll(); event; event = watcher.poll()) {
-            if (event.path.includes('after-the-fault')) return true;
-          }
-          return false;
-        },
-        { interval: 100, message: 'nothing was reported after the watch was re-armed' }
-      );
-    } finally {
-      watcher.stop();
+        // The point of re-arming: the stream is still live afterwards. Written repeatedly under a
+        // fresh name rather than once, because macOS brings the replacement stream up on another
+        // thread and a single write racing that can be missed outright rather than merely delayed --
+        // which would make this assert how promptly the watch re-arms, not whether it did.
+        let attempt = 0;
+        await waitFor(
+          () => {
+            fs.writeFileSync(path.join(dir, `after-the-fault-${(attempt += 1)}.js`), 'x');
+            for (let event = watcher.poll(); event; event = watcher.poll()) {
+              if (event.path.includes('after-the-fault')) return true;
+            }
+            return false;
+          },
+          { interval: 100, message: 'nothing was reported after the watch was re-armed' }
+        );
+      } finally {
+        watcher.stop();
+      }
     }
-  });
+  );
 
   it('stops re-arming a directory whose watch fails every time', () => {
     const dir = tempDir();

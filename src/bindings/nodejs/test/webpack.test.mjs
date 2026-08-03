@@ -16,6 +16,7 @@ const {
   waitForQuiet,
   writeFile,
   sleep,
+  JS_WATCHER_SUPPORTED,
 } = require('./helpers/tmp.js');
 
 const RetriggerWebpackPlugin = require('../plugins/webpack-plugin.js');
@@ -65,7 +66,7 @@ afterEach(async () => {
 
 afterAll(() => cleanupTempDirs());
 
-describe('webpack 5 integration', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('webpack 5 integration', () => {
   it('installs itself as watchFileSystem without disturbing a plain build', async () => {
     const project = fixture();
     const plugin = new RetriggerWebpackPlugin({ watchPaths: [project.src] });

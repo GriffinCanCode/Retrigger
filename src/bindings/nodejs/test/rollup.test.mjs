@@ -9,7 +9,14 @@ const require = createRequire(import.meta.url);
 // this one spy, which proves `rollup.watch` (the observation-only API this package's factory must
 // never call) is never even touched.
 const rollupModule = require('rollup');
-const { tempDir, cleanupTempDirs, waitFor, waitForQuiet, writeFile } = require('./helpers/tmp.js');
+const {
+  tempDir,
+  cleanupTempDirs,
+  waitFor,
+  waitForQuiet,
+  writeFile,
+  JS_WATCHER_SUPPORTED,
+} = require('./helpers/tmp.js');
 
 const { createRetriggerRollupWatcher } = require('../lib/rollup-plugin.js');
 
@@ -48,7 +55,7 @@ afterEach(async () => {
 
 afterAll(() => cleanupTempDirs());
 
-describe('rollup manual-rebuild watcher', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('rollup manual-rebuild watcher', () => {
   it('never touches rollup.watch — the observation-only API this package must not rely on', async () => {
     const original = rollupModule.watch;
     let called = false;

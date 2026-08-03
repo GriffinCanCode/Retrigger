@@ -12,6 +12,7 @@ const {
   waitForQuiet,
   writeFile,
   sleep,
+  JS_WATCHER_SUPPORTED,
 } = require('./helpers/tmp.js');
 const { createRetriggerVitePlugin, normalizePath } = require('../plugins/vite-plugin.js');
 
@@ -64,7 +65,7 @@ afterEach(async () => {
 
 afterAll(() => cleanupTempDirs());
 
-describe('vite plugin', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('vite plugin', () => {
   it('exposes the shape Vite expects from a plugin object', () => {
     const plugin = createRetriggerVitePlugin();
     expect(plugin.name).toBe('retrigger');

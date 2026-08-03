@@ -4,7 +4,13 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { Retrigger } from '../lib/retrigger.js';
 import { JsWatcher, RECURSIVE_WATCH } from '../lib/js-watcher.js';
-import { cleanupTempDirs, tempDir, waitFor, writeFile } from './helpers/tmp.js';
+import {
+  cleanupTempDirs,
+  JS_WATCHER_SUPPORTED,
+  tempDir,
+  waitFor,
+  writeFile,
+} from './helpers/tmp.js';
 
 afterAll(cleanupTempDirs);
 
@@ -40,32 +46,35 @@ async function settle() {
 }
 
 describe('resource hygiene', () => {
-  it('releases every watcher handle and timer after stop()', async () => {
-    const dir = tempDir();
-    fs.mkdirSync(path.join(dir, 'a', 'b'), { recursive: true });
-    await settle();
-    const baseline = watcherResourceTotal();
+  it.skipIf(!JS_WATCHER_SUPPORTED)(
+    'releases every watcher handle and timer after stop()',
+    async () => {
+      const dir = tempDir();
+      fs.mkdirSync(path.join(dir, 'a', 'b'), { recursive: true });
+      await settle();
+      const baseline = watcherResourceTotal();
 
-    const watcher = new Retrigger({ paths: dir, engine: 'javascript' });
-    watcher.start();
-    writeFile(path.join(dir, 'a', 'b', 'f.js'), 'x');
-    await waitFor(() => watcher.getStats().eventsDelivered > 0, {
-      timeout: 15000,
-      message: 'no events before the leak check',
-    });
-    expect(watcherResourceTotal()).toBeGreaterThan(baseline);
+      const watcher = new Retrigger({ paths: dir, engine: 'javascript' });
+      watcher.start();
+      writeFile(path.join(dir, 'a', 'b', 'f.js'), 'x');
+      await waitFor(() => watcher.getStats().eventsDelivered > 0, {
+        timeout: 15000,
+        message: 'no events before the leak check',
+      });
+      expect(watcherResourceTotal()).toBeGreaterThan(baseline);
 
-    watcher.stop();
-    await settle();
-    // Only the upper bound is the watcher's to answer for. `Timeout` is one of
-    // WATCHED_KINDS and the count is process-global, so the runner's own timer
-    // can retire between the two samples and carry the total below the baseline
-    // -- which is not a leak, and is the only direction an exact match fails in.
-    await waitFor(() => watcherResourceTotal() <= baseline, {
-      timeout: 2000,
-      message: `watcher resources still held after stop() (baseline=${baseline})`,
-    });
-  });
+      watcher.stop();
+      await settle();
+      // Only the upper bound is the watcher's to answer for. `Timeout` is one of
+      // WATCHED_KINDS and the count is process-global, so the runner's own timer
+      // can retire between the two samples and carry the total below the baseline
+      // -- which is not a leak, and is the only direction an exact match fails in.
+      await waitFor(() => watcherResourceTotal() <= baseline, {
+        timeout: 2000,
+        message: `watcher resources still held after stop() (baseline=${baseline})`,
+      });
+    }
+  );
 
   it('does not accumulate handles across repeated start/stop cycles', async () => {
     const dir = tempDir();

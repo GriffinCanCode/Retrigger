@@ -4,7 +4,14 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { Retrigger } from '../lib/retrigger.js';
-import { cleanupTempDirs, tempDir, waitFor, waitUntilLive, writeFile } from './helpers/tmp.js';
+import {
+  cleanupTempDirs,
+  JS_WATCHER_SUPPORTED,
+  tempDir,
+  waitFor,
+  waitUntilLive,
+  writeFile,
+} from './helpers/tmp.js';
 
 afterAll(cleanupTempDirs);
 
@@ -34,7 +41,7 @@ function heartbeat(intervalMs = 5) {
   };
 }
 
-describe('nonblocking burst hashing', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('nonblocking burst hashing', () => {
   it('keeps the event loop responsive while hashing a large file', async () => {
     const dir = tempDir();
     const target = path.join(dir, 'large.bin');

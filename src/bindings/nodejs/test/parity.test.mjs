@@ -11,7 +11,7 @@ process.env.RETRIGGER_SILENT = '1';
 const { Retrigger } = await import('../lib/retrigger.js');
 const { getEngine, resetEngineCache } = await import('../lib/engine.js');
 const { resetNativeCache } = await import('../lib/native.js');
-const { cleanupTempDirs } = await import('./helpers/tmp.js');
+const { cleanupTempDirs, JS_WATCHER_SUPPORTED } = await import('./helpers/tmp.js');
 const { runEngineSuite } = await import('./shared/engine-suite.mjs');
 
 afterAll(cleanupTempDirs);
@@ -29,6 +29,8 @@ const ENGINES = [
   {
     name: 'javascript (fs.watch)',
     make: (options = {}) => new Retrigger({ ...options, engine: 'javascript' }),
+    // Node's fs.watch cannot back this engine's watcher on BSD; see JS_WATCHER_SUPPORTED.
+    usesFsWatch: true,
   },
   {
     name: 'native (mock addon, stat diffing)',
@@ -62,6 +64,10 @@ describe('the mock addon really is loaded as native', () => {
   });
 });
 
+// The fs.watch-backed engine is unsupported on FreeBSD (see JS_WATCHER_SUPPORTED); the mock
+// "native" engine is stat-diff based and runs on every platform, so parity there is asserted
+// against it alone.
 for (const engine of ENGINES) {
+  if (engine.usesFsWatch && !JS_WATCHER_SUPPORTED) continue;
   runEngineSuite(engine.name, engine.make);
 }

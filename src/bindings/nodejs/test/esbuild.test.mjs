@@ -9,7 +9,14 @@ const require = createRequire(import.meta.url);
 // except this one spy, on the `BuildContext` esbuild hands back, which proves `ctx.watch` (the
 // observation-only API this package's factory must never call) is never even touched.
 const esbuild = require('esbuild');
-const { tempDir, cleanupTempDirs, waitFor, waitForQuiet, writeFile } = require('./helpers/tmp.js');
+const {
+  tempDir,
+  cleanupTempDirs,
+  waitFor,
+  waitForQuiet,
+  writeFile,
+  JS_WATCHER_SUPPORTED,
+} = require('./helpers/tmp.js');
 
 const { createRetriggerEsbuildWatcher } = require('../lib/esbuild-plugin.js');
 
@@ -50,7 +57,7 @@ afterEach(async () => {
 
 afterAll(() => cleanupTempDirs());
 
-describe('esbuild manual-rebuild watcher', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('esbuild manual-rebuild watcher', () => {
   it('never touches ctx.watch — the observation-only API this package must not rely on', async () => {
     // `esbuild.context` is a non-configurable getter (unlike Rollup's plain, writable `watch`
     // export), so the spy instead swaps the module's own `require.cache` entry for a `Proxy` that

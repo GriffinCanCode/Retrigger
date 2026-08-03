@@ -2,7 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 
-import { cleanupTempDirs, tempDir, waitFor, waitForQuiet, writeFile } from './helpers/tmp.js';
+import {
+  cleanupTempDirs,
+  JS_WATCHER_SUPPORTED,
+  tempDir,
+  waitFor,
+  waitForQuiet,
+  writeFile,
+} from './helpers/tmp.js';
 import { watch, FSWatcher } from '../lib/chokidar-adapter.js';
 
 afterAll(cleanupTempDirs);
@@ -24,7 +31,7 @@ function makeWatcher(paths, options = {}) {
   return w;
 }
 
-describe('chokidar adapter: basic shape', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('chokidar adapter: basic shape', () => {
   it('exports a watch() factory and an FSWatcher class', () => {
     expect(typeof watch).toBe('function');
     expect(typeof FSWatcher).toBe('function');
@@ -102,7 +109,7 @@ describe('chokidar adapter: basic shape', () => {
   });
 });
 
-describe('chokidar adapter: options', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('chokidar adapter: options', () => {
   it('respects a glob in ignored', async () => {
     const dir = tempDir();
     const w = makeWatcher(dir, { ignored: '**/*.log', ignoreInitial: true });
@@ -219,7 +226,7 @@ describe('chokidar adapter: options', () => {
   });
 });
 
-describe('chokidar adapter: add()/unwatch()/getWatched()', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('chokidar adapter: add()/unwatch()/getWatched()', () => {
   it('accepts an array of paths in add()', async () => {
     const a = tempDir();
     const b = tempDir();

@@ -5,6 +5,7 @@ import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { Retrigger } from '../lib/retrigger.js';
 import {
   cleanupTempDirs,
+  JS_WATCHER_SUPPORTED,
   tempDir,
   waitFor,
   waitForQuiet,
@@ -19,7 +20,7 @@ afterAll(cleanupTempDirs);
  * are awkward rather than convenient: unicode names, spaces, deep nesting,
  * directory churn and several hundred files at once.
  */
-describe('JavaScript engine against a real filesystem', () => {
+describe.skipIf(!JS_WATCHER_SUPPORTED)('JavaScript engine against a real filesystem', () => {
   /** @type {Retrigger[]} */
   const open = [];
   afterEach(() => {

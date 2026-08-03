@@ -12,7 +12,7 @@ import { hashBytesSync, hashFile, hashFileSync } from '../lib/hash-js.js';
 import { JsWatcher, RECURSIVE_WATCH } from '../lib/js-watcher.js';
 import { Retrigger } from '../lib/retrigger.js';
 import RetriggerWebpackPlugin from '../plugins/webpack-plugin.js';
-import { cleanupTempDirs, tempDir, waitFor } from './helpers/tmp.js';
+import { cleanupTempDirs, JS_WATCHER_SUPPORTED, tempDir, waitFor } from './helpers/tmp.js';
 
 afterAll(cleanupTempDirs);
 
@@ -317,33 +317,36 @@ describe('tracking sets under a churning tree', () => {
     }
   });
 
-  it('still reports a deletion for a path it has forgotten', async () => {
-    // The hazard bounding the set creates: a deletion used to be suppressed when the path was absent
-    // from the set, which after eviction would mean a real deletion silently disappearing.
-    const dir = tempDir();
-    const target = path.join(dir, 'gone.ts');
-    fs.writeFileSync(target, 'x');
+  it.skipIf(!JS_WATCHER_SUPPORTED)(
+    'still reports a deletion for a path it has forgotten',
+    async () => {
+      // The hazard bounding the set creates: a deletion used to be suppressed when the path was absent
+      // from the set, which after eviction would mean a real deletion silently disappearing.
+      const dir = tempDir();
+      const target = path.join(dir, 'gone.ts');
+      fs.writeFileSync(target, 'x');
 
-    const watcher = new JsWatcher({ capacity: 100 });
-    watcher.watch(dir, true);
-    watcher.start();
-    // Force the set past its ceiling so a miss no longer proves the path was never seen.
-    watcher._known = new BoundedSet(4);
-    for (let i = 0; i < 50; i += 1) watcher._known.add(`/unrelated/${i}`);
-    expect(watcher._known.forgotten).toBe(true);
-    expect(watcher._known.has(target)).toBe(false);
+      const watcher = new JsWatcher({ capacity: 100 });
+      watcher.watch(dir, true);
+      watcher.start();
+      // Force the set past its ceiling so a miss no longer proves the path was never seen.
+      watcher._known = new BoundedSet(4);
+      for (let i = 0; i < 50; i += 1) watcher._known.add(`/unrelated/${i}`);
+      expect(watcher._known.forgotten).toBe(true);
+      expect(watcher._known.has(target)).toBe(false);
 
-    fs.rmSync(target);
-    await waitFor(
-      () => {
-        const events = [];
-        for (let event = watcher.poll(); event; event = watcher.poll()) events.push(event);
-        return events.some((e) => e.path === target && e.kind === 'deleted');
-      },
-      { timeout: 5_000 }
-    );
-    watcher.stop();
-  });
+      fs.rmSync(target);
+      await waitFor(
+        () => {
+          const events = [];
+          for (let event = watcher.poll(); event; event = watcher.poll()) events.push(event);
+          return events.some((e) => e.path === target && e.kind === 'deleted');
+        },
+        { timeout: 5_000 }
+      );
+      watcher.stop();
+    }
+  );
 
   it('suppresses unknown-path noise while the set is still exact', async () => {
     // The other half of that trade: before anything has been forgotten the set is authoritative, so
