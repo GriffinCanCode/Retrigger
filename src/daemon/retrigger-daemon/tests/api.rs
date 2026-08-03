@@ -390,13 +390,21 @@ async fn a_file_change_reaches_a_subscriber_with_the_xxh3_digest() -> Result<()>
         Some(expected),
         "the daemon must report the XXH3-64 digest from retrigger-core, got {event:#}"
     );
-    assert_eq!(event["content_changed"], true);
     assert!(
         event["event"]["path"]
             .as_str()
             .unwrap_or_default()
             .contains("change-"),
         "the event should name the file that changed: {event:#}"
+    );
+
+    // Asserted on the first event rather than on the settled one. Every file the writer produces
+    // carries the same bytes, so once the content cache has seen them `false` is the correct
+    // answer for the rest — the claim worth making is that their first appearance was a change.
+    let first = events.first().context("the subscriber received nothing")?;
+    assert_eq!(
+        first["content_changed"], true,
+        "the first sight of these bytes must be reported as a content change, got {first:#}"
     );
 
     harness.shutdown().await
