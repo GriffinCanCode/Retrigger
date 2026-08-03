@@ -801,6 +801,14 @@ impl Watcher {
             .map_err(WatchError::Backend)?;
 
         for entry in self.core.scope.read().iter() {
+            // Inspected before the backend sees it, for the same reason `watch` does it: the
+            // backends disagree about how a vanished path is reported. ReadDirectoryChangesW
+            // calls it "neither a file nor a directory" through a generic error that carries no
+            // kind to classify, so without this the documented NotFound above would be a promise
+            // this function keeps everywhere except Windows.
+            self.core
+                .metadata(&entry.path)
+                .map_err(|err| WatchError::from_io(&entry.path, err))?;
             watcher
                 .watch(&entry.path, mode(entry.recursive))
                 .map_err(|e| WatchError::from_notify(&entry.path, e))?;

@@ -267,7 +267,14 @@ export function runEngineSuite(engineName, makeRetrigger) {
       writeFile(target, 'a');
       await new Promise((r) => setTimeout(r, 20));
       writeFile(target, 'ab');
-      await waitFor(() => kindsFor(events, target).length > 0, { message: 'no event' });
+      // Waiting for the correction rather than for the stream to fall quiet. Quiet is reached
+      // when nothing has arrived for 250ms, which on a loaded macOS runner can happen while the
+      // correction is still inside FSEvents' coalescing latency -- the assertion then ran before
+      // the event it was about. The exact sequence is still asserted, and a correction that never
+      // comes still fails, now by timing out here rather than by reading a half-filled list.
+      await waitFor(() => kindsFor(events, target).length >= 2, {
+        message: 'the write absorbed by the window never arrived as a correction',
+      });
       await waitForQuiet(() => events.length, { quietMs: 250 });
       expect(kindsFor(events, target)).toEqual(['created', 'modified']);
     });
