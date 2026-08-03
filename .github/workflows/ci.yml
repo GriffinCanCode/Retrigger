@@ -227,6 +227,32 @@ jobs:
         run: npm test
         working-directory: src/bindings/nodejs
 
+  # The JavaScript engine covers a tree with one recursive watch on Windows,
+  # because a per-directory handle there drops most of a burst. That strategy
+  # would otherwise be exercised only by the Windows jobs, which are the
+  # slowest to report and the least pleasant to debug. macOS serves both, so it
+  # can hold the same code to the whole suite on every push.
+  fallback-recursive:
+    name: JS fallback (recursive watch strategy)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: src/bindings/nodejs
+      - name: Remove this package's native artifacts
+        run: find . -name '*.node' -not -path './node_modules/*' -print -delete
+        working-directory: src/bindings/nodejs
+      - name: Suite must pass with one watch per tree
+        run: npm test
+        working-directory: src/bindings/nodejs
+        env:
+          RETRIGGER_JS_RECURSIVE: '1'
+
   # ------------------------------------------------------------------- MSRV
   msrv:
     name: Minimum supported Rust version
@@ -266,7 +292,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [lint, test, test-musl, sanitizers, fallback, msrv]
+    needs: [lint, test, test-musl, sanitizers, fallback, fallback-recursive, msrv]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any dependency failed

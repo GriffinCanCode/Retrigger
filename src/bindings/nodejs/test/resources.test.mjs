@@ -3,7 +3,7 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { Retrigger } from '../lib/retrigger.js';
-import { JsWatcher } from '../lib/js-watcher.js';
+import { JsWatcher, RECURSIVE_WATCH } from '../lib/js-watcher.js';
 import { cleanupTempDirs, tempDir, waitFor, writeFile } from './helpers/tmp.js';
 
 afterAll(cleanupTempDirs);
@@ -104,8 +104,10 @@ describe('resource hygiene', () => {
     const engine = new JsWatcher({});
     engine.watch(dir, true);
     engine.start();
-    // 1 root + 12 nested + 12 inner
-    expect(engine.openDirectoryCount).toBe(25);
+    // One handle per directory — 1 root + 12 nested + 12 inner — except where a single recursive
+    // watch covers the tree. The count is not the point either way: what must hold is that every
+    // handle the engine opened is closed again, which the assertion after stop() is about.
+    expect(engine.openDirectoryCount).toBe(RECURSIVE_WATCH ? 1 : 25);
     engine.stop();
     expect(engine.openDirectoryCount).toBe(0);
   });

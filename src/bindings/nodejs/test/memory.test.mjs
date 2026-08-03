@@ -9,7 +9,7 @@ process.env.RETRIGGER_SILENT = '1';
 
 import { BoundedSet } from '../lib/bounded.js';
 import { hashBytesSync, hashFile, hashFileSync } from '../lib/hash-js.js';
-import { JsWatcher } from '../lib/js-watcher.js';
+import { JsWatcher, RECURSIVE_WATCH } from '../lib/js-watcher.js';
 import { Retrigger } from '../lib/retrigger.js';
 import RetriggerWebpackPlugin from '../plugins/webpack-plugin.js';
 import { cleanupTempDirs, tempDir, waitFor } from './helpers/tmp.js';
@@ -290,13 +290,18 @@ describe('tracking sets under a churning tree', () => {
     watcher.watch(dir, true);
     watcher.start();
     expect(watcher._known.size).toBeGreaterThan(300);
-    const before = watcher.openDirectoryCount;
-    expect(before).toBeGreaterThan(300);
+    // Measured on the directory tracking set rather than the handle count, because that is what
+    // `_forgetSubtree` prunes on every platform; the handles are one-per-directory only where the
+    // watch is, and are checked below where that holds.
+    const knownDirs = watcher._knownDirs.size;
+    expect(knownDirs).toBeGreaterThan(300);
+    const handles = watcher.openDirectoryCount;
 
     watcher._forgetSubtree(doomed);
     expect(watcher._known.has(path.join(dir, 'src', 'app.ts'))).toBe(true);
     expect(watcher._known.has(path.join(doomed, 'dep0', 'index.js'))).toBe(false);
-    expect(watcher.openDirectoryCount).toBeLessThan(before - 300);
+    expect(watcher._knownDirs.size).toBeLessThan(knownDirs - 300);
+    if (!RECURSIVE_WATCH) expect(watcher.openDirectoryCount).toBeLessThan(handles - 300);
     watcher.stop();
     expect(watcher.openDirectoryCount).toBe(0);
   });

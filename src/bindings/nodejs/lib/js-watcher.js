@@ -4,11 +4,14 @@
  * Pure-JavaScript watcher implementing the native addon's `Watcher` contract.
  *
  * Honest differences from the native engine, none of them faked:
- *   - `fs.watch` is only recursive on macOS and Windows, so the tree is walked
- *     and every directory is watched individually on all platforms. This keeps
- *     semantics identical everywhere at the cost of one file descriptor per
- *     directory (and an `EMFILE` risk on very large trees, surfaced as an
- *     error event rather than a crash).
+ *   - The tree is walked and every directory watched individually, which keeps
+ *     semantics identical across platforms at the cost of one file descriptor
+ *     per directory (and an `EMFILE` risk on very large trees, surfaced as an
+ *     error event rather than a crash). Windows is the exception: there a
+ *     per-directory handle is re-issued after each batch it reports and drops
+ *     everything that lands in the gap, so a single recursive watch covers the
+ *     tree instead. Only the handles differ — the walk, the tracking sets and
+ *     the events are the same.
  *   - `fs.watch` cannot correlate the two halves of a rename, so a rename is
  *     reported as `deleted` for the old path and `created` for the new one.
  *     `renamedFrom` / `renamedTo` are never emitted and `cookie` is always
@@ -91,6 +94,28 @@ const QUEUE_COMPACT_THRESHOLD = 1024;
  * every time it is watched is reporting a condition retrying cannot fix.
  */
 const REARM_LIMIT = 5;
+
+/**
+ * Whether one watch can stand in for a watch on every directory beneath it.
+ *
+ * Windows only, deliberately, though macOS supports recursive watches too. Watching each
+ * directory separately is what keeps this engine's semantics identical everywhere, and it holds
+ * up everywhere except here: behind `fs.watch` on Windows each directory handle is re-issued
+ * after every batch it reports, and changes landing in that gap are not queued anywhere — a few
+ * hundred writes into one directory arrive as two or three events, with no error raised and
+ * nothing to distinguish the loss from quiet. One recursive watch over the tree is drained
+ * continuously by libuv and does not shed the burst, so on Windows fidelity wins over uniformity.
+ *
+ * `RETRIGGER_JS_RECURSIVE` forces the choice either way on the platforms that serve both, which is
+ * how the recursive path is exercised somewhere other than Windows CI. A real choice rather than a
+ * test fixture: macOS supports both strategies natively.
+ */
+const RECURSIVE_CAPABLE = process.platform === 'win32' || process.platform === 'darwin';
+const RECURSIVE_OVERRIDE = process.env.RETRIGGER_JS_RECURSIVE;
+const RECURSIVE_WATCH =
+  RECURSIVE_OVERRIDE === '0'
+    ? false
+    : RECURSIVE_CAPABLE && (RECURSIVE_OVERRIDE === '1' || process.platform === 'win32');
 
 class JsWatcher {
   /**
@@ -293,9 +318,15 @@ class JsWatcher {
       this._watchDirectory(path.dirname(root));
       return;
     }
+    // The walk still runs when one watch covers the tree: it is what populates the tracking sets
+    // that tell a created file from a modified one and a removed directory from a removed file.
+    // Only the per-directory handles it would otherwise open are redundant.
+    const covered = RECURSIVE_WATCH && info.recursive;
+    if (covered) this._watchDirectory(root, true);
     this._walk(root, info.recursive, (entryPath, isDirectory) => {
-      if (isDirectory) this._watchDirectory(entryPath);
-      else this._known.add(entryPath);
+      if (isDirectory) {
+        if (!covered) this._watchDirectory(entryPath);
+      } else this._known.add(entryPath);
     });
   }
 
@@ -326,12 +357,16 @@ class JsWatcher {
     }
   }
 
-  _watchDirectory(dir) {
+  /**
+   * @param {string} dir
+   * @param {boolean} [recursive=false] whether this one watch covers the whole subtree
+   */
+  _watchDirectory(dir, recursive = false) {
     if (this._dirWatchers.has(dir)) return;
     if (!this.matcher.allowsDirectory(dir)) return;
     let watcher;
     try {
-      watcher = fs.watch(dir, { persistent: true, recursive: false });
+      watcher = fs.watch(dir, { persistent: true, recursive });
     } catch (err) {
       this._recordError(err);
       return;
@@ -365,7 +400,11 @@ class JsWatcher {
     if (attempts > REARM_LIMIT) return;
     this._rearms.set(dir, attempts);
     if (!fs.existsSync(dir)) return;
-    this._watchDirectory(dir);
+    // Re-attached with the reach it had. Only a root is ever watched recursively, so a lookup in
+    // the root table is the whole question -- and getting it wrong would silently narrow a
+    // tree-wide watch to its top directory.
+    const root = this._roots.get(dir);
+    this._watchDirectory(dir, RECURSIVE_WATCH && root !== undefined && root.recursive);
     if (!this._dirWatchers.has(dir)) return;
     // Whatever happened while the directory was unwatched was not observed, and cannot be
     // enumerated after the fact, so the gap is declared rather than passed off as quiet.
@@ -455,14 +494,18 @@ class JsWatcher {
   /**
    * Watch a directory that appeared after `start()`, and replay anything that
    * already landed inside it.
+   *
+   * The replay is needed on every platform, including the ones where the covering watch already
+   * reports the new directory's contents: files written between the `mkdir` and this call are
+   * inside the tree but were never announced, and the walk is the only thing that finds them.
    */
   _adoptNewDirectory(dir) {
     const root = this._findRoot(dir);
     if (!root || !root.recursive) return;
-    this._watchDirectory(dir);
+    if (!RECURSIVE_WATCH) this._watchDirectory(dir);
     this._walk(dir, true, (entryPath, isDirectory) => {
       if (isDirectory) {
-        if (entryPath !== dir) this._watchDirectory(entryPath);
+        if (!RECURSIVE_WATCH && entryPath !== dir) this._watchDirectory(entryPath);
         return;
       }
       if (this._known.has(entryPath)) return;
@@ -668,4 +711,4 @@ class JsWatcher {
   }
 }
 
-module.exports = { COALESCABLE, EVENT_KINDS, JsWatcher };
+module.exports = { COALESCABLE, EVENT_KINDS, JsWatcher, RECURSIVE_WATCH };

@@ -82,6 +82,15 @@ machine it was built on.
   the daemon behind would make `npm install` of the two together fail outright
   with `ERESOLVE`. One tag now publishes both, and the release proves a default
   install of the pair before it finishes.
+- The JavaScript engine covers a tree with a single recursive watch on Windows.
+  A `fs.watch` handle per directory is re-issued there after each batch it
+  reports and drops whatever lands in the gap, so a burst of a few hundred
+  writes arrived as two or three events, with no error raised and nothing to
+  tell the loss from quiet. Every other platform keeps one watch per directory.
+- A directory watch that faulted is re-armed rather than abandoned. The engine
+  had closed it and carried on reporting itself healthy while every later change
+  in that directory went unseen; it now reopens the watch, bounded by a ceiling
+  on consecutive failures, and queues `rescanRequired` for the gap.
 - Linux delivered no events at all — the old Zig watcher never armed its inotify
   thread — and the paths that did arrive were corrupt, because `FileEvent` used
   a fat pointer where Rust read a thin one.
