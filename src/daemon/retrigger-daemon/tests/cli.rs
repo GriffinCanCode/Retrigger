@@ -7,7 +7,6 @@
 //! exits 1 on startup.
 
 use std::fs;
-use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -343,12 +342,14 @@ fn the_full_lifecycle_works_from_the_command_line() -> Result<()> {
         exit.success(),
         "a daemon asked to stop must exit 0, got {exit:?}"
     );
+    // Any failure to connect proves the point, and the kind is not pinned: a listener would have
+    // accepted, so an error means nothing is serving. Windows reports the same closed loopback
+    // port as a timeout rather than a refusal often enough that requiring ConnectionRefused tests
+    // the platform's error vocabulary instead of the daemon's shutdown.
+    let connected = TcpStream::connect_timeout(&address, Duration::from_millis(500));
     assert!(
-        matches!(
-            TcpStream::connect_timeout(&address, Duration::from_millis(500)),
-            Err(err) if err.kind() == ErrorKind::ConnectionRefused
-        ),
-        "the port must be free once the daemon has exited"
+        connected.is_err(),
+        "the port must be free once the daemon has exited, but a connection was accepted"
     );
     Ok(())
 }
