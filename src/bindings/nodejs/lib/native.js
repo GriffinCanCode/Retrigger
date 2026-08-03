@@ -36,7 +36,6 @@ const TRIPLES = {
   'linux-arm64': ['linux-arm64-gnu', 'linux-arm64-musl'],
   'linux-arm': ['linux-arm-gnueabihf'],
   'linux-ppc64': ['linux-ppc64-gnu'],
-  'linux-s390x': ['linux-s390x-gnu'],
   'freebsd-x64': ['freebsd-x64'],
 };
 

@@ -121,8 +121,15 @@ describe('nonblocking burst hashing', () => {
       () => files.every((file) => events.some((e) => e.path === file && e.kind === 'modified')),
       { timeout: 20000, message: 'not every large file change arrived' }
     );
-    expect(watcher.getStats().asyncHashesInFlight).toBe(0);
-    expect(watcher.getStats().asyncHashesQueued).toBe(0);
+    // The queue must drain to empty. Poll for that rather than asserting it instantaneously: on the
+    // JS engine a single write can surface more than one filesystem event, so a straggler hash may
+    // still be settling the moment the last file's change is first observed. A real leak never
+    // reaches zero and fails this wait on its timeout.
+    await waitFor(
+      () =>
+        watcher.getStats().asyncHashesInFlight === 0 && watcher.getStats().asyncHashesQueued === 0,
+      { timeout: 20000, message: 'async hash queue never drained to zero' }
+    );
     watcher.close();
   });
 

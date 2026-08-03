@@ -248,7 +248,6 @@ describe('package manifest', () => {
       'x86_64-unknown-freebsd': 'freebsd-x64',
       'armv7-unknown-linux-gnueabihf': 'linux-arm-gnueabihf',
       'powerpc64le-unknown-linux-gnu': 'linux-ppc64-gnu',
-      's390x-unknown-linux-gnu': 'linux-s390x-gnu',
     };
 
     const built = pkg.napi.targets.map((triple) => {

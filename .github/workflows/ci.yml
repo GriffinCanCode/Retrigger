@@ -168,6 +168,8 @@ jobs:
           prepare: |
             pkg install -y gmake curl
             pkg install -y node22 || pkg install -y node
+            # FreeBSD's node package ships node but not npm; it is a separate port.
+            pkg install -y npm-node22 || pkg install -y npm
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           run: |
             set -eu

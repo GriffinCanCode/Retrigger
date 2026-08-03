@@ -163,7 +163,7 @@ The failure mode this package works hardest to avoid is an install that throws.
   `RETRIGGER_SILENT=1` suppresses it, and `getEngineInfo().nativeAttempts` explains what
   was tried and why each candidate was rejected.
 - **No runtime dependencies** — the published tarball is 90.2 KiB across 34 entries and
-  contains no native binary. The addon arrives through one of twelve platform packages
+  contains no native binary. The addon arrives through one of eleven platform packages
   listed as `optionalDependencies`, so a platform without one degrades instead of failing.
 - **Both engines are held to one test suite** — the JavaScript fallback, a mock addon, and
   the real compiled addon each run the same parity suite, so the fallback is a substitute
@@ -338,14 +338,14 @@ by layout assertions on both sides, so building does not depend on `bindgen`.
 ## Platform Support
 
 Retrigger runs wherever Node does, though not every platform gets a native binary.
-The Node package ships twelve platform optionalDependencies; each has a release job.
+The Node package ships eleven platform optionalDependencies; each has a release job.
 Verification tiers (what CI/release actually prove):
 
 - **Executed native** — Linux x64/arm64 (gnu + musl), macOS x64/arm64, Windows x64,
   FreeBSD x64 (`vmactions/freebsd-vm`). Full suite on GitHub-hosted OS/arch legs;
   FreeBSD runs the Node package build + test + pack on a real FreeBSD guest.
-- **Cross-built, executed under QEMU** — Linux armv7 (`linux-arm-gnueabihf`),
-  ppc64le, s390x. Built with a free cross toolchain, then `verify-artifact` (and
+- **Cross-built, executed under QEMU** — Linux armv7 (`linux-arm-gnueabihf`) and
+  ppc64le. Built with a free cross toolchain, then `verify-artifact` (and
   post-publish install) under QEMU.
 - **Cross-built, not executed** — Windows arm64. No free arm64 Windows runner; the
   release job emits a `::warning::` and skips the smoke test (same honesty bar as

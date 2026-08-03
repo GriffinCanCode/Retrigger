@@ -585,7 +585,6 @@ aspirational coverage.
 | `x86_64-unknown-freebsd`        | `freebsd-x64`         | Executed native (FreeBSD VM via `vmactions/freebsd-vm`)      |
 | `armv7-unknown-linux-gnueabihf` | `linux-arm-gnueabihf` | Cross-built, executed under QEMU                             |
 | `powerpc64le-unknown-linux-gnu` | `linux-ppc64-gnu`     | Cross-built, executed under QEMU                             |
-| `s390x-unknown-linux-gnu`       | `linux-s390x-gnu`     | Cross-built, executed under QEMU                             |
 
 Linux gnu/musl: the loader detects libc and tries the other build if it guesses wrong.
 FreeBSD uses kqueue. The JavaScript engine works on every platform Node supports.

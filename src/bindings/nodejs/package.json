@@ -70,8 +70,7 @@
       "aarch64-unknown-linux-musl",
       "x86_64-unknown-freebsd",
       "armv7-unknown-linux-gnueabihf",
-      "powerpc64le-unknown-linux-gnu",
-      "s390x-unknown-linux-gnu"
+      "powerpc64le-unknown-linux-gnu"
     ]
   },
   "scripts": {
@@ -119,7 +118,6 @@
     "@retrigger/core-linux-arm64-gnu": "2.0.0",
     "@retrigger/core-linux-arm64-musl": "2.0.0",
     "@retrigger/core-linux-ppc64-gnu": "2.0.0",
-    "@retrigger/core-linux-s390x-gnu": "2.0.0",
     "@retrigger/core-linux-x64-gnu": "2.0.0",
     "@retrigger/core-linux-x64-musl": "2.0.0",
     "@retrigger/core-win32-arm64-msvc": "2.0.0",

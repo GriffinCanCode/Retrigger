@@ -32,7 +32,6 @@ function findAddon() {
       'linux-arm64-musl',
       'linux-arm-gnueabihf',
       'linux-ppc64-gnu',
-      'linux-s390x-gnu',
     ],
     freebsd: ['freebsd-x64'],
   }[process.platform];
