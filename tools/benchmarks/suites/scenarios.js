@@ -9,28 +9,40 @@ const path = require('path');
 const fs = require('fs');
 
 const { CORE } = require('../lib/env');
-const { largeTree, rmTree, writeFile } = require('../lib/fixtures');
+const { largeTree, monorepoTree, rmTree, writeFile } = require('../lib/fixtures');
 const { sleep, waitFor, waitForQuiet, nowNs, elapsedMs } = require('../lib/time');
 const { summarize, withResources, pad, ms, bytes } = require('../lib/stats');
 const { tryImport } = require('../lib/optional');
 
-/** Default monorepo-scale fixture: 40 pkgs × 50 files = 2000 files. */
+/** Medium stress fixture: 40 pkgs × 50 files = 2000 files (flat grid). */
 const TREE = { dirs: 40, filesPerDir: 50, bytesPerFile: 256, seed: 0xc0ffee };
+/** Monorepo-scale fixture: 80 pkgs × 126 nested files (+ package.json) ≈ 10,160. */
+const MONOREPO = { packages: 80, filesPerPackage: 126, bytesPerFile: 256, seed: 0x10f17e };
 const STORM_WRITES = 2000;
+const MONOREPO_STORM_WRITES = 2000;
 const LATENCY_SAMPLES = 30;
 
+function fmtUtil(resources) {
+  const u = resources?.cpuUtilizationPct;
+  return typeof u === 'number' && Number.isFinite(u) ? ` util=${u.toFixed(1)}%` : '';
+}
+
 /**
- * @param {{quiet?: boolean, tree?: typeof TREE}} [opts]
+ * @param {{quiet?: boolean, tree?: typeof TREE, monorepo?: typeof MONOREPO}} [opts]
  */
 async function runScenariosSuite(opts = {}) {
   const quiet = opts.quiet === true;
   const log = quiet ? () => {} : (...args) => console.log(...args);
   const treeOpts = { ...TREE, ...opts.tree };
+  const monoOpts = { ...MONOREPO, ...opts.monorepo };
   const { createRetrigger } = require(CORE);
 
   log('\n══ scenario matrix ══');
   log(
-    `  fixture: ${treeOpts.dirs} dirs × ${treeOpts.filesPerDir} files = ${treeOpts.dirs * treeOpts.filesPerDir} files (${treeOpts.bytesPerFile}B each)`
+    `  medium fixture: ${treeOpts.dirs} dirs × ${treeOpts.filesPerDir} files = ${treeOpts.dirs * treeOpts.filesPerDir} files (${treeOpts.bytesPerFile}B each)`
+  );
+  log(
+    `  monorepo fixture: ${monoOpts.packages} packages × ${monoOpts.filesPerPackage} nested files (+ package.json) ≈ ${monoOpts.packages * (monoOpts.filesPerPackage + 1)} files`
   );
 
   const tree = largeTree(treeOpts);
@@ -48,21 +60,46 @@ async function runScenariosSuite(opts = {}) {
     rmTree(tree.root);
   }
 
-  log(`\n  ${pad('scenario', 28)}  ${pad('status', 8)}  highlight`);
+  const mono = monorepoTree(monoOpts);
+  log(
+    `\n  [monorepo] built ${mono.fileCount} files across ${mono.packages} packages (nested src/test)`
+  );
+  try {
+    cases.push(
+      await scenarioCrawl(createRetrigger, mono, log, {
+        id: 'scenarios/monorepo-crawl-snapshot',
+        label: 'monorepo crawl',
+      })
+    );
+    cases.push(
+      await scenarioStorm(createRetrigger, mono, log, {
+        mode: 'native',
+        id: 'scenarios/monorepo-storm-native',
+        stormWrites: MONOREPO_STORM_WRITES,
+      })
+    );
+  } finally {
+    rmTree(mono.root);
+  }
+
+  log(`\n  ${pad('scenario', 36)}  ${pad('status', 8)}  highlight`);
   for (const c of cases) {
     const highlight = c.status !== 'ok' ? c.error || c.status : formatHighlight(c);
-    log(`  ${pad(c.id, 28)}  ${pad(c.status, 8)}  ${highlight}`);
+    log(`  ${pad(c.id, 36)}  ${pad(c.status, 8)}  ${highlight}`);
   }
 
   return {
     name: 'scenarios',
-    description: 'Startup/crawl, storm, CPU/RSS, large-tree, poll, snapshot, chokidar adapter',
+    description:
+      'Startup/crawl, storm, CPU/RSS/util, medium + monorepo trees, poll, snapshot, chokidar adapter',
     cases,
   };
 }
 
-async function scenarioCrawl(createRetrigger, tree, log) {
-  log('\n  [crawl] snapshot() over large tree');
+async function scenarioCrawl(createRetrigger, tree, log, opts = {}) {
+  const id = opts.id || 'scenarios/crawl-snapshot';
+  const label = opts.label || 'crawl';
+  log(`\n  [${label}] snapshot() over ${tree.fileCount}-file tree`);
   const watcher = createRetrigger({ contentHashing: false });
   try {
     const measured = await withResources(async () => {
@@ -71,17 +108,17 @@ async function scenarioCrawl(createRetrigger, tree, log) {
       return { wallMs: elapsedMs(t0), entries: snap.entries.length, algorithm: snap.algorithm };
     });
     log(
-      `    snapshot: ${measured.result.entries} entries in ${ms(measured.result.wallMs)}  peakRSS=${bytes(measured.resources.rssPeakBytes)}  cpu=${ms(measured.resources.cpuTotalMs)}`
+      `    snapshot: ${measured.result.entries} entries in ${ms(measured.result.wallMs)}  peakRSS=${bytes(measured.resources.rssPeakBytes)}  cpu=${ms(measured.resources.cpuTotalMs)}${fmtUtil(measured.resources)}`
     );
     return {
-      id: 'scenarios/crawl-snapshot',
+      id,
       watcher: 'retrigger',
       status: 'ok',
       metrics: { ...measured.result, fileCount: tree.fileCount },
       resources: measured.resources,
     };
   } catch (err) {
-    return { id: 'scenarios/crawl-snapshot', watcher: 'retrigger', status: 'error', error: err.message };
+    return { id, watcher: 'retrigger', status: 'error', error: err.message };
   } finally {
     watcher.close();
   }
@@ -99,7 +136,7 @@ async function scenarioWatchWithSnapshot(createRetrigger, tree, log) {
       return { readyMs, entries: snap.entries.length };
     });
     log(
-      `    watchWithSnapshot ready: ${ms(measured.result.readyMs)}  entries=${measured.result.entries}  peakRSS=${bytes(measured.resources.rssPeakBytes)}`
+      `    watchWithSnapshot ready: ${ms(measured.result.readyMs)}  entries=${measured.result.entries}  peakRSS=${bytes(measured.resources.rssPeakBytes)}${fmtUtil(measured.resources)}`
     );
     return {
       id: 'scenarios/watch-with-snapshot',
@@ -120,9 +157,11 @@ async function scenarioWatchWithSnapshot(createRetrigger, tree, log) {
   }
 }
 
-async function scenarioStorm(createRetrigger, tree, log, { mode }) {
-  const id = mode === 'poll' ? 'scenarios/storm-poll' : 'scenarios/storm-native';
-  log(`\n  [storm] ${STORM_WRITES} rapid writes (${mode})`);
+async function scenarioStorm(createRetrigger, tree, log, { mode, id: idOpt, stormWrites } = {}) {
+  const id =
+    idOpt || (mode === 'poll' ? 'scenarios/storm-poll' : 'scenarios/storm-native');
+  const writes = stormWrites ?? STORM_WRITES;
+  log(`\n  [storm] ${writes} rapid writes (${mode}) on ${tree.fileCount}-file tree`);
   const opts =
     mode === 'poll'
       ? {
@@ -144,7 +183,7 @@ async function scenarioStorm(createRetrigger, tree, log, { mode }) {
     watcher.start();
     await sleep(400);
 
-    const targets = tree.files.slice(0, Math.min(STORM_WRITES, tree.files.length));
+    const targets = tree.files.slice(0, Math.min(writes, tree.files.length));
     const measured = await withResources(async () => {
       const t0 = nowNs();
       // Half identical (rewrite same buffer), half real.
@@ -174,7 +213,7 @@ async function scenarioStorm(createRetrigger, tree, log, { mode }) {
     });
 
     log(
-      `    writes=${measured.result.writes} delivered=${measured.result.delivered} unchanged=${measured.result.contentUnchanged} dropped=${measured.result.eventsDropped} wall=${ms(measured.result.wallMs)} cpu=${ms(measured.resources.cpuTotalMs)} peakRSS=${bytes(measured.resources.rssPeakBytes)}`
+      `    writes=${measured.result.writes} delivered=${measured.result.delivered} unchanged=${measured.result.contentUnchanged} dropped=${measured.result.eventsDropped} wall=${ms(measured.result.wallMs)} cpu=${ms(measured.resources.cpuTotalMs)}${fmtUtil(measured.resources)} peakRSS=${bytes(measured.resources.rssPeakBytes)}`
     );
     return {
       id,
@@ -223,7 +262,7 @@ async function scenarioChokidarAdapter(tree, log) {
       return { readyMs, stormMs, writes: sample.length, events };
     });
     log(
-      `    ready=${ms(measured.result.readyMs)} storm events=${measured.result.events}/${measured.result.writes} in ${ms(measured.result.stormMs)} peakRSS=${bytes(measured.resources.rssPeakBytes)}`
+      `    ready=${ms(measured.result.readyMs)} storm events=${measured.result.events}/${measured.result.writes} in ${ms(measured.result.stormMs)} peakRSS=${bytes(measured.resources.rssPeakBytes)}${fmtUtil(measured.resources)}`
     );
     return {
       id: 'scenarios/chokidar-adapter',
@@ -279,7 +318,7 @@ async function scenarioChokidarStock(tree, log) {
       return { readyMs, stormMs, writes: sample.length, events };
     });
     log(
-      `    ready=${ms(measured.result.readyMs)} storm events=${measured.result.events}/${measured.result.writes} in ${ms(measured.result.stormMs)} peakRSS=${bytes(measured.resources.rssPeakBytes)}`
+      `    ready=${ms(measured.result.readyMs)} storm events=${measured.result.events}/${measured.result.writes} in ${ms(measured.result.stormMs)} peakRSS=${bytes(measured.resources.rssPeakBytes)}${fmtUtil(measured.resources)}`
     );
     return {
       id: 'scenarios/chokidar-stock',
@@ -337,7 +376,7 @@ async function scenarioLargeTreeLatency(createRetrigger, tree, log) {
       };
     }
     log(
-      `    p50=${ms(measured.result.summary.p50)} p95=${ms(measured.result.summary.p95)} n=${measured.result.summary.count} peakRSS=${bytes(measured.resources.rssPeakBytes)}`
+      `    p50=${ms(measured.result.summary.p50)} p95=${ms(measured.result.summary.p95)} n=${measured.result.summary.count} peakRSS=${bytes(measured.resources.rssPeakBytes)}${fmtUtil(measured.resources)}`
     );
     return {
       id: 'scenarios/large-tree-latency',
@@ -361,12 +400,13 @@ async function scenarioLargeTreeLatency(createRetrigger, tree, log) {
 
 function formatHighlight(c) {
   const m = c.metrics || {};
-  if (m.readyMs != null) return `ready ${ms(m.readyMs)}`;
-  if (m.wallMs != null && m.entries != null) return `${m.entries} entries / ${ms(m.wallMs)}`;
-  if (m.delivered != null) return `delivered ${m.delivered}, drop ${m.eventsDropped}`;
-  if (m.p50 != null) return `p50 ${ms(m.p50)} p95 ${ms(m.p95)}`;
-  if (m.events != null) return `events ${m.events}`;
-  return '';
+  const util = fmtUtil(c.resources);
+  if (m.readyMs != null) return `ready ${ms(m.readyMs)}${util}`;
+  if (m.wallMs != null && m.entries != null) return `${m.entries} entries / ${ms(m.wallMs)}${util}`;
+  if (m.delivered != null) return `delivered ${m.delivered}, drop ${m.eventsDropped}${util}`;
+  if (m.p50 != null) return `p50 ${ms(m.p50)} p95 ${ms(m.p95)}${util}`;
+  if (m.events != null) return `events ${m.events}${util}`;
+  return util.trim();
 }
 
 module.exports = { runScenariosSuite };

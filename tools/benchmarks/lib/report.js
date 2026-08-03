@@ -113,6 +113,11 @@ function renderHash(suite, out) {
   }
 }
 
+function fmtUtil(resources) {
+  const u = resources?.cpuUtilizationPct;
+  return typeof u === 'number' && Number.isFinite(u) ? ` util=${u.toFixed(1)}%` : '';
+}
+
 function renderScenarios(suite, out) {
   for (const c of suite.cases || []) {
     if (c.status !== 'ok') {
@@ -122,16 +127,18 @@ function renderScenarios(suite, out) {
     const m = c.metrics;
     const rss = c.resources ? ` peakRSS=${bytes(c.resources.rssPeakBytes)}` : '';
     const cpu = c.resources ? ` cpu=${ms(c.resources.cpuTotalMs)}` : '';
-    if (m.readyMs != null) out(`  ${c.id}: ready ${ms(m.readyMs)}${rss}${cpu}`);
+    const util = fmtUtil(c.resources);
+    if (m.readyMs != null) out(`  ${c.id}: ready ${ms(m.readyMs)}${rss}${cpu}${util}`);
     else if (m.wallMs != null && m.entries != null)
-      out(`  ${c.id}: ${m.entries} entries in ${ms(m.wallMs)}${rss}${cpu}`);
+      out(`  ${c.id}: ${m.entries} entries in ${ms(m.wallMs)}${rss}${cpu}${util}`);
     else if (m.delivered != null)
       out(
-        `  ${c.id}: delivered=${m.delivered} unchanged=${m.contentUnchanged} dropped=${m.eventsDropped} wall=${ms(m.wallMs)}${rss}${cpu}`
+        `  ${c.id}: delivered=${m.delivered} unchanged=${m.contentUnchanged} dropped=${m.eventsDropped} wall=${ms(m.wallMs)}${rss}${cpu}${util}`
       );
-    else if (m.p50 != null) out(`  ${c.id}: p50=${ms(m.p50)} p95=${ms(m.p95)}${rss}`);
-    else if (m.events != null) out(`  ${c.id}: events=${m.events} ready=${ms(m.readyMs)}${rss}`);
-    else out(`  ${c.id}: ok${rss}${cpu}`);
+    else if (m.p50 != null) out(`  ${c.id}: p50=${ms(m.p50)} p95=${ms(m.p95)}${rss}${util}`);
+    else if (m.events != null)
+      out(`  ${c.id}: events=${m.events} ready=${ms(m.readyMs)}${rss}${util}`);
+    else out(`  ${c.id}: ok${rss}${cpu}${util}`);
   }
 }
 

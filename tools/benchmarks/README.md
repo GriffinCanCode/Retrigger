@@ -24,7 +24,7 @@ optional: a missing one prints `not installed` and is never estimated.
 | **rebuild** (flagship) | `npm run bench:rebuild` | Real Vite + webpack: byte-identical / real / burst writes → rebuild counts + wall time |
 | **watch** | `npm run bench:watch` | Raw FS-event latency vs chokidar / watchpack / parcel / chokidar-adapter / poll |
 | **hash** | `npm run bench:hash` | XXH3 (or JS) throughput |
-| **scenarios** | `npm run bench:scenarios` | Crawl/startup, CPU, peak RSS, event storms, large tree (2k files), snapshot APIs |
+| **scenarios** | `npm run bench:scenarios` | Crawl/startup, CPU/util, peak RSS, event storms, medium tree (2k) + monorepo (≥10k), snapshot APIs |
 
 ```bash
 # All suites → JSON + same-run gates
@@ -91,7 +91,9 @@ JSON Schema: [`schema/results.v1.schema.json`](schema/results.v1.schema.json)
 ```
 
 Raw latency samples are recorded under each case’s `samples` array when applicable.
-Resource counters (`cpuUserMs`, `rssPeakBytes`, …) appear under `resources`.
+Resource counters (`cpuUserMs`, `cpuTotalMs`, `cpuUtilizationPct`, `rssPeakBytes`, …)
+appear under `resources`. `cpuUtilizationPct` is single-core utilization over the
+measured wall window: `(cpuTotalMs / wallMs) * 100` (plus interval min/avg/max).
 
 ## Fixture sizes / seeds
 
@@ -99,7 +101,8 @@ Resource counters (`cpuUserMs`, `rssPeakBytes`, …) appear under `resources`.
 | --- | --- | --- |
 | Vite / webpack rebuild apps | tiny + 8 helper modules | `0x51a7e` / `0x77ebc` |
 | Watch latency dir | 200 files | `0x71a7` |
-| Scenario monorepo tree | 40 × 50 = 2000 files, 256 B | `0xc0ffee` |
+| Scenario medium tree | 40 × 50 = 2000 files (flat), 256 B | `0xc0ffee` |
+| Scenario monorepo tree | 80 pkgs × 126 nested `{src,test}/**/*.{js,ts}` (+ `package.json`) ≈ 10,160 files, 256 B | `0x10f17e` |
 
 Warmup writes precede measured samples. Sample counts are fixed in the suite
 sources (`IDENTICAL_WRITES`, `SAMPLES`, `STORM_WRITES`, …).

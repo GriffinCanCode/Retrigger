@@ -53,7 +53,27 @@
                   "type": "array",
                   "items": { "type": "number" }
                 },
-                "resources": { "type": "object" }
+                "resources": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "cpuUserMs": { "type": "number" },
+                    "cpuSystemMs": { "type": "number" },
+                    "cpuTotalMs": { "type": "number" },
+                    "cpuUtilizationPct": {
+                      "type": "number",
+                      "description": "Single-core CPU utilization over the measured wall window: (cpuTotalMs / wallMs) * 100"
+                    },
+                    "cpuUtilizationMinPct": { "type": "number" },
+                    "cpuUtilizationAvgPct": { "type": "number" },
+                    "cpuUtilizationMaxPct": { "type": "number" },
+                    "wallMs": { "type": "number" },
+                    "rssStartBytes": { "type": "number" },
+                    "rssEndBytes": { "type": "number" },
+                    "rssPeakBytes": { "type": "number" },
+                    "heapUsedEndBytes": { "type": "number" }
+                  }
+                }
               }
             }
           }

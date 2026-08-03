@@ -86,8 +86,8 @@ function webpackFixture(opts = {}) {
 }
 
 /**
- * Large tree for crawl / monorepo / storm scenarios.
- * Layout: packages/pkg-N/src/file-M.js
+ * Medium stress tree for the default crawl / storm scenarios.
+ * Layout: packages/pkg-N/src/file-M.js (flat single-level grid).
  * @param {{dirs?: number, filesPerDir?: number, bytesPerFile?: number, seed?: number}} [opts]
  */
 function largeTree(opts = {}) {
@@ -117,6 +117,75 @@ function largeTree(opts = {}) {
     fileCount: files.length,
     dirs,
     filesPerDir,
+    bytesPerFile,
+    seed,
+  };
+}
+
+/** Nested relative paths under a package: src|test with varied depth + .js/.ts. */
+function monorepoRelPath(area, fileIdx) {
+  const ext = fileIdx % 2 === 0 ? '.js' : '.ts';
+  const name = `file-${String(fileIdx).padStart(3, '0')}${ext}`;
+  const depth = 1 + (fileIdx % 4); // 1..4 levels under area
+  if (area === 'src') {
+    const bucket = ['lib', 'components', 'utils', 'services'][fileIdx % 4];
+    const parts = ['src', bucket];
+    if (depth >= 2) parts.push('nested');
+    if (depth >= 3) parts.push('deep');
+    if (depth >= 4) parts.push(`l${fileIdx % 5}`);
+    parts.push(name);
+    return path.join(...parts);
+  }
+  const bucket = ['unit', 'integration', 'e2e'][fileIdx % 3];
+  const parts = ['test', bucket];
+  if (depth >= 2) parts.push('helpers');
+  if (depth >= 3) parts.push('fixtures');
+  if (depth >= 4) parts.push(`suite-${fileIdx % 3}`);
+  parts.push(name);
+  return path.join(...parts);
+}
+
+/**
+ * Monorepo-scale fixture (≥10k files): packages/<name>/{src,test}/** with nested depth.
+ * Generated at benchmark-run time (mkdir + write loop), not checked into git.
+ * Default: 80 packages × 126 files (+ package.json) ≈ 10,160 files.
+ * @param {{packages?: number, filesPerPackage?: number, bytesPerFile?: number, seed?: number}} [opts]
+ */
+function monorepoTree(opts = {}) {
+  const packageCount = opts.packages ?? 80;
+  const filesPerPackage = opts.filesPerPackage ?? 126;
+  const bytesPerFile = opts.bytesPerFile ?? 256;
+  const seed = opts.seed ?? 0x10f17e;
+  const rand = mulberry32(seed);
+  const root = tempDir('retrigger-bench-monorepo-');
+  const files = [];
+  for (let p = 0; p < packageCount; p += 1) {
+    const pkgName = `pkg-${String(p).padStart(3, '0')}`;
+    const pkgRoot = path.join(root, 'packages', pkgName);
+    const pkgJson = path.join(pkgRoot, 'package.json');
+    writeFile(
+      pkgJson,
+      `${JSON.stringify({ name: `@bench/${pkgName}`, private: true, version: '0.0.0' }, null, 2)}\n`
+    );
+    files.push(pkgJson);
+    for (let f = 0; f < filesPerPackage; f += 1) {
+      // ~60% src / ~40% test, nested depths via monorepoRelPath.
+      const area = f % 5 === 0 || f % 5 === 1 ? 'test' : 'src';
+      const file = path.join(pkgRoot, monorepoRelPath(area, f));
+      const body = Buffer.alloc(bytesPerFile);
+      for (let i = 0; i < bytesPerFile; i += 1) body[i] = Math.floor(rand() * 256);
+      const header = Buffer.from(`// mono pkg=${p} file=${f} area=${area} seed=${seed}\n`);
+      header.copy(body, 0);
+      writeFile(file, body);
+      files.push(file);
+    }
+  }
+  return {
+    root,
+    files,
+    fileCount: files.length,
+    packages: packageCount,
+    filesPerPackage,
     bytesPerFile,
     seed,
   };
@@ -156,6 +225,7 @@ module.exports = {
   viteFixture,
   webpackFixture,
   largeTree,
+  monorepoTree,
   watchFixture,
   rmTree,
   digest,
