@@ -17,7 +17,12 @@ const { createRetriggerVitePlugin, normalizePath } = require('../plugins/vite-pl
 
 /** A real (tiny) Vite project on disk. */
 function fixture() {
-  const dir = tempDir('retrigger-vite-');
+  // Resolved to its real form before Vite sees it as a root. On Windows os.tmpdir() hands back
+  // the 8.3 short path (C:\Users\RUNNER~1\...) while the files Vite goes on to resolve carry the
+  // long one, so the server judges its own root to be outside the allowed filesystem roots and
+  // answers 403. Elsewhere this only settles symlinks such as macOS's /var -> /private/var,
+  // which is the form the watcher reports anyway.
+  const dir = fs.realpathSync.native(tempDir('retrigger-vite-'));
   writeFile(
     path.join(dir, 'index.html'),
     '<html><body><script type="module" src="/main.js"></script></body></html>\n'

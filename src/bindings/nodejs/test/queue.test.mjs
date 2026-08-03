@@ -119,6 +119,16 @@ describe('bounded queue under real filesystem pressure', () => {
     watcher.watch(dir, true);
     watcher.start();
     try {
+      // fs.watch is not armed synchronously on every platform. On Windows the writes below can
+      // all land before the watch is live, and the test then reads a stats block of zeroes and
+      // reports that the queue never overflowed -- a true statement about a watcher that never
+      // saw anything. Prove delivery first, then apply the pressure this test is about.
+      fs.mkdirSync(path.join(dir, 'live-sentinel'), { recursive: true });
+      await waitFor(() => watcher.stats().eventsQueued > 0, {
+        message: 'the watcher never delivered a first event',
+      });
+      for (let event = watcher.poll(); event; event = watcher.poll());
+
       for (let i = 0; i < 300; i += 1) {
         fs.writeFileSync(path.join(dir, `f${i}.js`), String(i));
       }

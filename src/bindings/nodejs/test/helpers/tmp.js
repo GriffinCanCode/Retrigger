@@ -35,7 +35,7 @@ function cleanupTempDirs() {
  *
  * @template T
  * @param {() => T} predicate returns a falsy value until the condition holds
- * @param {{timeout?: number, interval?: number, message?: string}} [options]
+ * @param {{timeout?: number, interval?: number, message?: string|(() => string)}} [options]
  * @returns {Promise<T>}
  */
 async function waitFor(predicate, options = {}) {
@@ -51,7 +51,11 @@ async function waitFor(predicate, options = {}) {
       last = err;
     }
     if (Date.now() >= deadline) {
-      const detail = options.message || 'condition not met';
+      // Called, not interpolated: a message built at failure time is how a caller reports what it
+      // actually saw, and stringifying the function instead prints its source and loses the fact.
+      const detail =
+        (typeof options.message === 'function' ? options.message() : options.message) ||
+        'condition not met';
       const state = last instanceof Error ? last.message : JSON.stringify(last);
       throw new Error(`waitFor timed out after ${timeout}ms: ${detail} (last=${state})`);
     }
