@@ -80,6 +80,20 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang
 
+      # watchman.test.mjs gates its real-service corpus on detectWatchman(). The
+      # Ubuntu universe package (watchman 4.9.x on 24.04 / ubuntu-latest) is old
+      # but enough to speak the daemon protocol; Facebook's newer .deb releases
+      # are not currently published for noble. The binary alone is not enough
+      # for AVAILABLE=true today: detectWatchman probes with `watchman version
+      # -j`, and both apt 4.9 and current upstream treat `-j` as "JSON command
+      # on stdin", so that probe always fails. The fb-watchman client install
+      # below is what flips the gate; this step supplies the daemon it talks to.
+      - name: Install Watchman (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y watchman
+          watchman version
+
       # inotify's default watch limit is low enough that a recursive watch over
       # a large tree can exhaust it. Raise it so a genuine bug is not masked by
       # an environment limit -- and so the limit-exhaustion test stays
@@ -109,6 +123,15 @@ jobs:
 
       - name: Install JS dependencies
         run: npm ci --no-audit --no-fund
+        working-directory: src/bindings/nodejs
+
+      # CI-only: not a package dependency. detectWatchman's preferred path is the
+      # fb-watchman npm client; without it the real-service tier in
+      # watchman.test.mjs stays skipIf'd (see Install Watchman comment above).
+      # --no-save / --no-package-lock keep package.json and the lockfile clean.
+      - name: Install fb-watchman client (Linux)
+        if: runner.os == 'Linux'
+        run: npm install --no-save --no-package-lock --no-audit --no-fund fb-watchman
         working-directory: src/bindings/nodejs
 
       # Build the addon this package actually ships, so the native-parity suite
