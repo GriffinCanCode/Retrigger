@@ -82,15 +82,18 @@ const ERROR_STREAK_LIMIT = 5;
  * neither `vite`'s own `FSWatcher` nor `chokidar` are usable here.
  *
  * `fs.watch(dir, { recursive: true })` is natively supported on macOS and Windows, and by Node
- * itself on Linux since v20.13; where a root does not support it, or has vanished, that one root
- * is silently left uncovered rather than throwing — this watcher's whole purpose is to never be
- * the reason a dev server hook throws.
+ * itself on Linux since v20; where recursion is unavailable (Linux before Node 20) it falls back to
+ * one non-recursive handle per directory, extended as subdirectories appear, so the tree still stays
+ * covered. A root that has vanished is skipped rather than throwing — this watcher's whole purpose
+ * is to never be the reason a dev server hook throws.
  */
 class FailOpenWatcher extends EventEmitter {
   constructor(roots) {
     super();
     /** @type {import('fs').FSWatcher[]} */
     this._handles = [];
+    /** @type {Set<string>} directories already covered by a non-recursive handle. */
+    this._watchedDirs = new Set();
     for (const root of roots) this._attach(root);
   }
 
@@ -104,8 +107,43 @@ class FailOpenWatcher extends EventEmitter {
       });
       this._handles.push(handle);
     } catch {
-      /* recursive fs.watch unsupported here, or the root disappeared before this could attach */
+      // Recursive fs.watch is unavailable here -- Linux before Node 20 -- or the root vanished
+      // mid-attach. Rather than leave the tree silently uncovered, watch every directory
+      // non-recursively and extend to new subdirectories as they appear: the same shape the JS
+      // engine uses where the platform has no recursive watch.
+      this._attachByDirectory(root);
     }
+  }
+
+  /** One handle per directory, extended to subdirectories as they are created, for platforms
+   * without recursive fs.watch. */
+  _attachByDirectory(dir) {
+    if (this._watchedDirs.has(dir)) return;
+    let handle;
+    try {
+      handle = fs.watch(dir, { persistent: false }, (_type, filename) => {
+        if (!filename) return;
+        const target = path.join(dir, filename.toString());
+        fs.stat(target, (err, stat) => {
+          if (err) this.emit('unlink', target);
+          else if (stat.isDirectory()) this._attachByDirectory(target);
+          else this.emit('change', target);
+        });
+      });
+    } catch {
+      return; /* the directory disappeared before this could attach */
+    }
+    handle.on('error', () => {
+      /* one directory's handle failing must not take the others down */
+    });
+    this._watchedDirs.add(dir);
+    this._handles.push(handle);
+    fs.readdir(dir, { withFileTypes: true }, (err, entries) => {
+      if (err) return;
+      for (const entry of entries) {
+        if (entry.isDirectory()) this._attachByDirectory(path.join(dir, entry.name));
+      }
+    });
   }
 
   /** Neither a size nor a rename direction is available from a raw `fs.watch` event, so a path
@@ -135,6 +173,7 @@ class FailOpenWatcher extends EventEmitter {
       }
     }
     this._handles = [];
+    this._watchedDirs.clear();
   }
 }
 
