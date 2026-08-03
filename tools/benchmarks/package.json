@@ -23,7 +23,7 @@
     "watchpack": "^2.5.2"
   },
   "devDependencies": {
-    "vite": "^6.4.3",
+    "vite": "^8.2.0",
     "webpack": "^5.109.2"
   },
   "private": true
