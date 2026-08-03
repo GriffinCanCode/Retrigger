@@ -38,6 +38,7 @@ A zero-dependency JavaScript fallback keeps it working on platforms with no nati
 - [Chokidar-Compatible Adapter](#chokidar-compatible-adapter)
 - [Requirements](#requirements)
 - [Native platform matrix](#native-platform-matrix)
+- [Known Limitations](#known-limitations)
 - [Who Should Not Be Here](#who-should-not-be-here)
 - [Reporting a Problem](#reporting-a-problem)
 - [License](#license)
@@ -287,8 +288,14 @@ Watcher contracts worth knowing (explicit, not magic):
 - **Atomic saves** — `atomicWriteNormalization: true` folds temp-then-rename into one
   `change`.
 - **Symlinks** — native follows per OS behaviour; the JavaScript engine does not traverse
-  symlinked directories. Permission errors and unreadable paths fail open as
-  `contentChanged: true` (never silently "unchanged").
+  symlinked directories.
+- **Unreadable files during hashing** — if a changed path cannot be read for a content
+  hash, the content-hashing layer reports `contentChanged: true` with a `null` hash
+  (never silently "unchanged"). That is fail-open on the hash attempt; see
+  [Content Changes](#content-changes).
+- **Permission-denied watch roots** — if a watched path itself cannot be registered
+  because of permissions, watch registration fails. That is not the hashing fail-open
+  above.
 - **Async hashing** — files above `maxHashBytes` hash off the drain loop so large bursts do
   not block the event loop; `maxConcurrentHashes` caps concurrency.
 
@@ -587,10 +594,28 @@ aspirational coverage.
 | `powerpc64le-unknown-linux-gnu` | `linux-ppc64-gnu`     | Cross-built, executed under QEMU                             |
 
 Linux gnu/musl: the loader detects libc and tries the other build if it guesses wrong.
-On FreeBSD the native engine re-scans on an interval (`backend()` reports `"polling"`)
-rather than using `kqueue`, whose recursive mode does not reliably observe directories
-created after the watch begins; every other platform uses its native OS backend. The
-JavaScript engine works on every platform Node supports.
+FreeBSD uses kqueue and is supported through the **native engine only**: Node's
+`fs.watch` cannot back the JavaScript fallback reliably on BSD (no recursive mode, and
+directory watches do not deliver filenames or content-modification events), so a FreeBSD
+deployment must run on the native addon, which ships for `freebsd-x64`. The JavaScript
+engine works on every other platform Node supports.
+
+## Known Limitations
+
+Stated plainly, alongside the platform matrix above.
+
+- **Windows arm64 is cross-built, not executed** — `win32-arm64-msvc`
+  (`aarch64-pc-windows-msvc`) ships, but CI never executes it: there is no free arm64
+  Windows runner. See the matrix row above.
+- **BSD-family native support is FreeBSD only** — only `freebsd-x64` has a native binary.
+  NetBSD, OpenBSD, illumos, and similar platforms have no native addon and fall back to
+  the JavaScript engine.
+- **Windows CI skips Node 18** — the Windows test matrix runs Node 20 and 22; Linux and
+  macOS also run Node 18 legs. The package still requires Node 18.17 or newer.
+- **Adversarial `campaign` workflow skips Windows** — the on-demand chaos/fuzz campaign
+  (`workflow_dispatch`) runs its matrix on linux-x64 and macos-arm64 only.
+- **Adoption** — no documented independent production deployments or case studies yet;
+  see [the repository README](https://github.com/GriffinCanCode/Retrigger#known-limitations).
 
 ## Who Should Not Be Here
 

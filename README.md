@@ -39,6 +39,7 @@ npm install @retrigger/core
 - [The Optional Daemon](#the-optional-daemon)
 - [Building from Source](#building-from-source)
 - [Platform Support](#platform-support)
+- [Known Limitations](#known-limitations)
 - [Who Should Not Be Here](#who-should-not-be-here)
 - [Reporting a Problem](#reporting-a-problem)
 - [License](#license)
@@ -354,6 +355,22 @@ Verification tiers (what CI/release actually prove):
 
 See [the package README](src/bindings/nodejs/README.md#native-platform-matrix) for the
 full triple → package suffix table.
+
+## Known Limitations
+
+Stated the same way as the rest of this document.
+
+- **No documented production adoption yet** — this repository and the published
+  `@retrigger/core` package are not yet used by any documented independent production
+  deployment, case study, or notable npm dependent. That is an absence of evidence, not a
+  claim about fitness.
+- **Windows arm64 is cross-built, not executed** — `aarch64-pc-windows-msvc` ships as a
+  release artifact, but there is no free arm64 Windows CI runner, so the binary is never
+  smoke-tested on real hardware. See [Platform Support](#platform-support).
+- **BSD-family native support is FreeBSD only** — of the BSD-family and adjacent Unixes,
+  only FreeBSD x64 gets a native addon (`freebsd-x64`). NetBSD, OpenBSD, illumos, and
+  similar platforms have no native binary and fall back to the JavaScript/`fs.watch`
+  engine.
 
 ## Who Should Not Be Here
 
