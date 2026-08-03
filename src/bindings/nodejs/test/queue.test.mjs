@@ -131,6 +131,11 @@ describe('bounded queue under real filesystem pressure', () => {
 
       for (let i = 0; i < 300; i += 1) {
         fs.writeFileSync(path.join(dir, `f${i}.js`), String(i));
+        // Yielded for the same reason the churn test does it: the watcher reads its notifications
+        // on this event loop, and a burst written without ever releasing it is a test of the loop
+        // rather than of the queue. Nothing polls here, so the backlog still overflows -- which is
+        // the point -- it simply gets the chance to arrive first.
+        if (i % 25 === 24) await new Promise((resolve) => setImmediate(resolve));
       }
       await waitFor(() => watcher.stats().eventsDropped > 0, {
         // Built at failure time and including what the watcher itself saw: a stats block of zeroes

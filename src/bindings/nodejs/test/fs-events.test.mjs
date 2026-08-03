@@ -68,6 +68,13 @@ describe('JavaScript engine against a real filesystem', () => {
     const count = 400;
     for (let i = 0; i < count; i += 1) {
       fs.writeFileSync(path.join(dir, `churn-${i}.js`), `export const i = ${i};`);
+      // Yielded periodically, because the watcher collects its notifications on this same event
+      // loop. A churn of this size in the real world comes from another process -- a checkout, an
+      // install, a build writing its output -- and leaves the loop free to keep up. A synchronous
+      // 400-write loop instead starves the reader for the whole burst, and where the OS holds
+      // pending notifications in a fixed buffer rather than a kernel queue, the ones that arrive
+      // with nobody to collect them are discarded. That measures the loop, not the watcher.
+      if (i % 25 === 24) await new Promise((resolve) => setImmediate(resolve));
     }
     await waitFor(() => new Set(pathsOf(events, 'created')).size >= count, {
       timeout: 20000,
