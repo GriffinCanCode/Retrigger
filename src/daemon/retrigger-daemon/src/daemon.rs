@@ -257,6 +257,13 @@ impl Daemon {
     /// A point-in-time snapshot of everything the daemon knows about itself.
     #[must_use]
     pub fn stats(&self) -> DaemonStats {
+        // Read the downstream counter (the processor's `files_hashed`) before the upstream one
+        // (`events_processed`): paired with `pump` counting an event before hashing it, sampling
+        // hashes first guarantees the snapshot never shows more hashes than events, even while the
+        // pump is mid-event. The reverse order can momentarily read a fresh hash against a stale
+        // event count.
+        let processor = self.processor.stats();
+        let events_processed = self.counters.events_processed.load(Ordering::Relaxed);
         DaemonStats {
             version: VERSION.to_owned(),
             pid: std::process::id(),
@@ -272,11 +279,11 @@ impl Daemon {
                 .map(|(path, recursive)| WatchedPath { path, recursive })
                 .collect(),
             subscribers: self.counters.subscribers.load(Ordering::Relaxed),
-            events_processed: self.counters.events_processed.load(Ordering::Relaxed),
+            events_processed,
             changes_detected: self.counters.changes_detected.load(Ordering::Relaxed),
             rescans: self.counters.rescans.load(Ordering::Relaxed),
             watcher: self.watcher.stats(),
-            processor: self.processor.stats(),
+            processor,
         }
     }
 }
@@ -313,9 +320,14 @@ fn pump(
         };
 
         let rescan = event.kind == EventKind::RescanRequired;
+        // Count the event as processed before handing it to the processor, which hashes inside
+        // `process`. Incrementing after would let `files_hashed` briefly lead `events_processed`,
+        // so a status snapshot taken in that window reports more hashes than events -- a false
+        // accounting violation. Counting first keeps `events_processed >= files_hashed` true at
+        // every instant.
+        counters.events_processed.fetch_add(1, Ordering::Relaxed);
         let processed = processor.process(event);
 
-        counters.events_processed.fetch_add(1, Ordering::Relaxed);
         if processed.content_changed {
             counters.changes_detected.fetch_add(1, Ordering::Relaxed);
         }
