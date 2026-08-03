@@ -363,8 +363,9 @@ async fn a_file_change_reaches_a_subscriber_with_the_xxh3_digest() -> Result<()>
     let harness = Harness::start().await?;
     let contents = b"the bytes that must be hashed".to_vec();
     let expected = retrigger_core::hash(&contents);
+    let whole = contents.len() as u64;
 
-    let reader = tokio::spawn(stream_events(harness.address, 1, EVENT_BUDGET));
+    let reader = tokio::spawn(stream_events(harness.address, 4, EVENT_BUDGET));
     // Nothing is written until the subscription is registered, or the change could be missed.
     harness
         .await_subscribers(1, Duration::from_secs(10))
@@ -374,9 +375,16 @@ async fn a_file_change_reaches_a_subscriber_with_the_xxh3_digest() -> Result<()>
     let events = reader.await??;
     writer.abort();
 
+    // Not simply the first event. `std::fs::write` creates the file and then fills it, and the
+    // watcher is entitled to report the empty file it saw in between -- on Windows it regularly
+    // does, and that event is correct: it carries the digest of no bytes. The claim being made
+    // here is about the event that reports the settled file.
     let event = events
-        .first()
-        .context("no file event reached the subscriber within the budget")?;
+        .iter()
+        .find(|event| event["event"]["size"].as_u64() == Some(whole))
+        .with_context(|| {
+            format!("no event reported the file at its full length within the budget: {events:#?}")
+        })?;
     assert_eq!(
         event["hash"].as_u64(),
         Some(expected),
@@ -401,8 +409,8 @@ async fn two_subscribers_see_the_same_change() -> Result<()> {
     let harness = Harness::start().await?;
     let contents = b"shared".to_vec();
 
-    let first = tokio::spawn(stream_events(harness.address, 1, EVENT_BUDGET));
-    let second = tokio::spawn(stream_events(harness.address, 1, EVENT_BUDGET));
+    let first = tokio::spawn(stream_events(harness.address, 4, EVENT_BUDGET));
+    let second = tokio::spawn(stream_events(harness.address, 4, EVENT_BUDGET));
     harness
         .await_subscribers(2, Duration::from_secs(10))
         .await?;
@@ -412,8 +420,14 @@ async fn two_subscribers_see_the_same_change() -> Result<()> {
     writer.abort();
 
     let expected = retrigger_core::hash(&contents);
+    let whole = contents.len() as u64;
     for events in [&first, &second] {
-        let event = events.first().context("a subscriber received nothing")?;
+        // The settled file rather than the first event, for the reason given in the digest test:
+        // a create caught before the bytes land is a real event about a real empty file.
+        let event = events
+            .iter()
+            .find(|event| event["event"]["size"].as_u64() == Some(whole))
+            .with_context(|| format!("a subscriber saw no completed write: {events:#?}"))?;
         assert_eq!(event["hash"].as_u64(), Some(expected));
     }
 
