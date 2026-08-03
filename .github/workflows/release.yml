@@ -193,7 +193,6 @@ jobs:
   build-musl:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.host }}
-    container: node:22-alpine
     needs: guard
     strategy:
       fail-fast: false
@@ -202,39 +201,41 @@ jobs:
           - { host: ubuntu-latest,    target: x86_64-unknown-linux-musl }
           - { host: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
 
-    env:
-      RUSTFLAGS: '-C target-feature=-crt-static'
-
+    # Alpine is entered per step rather than declared as the job's `container:`.
+    # GitHub runs its JavaScript actions -- checkout and upload-artifact among
+    # them -- inside the job container, and refuses to do that for an Alpine
+    # image on an arm64 runner: "JavaScript Actions in Alpine containers are
+    # only supported on x64 Linux runners". Keeping the actions on the host and
+    # putting only the build in Alpine is what lets one job serve both
+    # architectures, and both remain native builds on native hardware.
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install toolchain
-        run: apk add --no-cache build-base clang clang-dev llvm-dev rust cargo make bash python3 git
-
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-        working-directory: ${{ env.NODE_DIR }}
-
-      - name: Build the C hash engine
-        run: make build-core BUILD_TYPE=release
-
-      - name: Build native addon
-        run: npm run build
-        working-directory: ${{ env.NODE_DIR }}
-
-      # The whole point of building in Alpine instead of cross-compiling.
-      - name: Verify the artifact loads and computes
-        run: node scripts/verify-artifact.js
-        working-directory: ${{ env.NODE_DIR }}
-
-      # A native build is named by the host, so this is also the check that the
-      # runner really was musl and not a glibc image that quietly stood in.
-      - name: Confirm the artifact is the musl one
-        shell: sh
+      - name: Build and verify inside Alpine
         run: |
-          cd "$NODE_DIR"
+          cat > "$RUNNER_TEMP/build-musl.sh" <<'SCRIPT'
+          set -eu
+          apk add --no-cache build-base clang clang-dev llvm-dev rust cargo make bash python3 git
+          cd "/work/$NODE_DIR"
+          npm ci --no-audit --no-fund
+          cd /work
+          make build-core BUILD_TYPE=release
+          cd "/work/$NODE_DIR"
+          npm run build
+          # The whole point of building in Alpine instead of cross-compiling.
+          node scripts/verify-artifact.js
+          # A native build is named by the host, so this is also the check that
+          # the runner really was musl and not a glibc image standing in.
           ls *.node
-          test -f retrigger-nodejs-bindings.$(node -p "process.arch === 'x64' ? 'linux-x64-musl' : 'linux-arm64-musl'").node
+          test -f "retrigger-nodejs-bindings.$(node -p "process.arch === 'x64' ? 'linux-x64-musl' : 'linux-arm64-musl'").node"
+          SCRIPT
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$RUNNER_TEMP/build-musl.sh:/build-musl.sh:ro" \
+            -w /work \
+            -e NODE_DIR="$NODE_DIR" \
+            -e RUSTFLAGS='-C target-feature=-crt-static' \
+            node:22-alpine sh /build-musl.sh
 
       - uses: actions/upload-artifact@v7
         with:
