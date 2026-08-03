@@ -321,12 +321,16 @@ describe('vite plugin', () => {
     plugin.buildEnd();
     expect(plugin.api.isWatching()).toBe(false);
 
-    const baseline = dispatched;
+    const baseline = plugin.api.getStats().metrics.triggers;
     writeFile(project.mod, 'export const n = 9;\n');
-    // Vite's own chokidar watcher may still fire; what must not happen is a
-    // *second*, Retrigger-sourced dispatch for the same write.
-    const total = await waitForQuiet(() => dispatched, { quietMs: 200, timeout: 2000 });
-    expect(total - baseline).toBeLessThanOrEqual(1);
+    // Counting Retrigger's own dispatches rather than the events arriving on
+    // Vite's watcher: after teardown this plugin must contribute nothing, but
+    // Vite's chokidar is still running and is free to report one write however
+    // many times it likes -- on macOS a single write commonly surfaces as both
+    // a content change and a metadata change, so a total-based bound fails for
+    // a reason that has nothing to do with this plugin.
+    await waitForQuiet(() => dispatched, { quietMs: 200, timeout: 2000 });
+    expect(plugin.api.getStats().metrics.triggers).toBe(baseline);
   });
 
   it('degrades instead of throwing when the engine cannot start', async () => {

@@ -310,18 +310,31 @@ async fn a_watch_can_be_added_and_removed_at_runtime() -> Result<()> {
     harness.shutdown().await
 }
 
+/// An absolute path that does not exist, spelled for the platform running the test.
+///
+/// Absolute matters: the API refuses a relative path with a 400 before it can discover that the
+/// target is missing, and "missing" is what these assertions are about. A bare `/nope` is
+/// absolute on Unix and merely rootless on Windows, where absolute means a drive or a UNC share.
+fn absent(name: &str) -> String {
+    if cfg!(windows) {
+        format!("C:\\definitely\\not\\here\\{name}")
+    } else {
+        format!("/definitely/not/here/{name}")
+    }
+}
+
 #[tokio::test]
 async fn bad_watch_requests_are_rejected_with_a_code_the_client_can_act_on() -> Result<()> {
     let harness = Harness::start().await?;
 
     let missing = harness
-        .post_json("/watch", "{\"path\":\"/definitely/not/here\"}")
+        .post_json("/watch", &format!("{{\"path\":{:?}}}", absent("watch")))
         .await?;
     assert_eq!(missing.status, 404, "{}", missing.body);
     assert!(missing.body.contains("error"), "{}", missing.body);
 
     let unwatched = harness
-        .post_json("/unwatch", "{\"path\":\"/never/registered\"}")
+        .post_json("/unwatch", &format!("{{\"path\":{:?}}}", absent("unwatch")))
         .await?;
     assert_eq!(unwatched.status, 404, "{}", unwatched.body);
 
