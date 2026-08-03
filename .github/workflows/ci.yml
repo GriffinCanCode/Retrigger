@@ -175,7 +175,12 @@ jobs:
             set -eu
             . "$HOME/.cargo/env"
             cd src/bindings/nodejs
-            npm ci --no-audit --no-fund
+            # `npm install`, not `npm ci`: FreeBSD's pkg ships a newer, stricter npm
+            # that fails `npm ci` because the unpublished @retrigger/core-* platform
+            # optionalDependencies have no resolved nodes in the lock (they 404 until
+            # the release publishes them). install reconciles instead of strictly
+            # validating, so the leg is not blocked by a chicken-and-egg.
+            npm install --no-audit --no-fund
             npm run build
             npm test
             npm run test:pack
