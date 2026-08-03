@@ -60,6 +60,18 @@ pub enum WatchError {
     /// An I/O error occurred while inspecting a path.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+
+    /// A directory tree exceeded the bound [`Watcher::snapshot`](crate::Watcher::snapshot) is
+    /// willing to hold in memory at once.
+    ///
+    /// The honest answer for a tree too large to inventory in one call, for the same reason
+    /// [`EventKind::RescanRequired`](crate::EventKind::RescanRequired) exists: reporting a
+    /// truncated snapshot as complete would be a silent wrong answer, which a content-addressed
+    /// cache can never safely recover from.
+    #[error(
+        "cannot snapshot {0}: the tree exceeds the entries this crate will hold in one inventory"
+    )]
+    ScanTooLarge(PathBuf),
 }
 
 impl WatchError {

@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { defineConfig, configDefaults } from 'vitest/config';
 
 // vite is deliberately held at 6 even though 8 is current, and it is a test-only
 // dependency: nothing published imports it, and plugins/vite-plugin.js
@@ -13,6 +13,12 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/**/*.test.mjs'],
+    // rspack-extra.test.mjs has no webpack-side default run: it exercises Rspack's
+    // `cache.type: 'persistent'` shape, which is not a valid webpack 5 cache option, so it only
+    // makes sense under vitest.rspack.config.mjs's `webpack -> @rspack/core` alias (`npm run
+    // test:rspack`). test/webpack.test.mjs itself has no such exclusion -- it is the shared
+    // suite that *does* run for real here, against real webpack, exactly as before.
+    exclude: [...configDefaults.exclude, 'test/rspack-extra.test.mjs'],
     // Real filesystem watchers, a real webpack watch build and a real Vite dev
     // server all need generous but bounded time.
     testTimeout: 30000,

@@ -33,6 +33,29 @@ pub enum Backend {
     Polling,
 }
 
+/// Which backend implementation drives event delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BackendMode {
+    /// Whatever `notify` recommends for the current platform: `inotify` on Linux, `FSEvents` on
+    /// macOS, `ReadDirectoryChangesW` on Windows.
+    #[default]
+    Auto,
+    /// Force `notify`'s portable polling backend, which re-`stat`s watched paths on an interval
+    /// instead of asking the kernel.
+    ///
+    /// The one honest way to watch a network file system (NFS, SMB, and similar): kernel watch
+    /// events are unreliable or entirely absent over them, whereas polling degrades gracefully to
+    /// however fast the mount answers `stat`. It costs real CPU and I/O in proportion to tree size
+    /// and `interval`, which is why it is never chosen automatically.
+    Poll {
+        /// How often to re-scan watched paths.
+        interval: Duration,
+        /// Whether to also hash file contents to detect changes size and modification time miss —
+        /// significant extra cost, since every watched file is read on every interval.
+        compare_contents: bool,
+    },
+}
+
 /// Watcher configuration.
 ///
 /// Construct with `..Default::default()` and override what you care about:
@@ -70,15 +93,52 @@ pub struct WatcherConfig {
     /// a file it was woken for mid-write. Raising this therefore trades freshness for fewer
     /// wake-ups in both directions.
     pub debounce: Duration,
-    /// Whether the backend follows symbolic links when recursing.
+    /// Whether symbolic links are followed, for two distinct questions this one flag answers.
     ///
-    /// Honoured by inotify, kqueue, and the polling backend. macOS `FSEvents` does not expose the
-    /// choice and always reports the resolved path.
+    /// 1. **Descent.** Whether the backend walks *through* a symlinked directory when recursing,
+    ///    rather than reporting the link itself and stopping. Honoured by inotify, kqueue, and
+    ///    the polling backend; macOS `FSEvents` does not expose the choice and always resolves.
+    ///    This crate's own directory reconciliation (see [`crate::scan`]) never follows a
+    ///    symlinked directory regardless of this setting — loop safety is structural, not
+    ///    configurable, because a link back into its own ancestry would otherwise recurse forever.
+    /// 2. **Inspection.** Whether [`Watcher::watch`](crate::Watcher::watch) and the per-event
+    ///    `stat` that fills in [`FileEvent::size`](crate::FileEvent::size) resolve a symlinked
+    ///    *event path* (`stat`, following the link) or report the link itself (`lstat`, `false`).
+    ///    This is the sense in which a caller who watches a symlink and sets this to `false` sees
+    ///    the link's own size and existence rather than its target's.
+    ///
+    /// Both default to `true` — the historical, link-transparent behaviour.
     pub follow_symlinks: bool,
     /// Include/exclude filtering, applied before events are queued.
     ///
     /// Defaults to [`EventFilter::new`] — no filtering at all.
     pub filter: EventFilter,
+    /// Which backend drives event delivery.
+    ///
+    /// Defaults to [`BackendMode::Auto`], which preserves this crate's original behaviour
+    /// exactly. [`BackendMode::Poll`] is for network file systems and similar mounts where kernel
+    /// watch events cannot be trusted; see its documentation for the cost.
+    pub backend: BackendMode,
+    /// Hold a changed file until it stops growing before reporting it ("await write finish").
+    ///
+    /// `None` (the default) preserves this crate's original behaviour: an event is reported as
+    /// soon as the backend sees it, which for a large file being written in chunks means the
+    /// first chunk. When set, a [coalescable](crate::EventKind::is_coalescable) event for a
+    /// non-directory path is held and re-`stat`d on [`poll_interval`](AwaitWriteFinishConfig::poll_interval);
+    /// once its size and modification time have been unchanged for
+    /// [`stability_threshold`](AwaitWriteFinishConfig::stability_threshold), exactly one
+    /// [`Modified`](crate::EventKind::Modified) is delivered. A removal or rename for a path being
+    /// held cancels the hold and is delivered immediately — this can never delay or hide a delete.
+    pub await_write_finish: Option<AwaitWriteFinishConfig>,
+    /// Fold an atomic-save `RenamedTo` for a path the consumer has already seen arrive into
+    /// [`Modified`](crate::EventKind::Modified).
+    ///
+    /// Off by default, which preserves this crate's original behaviour: editors and build tools
+    /// that save atomically (write a temp file, `rename` it over the target) produce a
+    /// `RenamedTo` for a path that already exists, and a consumer that only reacts to `Modified`
+    /// would otherwise miss it. A `RenamedTo` for a path that has never been announced is a
+    /// genuine arrival and is never folded, flag or no flag.
+    pub atomic_write_normalization: bool,
 }
 
 impl Default for WatcherConfig {
@@ -88,8 +148,20 @@ impl Default for WatcherConfig {
             debounce: DEFAULT_DEBOUNCE,
             follow_symlinks: true,
             filter: EventFilter::new(),
+            backend: BackendMode::Auto,
+            await_write_finish: None,
+            atomic_write_normalization: false,
         }
     }
+}
+
+/// [`WatcherConfig::await_write_finish`] thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AwaitWriteFinishConfig {
+    /// How often to re-`stat` a path while waiting for it to settle.
+    pub poll_interval: Duration,
+    /// How long a path's size and modification time must be unchanged before it is reported.
+    pub stability_threshold: Duration,
 }
 
 /// A point-in-time snapshot of watcher counters.
@@ -160,6 +232,14 @@ mod tests {
             config.filter.is_empty(),
             "the default filter must not silently swallow paths"
         );
+        assert_eq!(config.backend, BackendMode::Auto);
+        assert_eq!(config.await_write_finish, None);
+        assert!(!config.atomic_write_normalization);
+    }
+
+    #[test]
+    fn backend_mode_defaults_to_auto() {
+        assert_eq!(BackendMode::default(), BackendMode::Auto);
     }
 
     #[test]

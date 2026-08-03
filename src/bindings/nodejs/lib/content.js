@@ -10,11 +10,11 @@
  *
  * # Why this lives above the engine
  *
- * The native addon and the JavaScript fallback hash with different algorithms — XXH3-64 and
- * BLAKE2b-64 — and `lib/hash-js` is explicit that the two digest *values* are not comparable. They
- * do not have to be. This compares a path against its own previous digest, taken by the same engine,
- * in the same process. Both engines therefore reach identical `contentChanged` decisions from
- * non-identical digests, which is why the decision is made here once rather than twice below.
+ * The native addon and the JavaScript fallback both hash with XXH3-64 (`lib/hash-js` compiles the
+ * same engine to WebAssembly), so a digest from one is in fact comparable to a digest from the
+ * other. This module never relies on that: it compares a path against its own previous digest,
+ * taken by the same engine, in the same process, which is what makes the decision below correct
+ * even on the day the two engines' outputs happen to differ for a reason neither has yet.
  *
  * # The decision table
  *
@@ -25,8 +25,8 @@
  * |-------------------------------------------------------------|------------------|
  * | file created/modified/metadata/rename-target, digest differs  | `true`           |
  * | ditto, digest matches the cached one                          | `false`          |
- * | file could not be read                                        | `true`           |
- * | file too large to hash within the budget                      | `true`           |
+ * | file could not be read (or, for `annotateAsync`, aborted)      | `true`           |
+ * | file too large to hash synchronously within the budget        | `true`           |
  * | file deleted or renamed away                                  | `true`           |
  * | directory created/deleted/renamed                             | `true`           |
  * | directory modified/metadata                                   | `false`          |
@@ -34,6 +34,9 @@
  *
  * Every uncertain case answers `true`. Unknown is not the same as unchanged: a redundant rebuild
  * costs a few seconds, a missed one costs a developer their afternoon.
+ *
+ * The size budget row is `annotate`'s alone: `annotateAsync` exists precisely so a file over that
+ * budget is still read, on the non-blocking path, rather than answered with a guess.
  */
 
 const path = require('path');
@@ -47,13 +50,16 @@ const { BoundedMap } = require('./bounded');
 const DEFAULT_MAX_ENTRIES = 100000;
 
 /**
- * Largest file hashed before the answer is assumed to be "changed".
+ * Largest file `annotate` hashes synchronously before the answer is assumed to be "changed".
  *
- * Hashing happens on the drain loop, so it is time the event loop does not have this tick. At the
- * throughputs this package measures, a source file costs tens of microseconds and is unambiguously
- * worth it against a rebuild. A large artifact is not: it is both slow to hash and unlikely to be a
- * hand-edit whose bytes are unchanged. Past this size the file is reported as changed without being
- * read, which is the same fail-safe direction as an unreadable file.
+ * `annotate` hashing happens on the drain loop, so it is time the event loop does not have this
+ * tick. At the throughputs this package measures, a source file costs tens of microseconds and is
+ * unambiguously worth it against a rebuild. Past this size the file is reported as changed without
+ * being read synchronously, which is the same fail-safe direction as an unreadable file. `annotateAsync`
+ * uses this same threshold the other way around: at or under it a file is small enough that hashing
+ * it synchronously is still cheaper than the bookkeeping an async read costs, so `Retrigger`'s drain
+ * loop routes only files over this size to the non-blocking path (`engine.hashFile`) instead of
+ * skipping them.
  */
 const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -65,7 +71,9 @@ const STRUCTURAL = new Set(['created', 'deleted', 'renamedFrom', 'renamedTo']);
 
 class ContentTracker {
   /**
-   * @param {{hashFileSync: (file: string) => {hash: string, size: number}}} engine
+   * @param {{hashFileSync: (file: string) => {hash: string, size: number},
+   *   hashFile?: (file: string, options?: {signal?: AbortSignal}) =>
+   *     Promise<{hash: string, size: number}>}} engine
    * @param {{maxEntries?: number, maxBytes?: number}} [options]
    */
   constructor(engine, options = {}) {
@@ -75,6 +83,29 @@ class ContentTracker {
     this.filesHashed = 0;
     this.hashErrors = 0;
     this.unchanged = 0;
+  }
+
+  /**
+   * The size, in bytes, past which a caller should prefer {@link annotateAsync} to
+   * {@link annotate} for a file event — the threshold `_fingerprint` itself uses to decide
+   * whether reading a file synchronously is still worth it.
+   * @returns {number}
+   */
+  get maxBytes() {
+    return this._maxBytes;
+  }
+
+  /**
+   * Whether `event` is a kind {@link annotate}/{@link annotateAsync} would actually read a file
+   * for, as opposed to one answered entirely from `event.kind`/`event.isDirectory` without
+   * touching the file system. A caller deciding whether a hash is even in question for `event` —
+   * `lib/retrigger.js`'s dispatch does, to route only real fingerprint work through the async
+   * path — asks here rather than reimplementing the classification below.
+   * @param {{kind: string, isDirectory?: boolean}} event
+   * @returns {boolean}
+   */
+  needsFingerprint(event) {
+    return !event.isDirectory && event.kind !== 'rescanRequired' && !REMOVALS.has(event.kind);
   }
 
   /**
@@ -93,6 +124,32 @@ class ContentTracker {
     event.hash = hash;
     if (!contentChanged) this.unchanged += 1;
     return event;
+  }
+
+  /**
+   * `annotate`'s asynchronous twin, for a file too large to fingerprint synchronously without
+   * costing the caller's event loop a noticeable stall.
+   *
+   * Unlike {@link _fingerprint}, this never treats "too large" as a reason to skip reading the
+   * file: the whole reason to call this instead of {@link annotate} is that the caller already
+   * has a non-blocking way to read it (`engine.hashFile`, chunked and I/O-driven on every engine
+   * this package ships), so there is no size past which guessing "changed" is cheaper than
+   * knowing. Directory, removal, and rescan events need no I/O either way and are answered by
+   * the same synchronous logic {@link annotate} uses.
+   *
+   * @param {{path: string, kind: string, size?: number, isDirectory?: boolean}} event
+   * @param {{signal?: AbortSignal}} [options] threaded straight through to `engine.hashFile`
+   * @returns {Promise<void>}
+   */
+  async annotateAsync(event, options) {
+    if (!this.needsFingerprint(event)) {
+      this.annotate(event);
+      return;
+    }
+    const { contentChanged, hash } = await this._fingerprintAsync(event, options);
+    event.contentChanged = contentChanged;
+    event.hash = hash;
+    if (!contentChanged) this.unchanged += 1;
   }
 
   /** @returns {{contentChanged: boolean, hash: string|null}} */
@@ -118,6 +175,8 @@ class ContentTracker {
   _fingerprint(event) {
     // The size the watcher already stat'd, so the ceiling costs no syscall of its own. A size of
     // zero is not trusted as "empty" — it is also what an engine reports when it does not know.
+    // This ceiling is specific to the synchronous path: `_fingerprintAsync` has no equivalent,
+    // because avoiding exactly this stall on a large file is the reason it exists.
     if (Number.isFinite(event.size) && event.size > this._maxBytes) return CHANGED;
 
     let hash;
@@ -127,6 +186,24 @@ class ContentTracker {
     } catch {
       // Unreadable is not unchanged: the file may well have changed, and it may simply have been
       // replaced again between the event and this read.
+      this.hashErrors += 1;
+      return CHANGED;
+    }
+
+    const previous = this._cache.get(event.path);
+    this._cache.set(event.path, hash);
+    return { contentChanged: previous !== hash, hash };
+  }
+
+  /** @returns {Promise<{contentChanged: boolean, hash: string|null}>} */
+  async _fingerprintAsync(event, options) {
+    let hash;
+    try {
+      hash = (await this._engine.hashFile(event.path, options)).hash;
+      this.filesHashed += 1;
+    } catch {
+      // Same fail-safe direction as `_fingerprint`: unreadable (including "aborted", from a
+      // watcher stopped mid-hash) is reported as changed, never as unchanged.
       this.hashErrors += 1;
       return CHANGED;
     }

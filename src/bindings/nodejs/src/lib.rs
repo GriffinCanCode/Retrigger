@@ -53,6 +53,7 @@
 //! system has already agreed to.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use napi::bindgen_prelude::{AsyncTask, BigInt, BufferSlice, Either, JsObjectValue, Unknown};
 use napi::{Env, Error, JsValue, Result, Status, Task, ValueType};
@@ -60,7 +61,8 @@ use napi_derive::napi;
 
 use retrigger_core as hashing;
 use retrigger_system::{
-    Backend, EventFilter, EventKind, FileEvent, WatchError, Watcher as SystemWatcher, WatcherConfig,
+    AwaitWriteFinishConfig, Backend, BackendMode, EventFilter, EventKind, FileEvent,
+    SnapshotEnvelope, WatchError, Watcher as SystemWatcher, WatcherConfig,
 };
 
 /// The one algorithm every hash entry point here uses.
@@ -72,6 +74,20 @@ const HASH_ALGORITHM: &str = "xxh3-64";
 /// Queue capacity when the caller does not ask for one, matching
 /// `lib/js-watcher.js` and the mock so the default is one number, not three.
 const DEFAULT_CAPACITY: u32 = 8192;
+
+/// `backend: "poll"` re-scan interval when the caller does not name one.
+/// Matches `lib/retrigger.js`'s own normalization so the native and
+/// JavaScript engines agree on what "unspecified" means.
+const DEFAULT_POLL_INTERVAL_MS: u32 = 1000;
+
+/// `awaitWriteFinish.pollIntervalMs` when the caller enables the feature but
+/// does not name one.
+const DEFAULT_AWAIT_WRITE_FINISH_POLL_MS: u32 = 100;
+
+/// `awaitWriteFinish.stabilityThresholdMs` when the caller enables the
+/// feature but does not name one. Matches the convention chokidar's
+/// `awaitWriteFinish.stabilityThreshold` made familiar.
+const DEFAULT_AWAIT_WRITE_FINISH_STABILITY_MS: u32 = 2000;
 
 // --------------------------------------------------------------------- hash
 
@@ -287,6 +303,36 @@ pub struct WatcherOptions {
     pub include: Option<Vec<String>>,
     /// Globs that reject a path. Excludes always beat includes.
     pub exclude: Option<Vec<String>>,
+    /// `"auto"` (the default) picks the platform-native backend; `"poll"`
+    /// forces the portable, interval-driven fallback for network/remote file
+    /// systems where kernel watch events cannot be trusted. Anything else is a
+    /// `TypeError`.
+    pub backend: Option<String>,
+    /// Re-scan interval in milliseconds when `backend: "poll"`. Ignored
+    /// otherwise. Non-positive or absent means `notify`'s own default.
+    pub poll_interval_ms: Option<f64>,
+    /// Whether the `"poll"` backend also hashes file contents to catch a
+    /// same-size, same-mtime rewrite that a `stat`-only poll would miss.
+    /// Ignored for `"auto"`. Defaults to `false`.
+    pub poll_compare_contents: Option<bool>,
+    /// Hold a changed file until it stops growing before reporting it.
+    /// Absent (the default) reports as soon as the backend sees a change.
+    pub await_write_finish: Option<AwaitWriteFinishOptions>,
+    /// Fold an atomic-save `renamedTo` for a path already seen to arrive into
+    /// `modified`. Defaults to `false`.
+    pub atomic_write_normalization: Option<bool>,
+}
+
+/// [`WatcherOptions::await_write_finish`] thresholds, both in milliseconds.
+#[napi(object)]
+pub struct AwaitWriteFinishOptions {
+    /// How often to re-`stat` a path while waiting for it to settle.
+    /// Non-positive or absent means `retrigger_system`'s own default.
+    pub poll_interval_ms: Option<f64>,
+    /// How long size and modification time must be unchanged before the path
+    /// is reported. Non-positive or absent means `retrigger_system`'s own
+    /// default.
+    pub stability_threshold_ms: Option<f64>,
 }
 
 /// One file system change, in the shape `lib/retrigger.js` dispatches on.
@@ -334,7 +380,11 @@ pub struct JsWatcherStats {
 /// The poll-based watcher `lib/engine.js` drives.
 #[napi]
 pub struct Watcher {
-    inner: SystemWatcher,
+    /// `Arc`, not an owned value, so [`Watcher::snapshot`] and
+    /// [`Watcher::watch_with_snapshot`] can hand a background pool thread a handle that outlives
+    /// this call without either cloning [`SystemWatcher`] itself (it is not [`Clone`] — it owns
+    /// live thread handles) or risking a JS-side drop racing the crawl.
+    inner: Arc<SystemWatcher>,
     /// Includes and excludes together: the question to ask about a *file*.
     files: EventFilter,
     /// Excludes only, plus the directory form of every `prefix/**` pattern:
@@ -353,6 +403,11 @@ impl Watcher {
             debounce_ms: None,
             include: None,
             exclude: None,
+            backend: None,
+            poll_interval_ms: None,
+            poll_compare_contents: None,
+            await_write_finish: None,
+            atomic_write_normalization: None,
         });
         let include = patterns(options.include);
         let exclude = patterns(options.exclude);
@@ -367,6 +422,25 @@ impl Watcher {
         let source =
             EventFilter::from_globs::<[&str; 0], _>([], &exclude).map_err(pattern_error)?;
 
+        let backend = backend_mode(
+            &env,
+            options.backend.as_deref(),
+            options.poll_interval_ms,
+            options.poll_compare_contents,
+        )?;
+        let await_write_finish = options
+            .await_write_finish
+            .map(|awf| AwaitWriteFinishConfig {
+                poll_interval: std::time::Duration::from_millis(u64::from(count(
+                    awf.poll_interval_ms.unwrap_or(0.0),
+                    DEFAULT_AWAIT_WRITE_FINISH_POLL_MS,
+                ))),
+                stability_threshold: std::time::Duration::from_millis(u64::from(count(
+                    awf.stability_threshold_ms.unwrap_or(0.0),
+                    DEFAULT_AWAIT_WRITE_FINISH_STABILITY_MS,
+                ))),
+            });
+
         let capacity = count(options.capacity.unwrap_or(0.0), DEFAULT_CAPACITY);
         let config = WatcherConfig {
             capacity: capacity as usize,
@@ -375,13 +449,16 @@ impl Watcher {
                 0,
             ))),
             filter: source,
+            backend,
+            await_write_finish,
+            atomic_write_normalization: options.atomic_write_normalization.unwrap_or(false),
             ..WatcherConfig::default()
         };
 
         let inner = SystemWatcher::new(config)
             .map_err(|err| watch_failure(&env, "cannot create a watcher".to_owned(), &err))?;
         Ok(Self {
-            inner,
+            inner: Arc::new(inner),
             files,
             directories,
         })
@@ -473,6 +550,43 @@ impl Watcher {
         }
     }
 
+    /// Crawl `target`'s current contents, without registering a watch on it.
+    ///
+    /// Runs on libuv's thread pool, like [`hash_file`], because a snapshot of a large tree is a
+    /// blocking directory walk. Rejects `target` synchronously if it is not a non-empty string, so
+    /// a caller sees a `TypeError` immediately rather than from a rejected promise.
+    #[napi(ts_return_type = "Promise<SnapshotEnvelope>")]
+    pub fn snapshot(&self, env: Env, target: Unknown) -> Result<AsyncTask<SnapshotTask>> {
+        let path = path_arg(&env, target, "snapshot")?;
+        Ok(AsyncTask::new(SnapshotTask {
+            watcher: Arc::clone(&self.inner),
+            path,
+            register: false,
+            recursive: false,
+            code: None,
+        }))
+    }
+
+    /// [`watch`](Self::watch) `target`, then [`snapshot`](Self::snapshot) it, with the watch
+    /// registered before the crawl begins — see
+    /// [`retrigger_system::Watcher::watch_with_snapshot`] for why the ordering matters.
+    #[napi(ts_return_type = "Promise<SnapshotEnvelope>")]
+    pub fn watch_with_snapshot(
+        &self,
+        env: Env,
+        target: Unknown,
+        recursive: Option<bool>,
+    ) -> Result<AsyncTask<SnapshotTask>> {
+        let path = path_arg(&env, target, "watchWithSnapshot")?;
+        Ok(AsyncTask::new(SnapshotTask {
+            watcher: Arc::clone(&self.inner),
+            path,
+            register: true,
+            recursive: recursive.unwrap_or(true),
+            code: None,
+        }))
+    }
+
     /// A directory is judged by the excludes alone, a file by the whole filter.
     fn deliverable(&self, event: &FileEvent) -> bool {
         match event.kind {
@@ -480,6 +594,125 @@ impl Watcher {
             _ if event.is_directory => !self.directories.excludes(&event.path),
             _ => self.files.matches(&event.path),
         }
+    }
+}
+
+/// One entry of a [`JsSnapshotEnvelope`], in the shape [`snapshot`](Watcher::snapshot) and
+/// [`watch_with_snapshot`](Watcher::watch_with_snapshot) resolve with.
+#[napi(object)]
+pub struct JsSnapshotEntry {
+    /// Absolute path.
+    pub path: String,
+    pub is_directory: bool,
+    /// Always `0` for a directory.
+    pub size: i64,
+    /// Nanoseconds since the Unix epoch, `null` when the file system reports none. A `BigInt`,
+    /// like [`JsFileEvent::timestamp_ns`], because nanosecond timestamps exceed
+    /// `Number.MAX_SAFE_INTEGER`.
+    pub modified_ns: Option<BigInt>,
+}
+
+/// A self-describing, portable snapshot — see [`SnapshotEnvelope`].
+#[napi(object)]
+pub struct JsSnapshotEnvelope {
+    /// The digest algorithm this envelope's format is defined in terms of; see
+    /// [`retrigger_system::SNAPSHOT_ALGORITHM`].
+    pub algorithm: String,
+    /// Schema version; see [`retrigger_system::SNAPSHOT_ENVELOPE_VERSION`].
+    pub version: u32,
+    pub entries: Vec<JsSnapshotEntry>,
+}
+
+impl From<SnapshotEnvelope> for JsSnapshotEnvelope {
+    fn from(envelope: SnapshotEnvelope) -> Self {
+        Self {
+            algorithm: envelope.algorithm,
+            version: envelope.version,
+            entries: envelope
+                .entries
+                .into_iter()
+                .map(|entry| JsSnapshotEntry {
+                    path: entry.path.to_string_lossy().into_owned(),
+                    is_directory: entry.is_directory,
+                    size: as_i64(entry.size),
+                    modified_ns: entry.modified_ns.map(BigInt::from),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Off-thread body of [`Watcher::snapshot`] and [`Watcher::watch_with_snapshot`]; `register`
+/// selects between them so the two async entry points can share one [`Task`] rather than
+/// duplicating the pool-thread and error-mapping logic.
+pub struct SnapshotTask {
+    watcher: Arc<SystemWatcher>,
+    path: PathBuf,
+    /// Whether to [`watch`](SystemWatcher::watch) `path` before crawling it (`watchWithSnapshot`)
+    /// or only crawl it (`snapshot`).
+    register: bool,
+    /// Ignored unless `register` is set.
+    recursive: bool,
+    /// Carried from the pool thread to [`Task::reject`], mirroring [`HashFileTask::code`].
+    code: Option<&'static str>,
+}
+
+impl Task for SnapshotTask {
+    type Output = Vec<retrigger_system::SnapshotEntry>;
+    type JsValue = JsSnapshotEnvelope;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let result = if self.register {
+            self.watcher.watch_with_snapshot(&self.path, self.recursive)
+        } else {
+            self.watcher.snapshot(&self.path)
+        };
+        result.map_err(|err| {
+            self.code = Some(match &err {
+                WatchError::NotFound(_) => "ENOENT",
+                WatchError::PermissionDenied(_) => "EACCES",
+                _ => "ERR_RETRIGGER_WATCH",
+            });
+            Error::new(
+                Status::GenericFailure,
+                format!("cannot snapshot {}: {err}", self.path.display()),
+            )
+        })
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(JsSnapshotEnvelope::from(SnapshotEnvelope::new(output)))
+    }
+
+    fn reject(&mut self, env: Env, err: Error) -> Result<Self::JsValue> {
+        Err(match self.code.take() {
+            Some(code) => coded(&env, code, err.reason),
+            None => err,
+        })
+    }
+}
+
+/// Parse [`WatcherOptions::backend`] into a [`BackendMode`], or throw a `TypeError` for anything
+/// but `"auto"`, `"poll"`, or absent (which is `"auto"`).
+fn backend_mode(
+    env: &Env,
+    backend: Option<&str>,
+    poll_interval_ms: Option<f64>,
+    compare_contents: Option<bool>,
+) -> Result<BackendMode> {
+    match backend {
+        None | Some("auto") => Ok(BackendMode::Auto),
+        Some("poll") => Ok(BackendMode::Poll {
+            interval: std::time::Duration::from_millis(u64::from(count(
+                poll_interval_ms.unwrap_or(0.0),
+                DEFAULT_POLL_INTERVAL_MS,
+            ))),
+            compare_contents: compare_contents.unwrap_or(false),
+        }),
+        Some(other) => throw_type(
+            env,
+            format!("backend must be \"auto\" or \"poll\", got {other:?}"),
+        ),
     }
 }
 

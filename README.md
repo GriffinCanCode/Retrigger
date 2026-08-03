@@ -1,4 +1,4 @@
-# Retrigger: A File System Watcher for Node.js
+# Retrigger: Skip Byte-Identical Rebuilds
 
 [![npm version](https://img.shields.io/npm/v/@retrigger/core.svg)](https://www.npmjs.com/package/@retrigger/core)
 [![downloads](https://img.shields.io/npm/dm/@retrigger/core.svg)](https://www.npmjs.com/package/@retrigger/core)
@@ -6,12 +6,19 @@
 [![node](https://img.shields.io/node/v/@retrigger/core.svg)](https://nodejs.org)
 [![license](https://img.shields.io/npm/l/@retrigger/core.svg)](LICENSE)
 
-![Retrigger — a fast file system watcher for Node.js, webpack and Vite](assets/retrigger-project.png)
+![Retrigger — skip byte-identical rebuilds for Node.js, webpack and Vite](assets/retrigger-project.png)
 
-A fast file system watcher for Node.js, webpack and Vite dev servers. It watches through
-the platform's own backend — inotify, FSEvents, `ReadDirectoryChangesW` — and hashes every
-changed file with a native XXH3-64 engine, so a rebuild can be skipped when the bytes did
-not actually change.
+Retrigger exists so a Vite or webpack (or Rspack, Rollup, or esbuild) dev server does
+**not** rebuild when a file's bytes did not change — a formatter on save, a generator that
+reran, a branch switch that restored identical contents. It watches through the platform
+backend (inotify, FSEvents, `ReadDirectoryChangesW`), hashes every changed file with
+XXH3-64, and withholds the event from the bundler when the digest matches.
+
+Raw per-event latency is not the product. Measured against Chokidar on the same machine,
+Retrigger is slower at delivering a single filesystem event; it trades a few milliseconds
+of watch latency for skipping entire rebuilds. That is the right trade for dev-server
+rebuild suppression. The watcher, hashing API, plugins, snapshots, and optional daemon are
+supporting machinery for that thesis — not co-equal headline features.
 
 A pure-JavaScript fallback takes over where no native binary exists, so that `require()`
 works on every platform.
@@ -105,9 +112,10 @@ hashFileSync('./src/index.ts'); // { hash: '…', size: 1234 }
 getEngineInfo(); // which engine loaded, and why
 ```
 
-That digest is canonical XXH3-64 only when the native engine loaded. The JavaScript engine returns
-a BLAKE2b-64 digest of the same shape, and `getEngineInfo().hashAlgorithm` says which you have.
-Never persist a digest from one engine and compare it against the other.
+That digest is canonical XXH3-64 whichever engine loaded: the JavaScript engine computes the same
+algorithm through a prebuilt WebAssembly module rather than a different one, so a digest from one
+engine is comparable to a digest from the other. `getEngineInfo().hashAlgorithm` says which engine
+you have, but both report `"xxh3-64"`.
 
 ### Bundler Plugins
 
@@ -137,16 +145,25 @@ that reran, or a branch switch that restored the same contents costs nothing. `c
 false` restores the ordinary behaviour of rebuilding on every write. The count of writes each
 plugin suppressed is `metrics.eventsUnchanged`, which Vite serves at `/__retrigger_stats`.
 
+Next.js is supported in **webpack mode** via `RetriggerWebpackPlugin`. Turbopack is not — it
+exposes no public watcher or pre-rebuild veto seam; see
+[`docs/upstream/turbopack-watcher-request.md`](docs/upstream/turbopack-watcher-request.md).
+Integration there is deferred until Vercel ships an API. Rspack works with the same webpack
+plugin; Rollup and esbuild use `@retrigger/core/rollup` and `@retrigger/core/esbuild`. Full
+options, Astro, Watchman, and the chokidar adapter live in
+[the package README](src/bindings/nodejs/README.md).
+
 ## Installation
 
 The failure mode this package works hardest to avoid is an install that throws.
 
 - **`require()` never throws** — if no native binary matches the platform, the JavaScript
-  engine (`fs.watch` and BLAKE2b-64) takes over, prints one warning line, and keeps going.
+  engine (`fs.watch` and the same XXH3-64 through WebAssembly) takes over, prints one warning
+  line, and keeps going.
   `RETRIGGER_SILENT=1` suppresses it, and `getEngineInfo().nativeAttempts` explains what
   was tried and why each candidate was rejected.
-- **No runtime dependencies** — the published tarball is 38.4 KiB across 20 entries and
-  contains no native binary. The addon arrives through one of nine platform packages
+- **No runtime dependencies** — the published tarball is 90.2 KiB across 34 entries and
+  contains no native binary. The addon arrives through one of twelve platform packages
   listed as `optionalDependencies`, so a platform without one degrades instead of failing.
 - **Both engines are held to one test suite** — the JavaScript fallback, a mock addon, and
   the real compiled addon each run the same parity suite, so the fallback is a substitute
@@ -158,48 +175,56 @@ still exits on its own.
 
 ## Measured Performance
 
-Every number below was produced by a command in this repository on one machine — an Apple
-M4 Max running macOS 26.5.1 and Node 22.12 — with a warm page cache.
+Numbers below come from this repository's performance lab
+([`tools/benchmarks/`](tools/benchmarks/)), measured on **Apple M4 Max · darwin arm64 ·
+Node v22 · native engine · XXH3-64**. They are not universal guarantees. Reproduce with:
 
-They are not projections, and no comparison against other watchers is claimed here because
-none was measured in the same run.
+```bash
+cd tools/benchmarks && npm install && npm run bench:all
+```
 
-### In-Memory Hashing
+### Flagship: skip byte-identical rebuilds
 
-`make -C src/core bench` measures XXH3-64 through NEON.
+Real Vite and webpack watch builds, same machine, same fixtures. Rebuilds are counted from
+the bundler (`handleHotUpdate` / `compiler.watch`), not guessed from watcher events.
 
-- **64 B** — 15,624 MiB/s.
-- **1 KiB** — 36,784 MiB/s.
-- **64 KiB** — 32,058 MiB/s.
-- **16 MiB** — 31,378 MiB/s.
+| Scenario                         | Retrigger                            | Stock watcher                           |
+| -------------------------------- | ------------------------------------ | --------------------------------------- |
+| Vite, 8 byte-identical writes    | **0/8** rebuilds (0 ms rebuild wall) | **8/8** (~804 ms rebuild wall)          |
+| webpack, 8 byte-identical writes | **0/8** rebuilds (0 ms rebuild wall) | **8/8** (~386 ms rebuild wall)          |
+| Vite / webpack, 4 real edits     | **4/4** rebuild correctly            | **4/4** rebuild correctly               |
+| Burst (identical + real)         | Only the real edits rebuild          | Stock rebuilds for identical writes too |
 
-### End-to-End File Hashing
+On that run, identical writes saved **100%** of rebuild-attributable wall time versus stock
+(0 vs ~804 ms Vite, 0 vs ~386 ms webpack). Observation/hash-confirm time is separate from
+rebuild wall — the product metric is rebuilds that never ran.
 
-The shipped Node API counts `open` and `read` inside every figure below.
+### Honesty: raw watch latency trails Chokidar
 
-- **1 KiB** — 11.4 µs per file, 86 MiB/s.
-- **16 KiB** — 11.9 µs per file, 1,317 MiB/s.
-- **256 KiB** — 25.0 µs per file, 10,013 MiB/s.
-- **4 MiB** — 240 µs per file, 16,643 MiB/s.
+Same-run raw FS-event latency (p50), native Retrigger vs Chokidar:
 
-The ~11 µs floor is syscall overhead, and it is the number that matters for a watcher:
-below roughly 16 KiB, hashing a file costs about as much as opening it.
+- **Chokidar** — ~0.31 ms
+- **Retrigger** — ~11.80 ms
 
-### Watcher Latency
+Retrigger trades a few milliseconds of per-event latency for skipping entire rebuilds.
+If your bottleneck is noticing a change rather than rebuilding, stay with a lighter
+watcher; if your bottleneck is rebuilds that produce identical output, that trade is the
+point.
 
-`cargo bench -p retrigger-system` measures FSEvents.
+### Supporting scenarios
 
-- **Single event, change to delivery** — 1.7 ms median, across a 1.07–2.68 ms range.
-- **200 creations in a burst** — 16.0 ms.
-- **2,000 files moved into a watched tree** — 13.7 ms.
-- **Include/exclude decision** — 187 ns allowed, 88 ns excluded.
+Also measured on the same machine class:
 
-First-event latency is dominated by the platform backend, not by this code: on macOS,
-FSEvents coalesces and delivers on its own schedule. Retrigger is not meaningfully quicker
-than any other FSEvents consumer at noticing a change.
+- Snapshot crawl of **2,000** files in ~6.3 ms
+- Event storm of **2,000** writes — **0** events dropped
+- Peak RSS in the webpack rebuild lab ~151 MB
 
-What it adds is content hashing fast enough to run on every event, so a rebuild can be
-skipped when a file was rewritten with identical bytes, and bounded memory under churn.
+### Hash throughput (supporting)
+
+`make -C src/core bench` measures XXH3-64 through NEON on this class of machine (warm
+cache). Below roughly 16 KiB, end-to-end file hashing is dominated by `open`/`read`, not
+by the hash — which is why hashing every event is affordable when a rebuild costs tens or
+hundreds of milliseconds.
 
 ## Verification
 
@@ -222,22 +247,22 @@ and `linux/x86-64`.
 - **C under ASan/UBSan** — passes on both.
 - **Rust workspace** — passes on both.
 - **Native addon artifact** — passes on both.
-- **JavaScript, 320 tests** — passes on both.
-- **Packaged install, 12 checks** — passes on both.
+- **JavaScript, 389 tests** — passes on both.
+- **Packaged install, 15 checks** — passes on both.
 
 The C suite runs a differential test that hashes the same inputs through every SIMD level
 the CPU offers and compares them against scalar, so "AVX2 is enabled" is a measurement
 rather than an assumption.
 
-Published XXH3-64 vectors are checked from C, from Rust, and from the Node addon. The
-JavaScript fallback is checked against published BLAKE2b vectors, because that is the
-algorithm it actually uses.
+Published XXH3-64 vectors are checked from C, from Rust, from the Node addon, and from the
+JavaScript fallback's WebAssembly module — the same algorithm, the same vectors, four
+independent call paths.
 
-What the two engines are held to _jointly_ is the content-change decision, which is the thing
-a consumer depends on. One suite runs against the compiled addon, a mock addon, and the
-JavaScript engine, and all three must agree on which writes changed a file's bytes — from
-digests that are deliberately not comparable, because each engine only ever compares a path
-against its own earlier digest.
+What the two Node engines are held to _jointly_ is more than the content-change decision now:
+one suite runs against the compiled addon, a mock addon, and the JavaScript engine and checks
+that all three agree on which writes changed a file's bytes, and a separate cross-engine suite
+hashes a shared corpus through both real engines and asserts the digests themselves are equal,
+byte for byte — not merely that each engine agrees with its own earlier digest.
 
 ### Adversarial suites and campaigns
 
@@ -285,7 +310,9 @@ retrigger config --output retrigger.toml
 retrigger start
 ```
 
-It speaks HTTP with JSON bodies and streams events over SSE.
+It speaks HTTP with JSON bodies and streams events over SSE, including
+`GET /snapshot` for a self-describing tree inventory (the same shape as the in-process
+`snapshot()` / `watchWithSnapshot()` APIs).
 
 `retrigger validate` checks a config file before the daemon tries to run it, and
 `retrigger status` reports on a running one.
@@ -311,12 +338,22 @@ by layout assertions on both sides, so building does not depend on `bindgen`.
 ## Platform Support
 
 Retrigger runs wherever Node does, though not every platform gets a native binary.
+The Node package ships twelve platform optionalDependencies; each has a release job.
+Verification tiers (what CI/release actually prove):
 
-- **Linux x64 and arm64, gnu and musl** — inotify, with the full suite verified.
-- **macOS arm64 and x64** — FSEvents, with the full suite verified.
-- **Windows x64 and arm64** — `ReadDirectoryChangesW`, in the CI matrix but not verified in
-  this run.
+- **Executed native** — Linux x64/arm64 (gnu + musl), macOS x64/arm64, Windows x64,
+  FreeBSD x64 (`vmactions/freebsd-vm`). Full suite on GitHub-hosted OS/arch legs;
+  FreeBSD runs the Node package build + test + pack on a real FreeBSD guest.
+- **Cross-built, executed under QEMU** — Linux armv7 (`linux-arm-gnueabihf`),
+  ppc64le, s390x. Built with a free cross toolchain, then `verify-artifact` (and
+  post-publish install) under QEMU.
+- **Cross-built, not executed** — Windows arm64. No free arm64 Windows runner; the
+  release job emits a `::warning::` and skips the smoke test (same honesty bar as
+  before).
 - **Anywhere else** — the `fs.watch` fallback, degraded but never broken.
+
+See [the package README](src/bindings/nodejs/README.md#native-platform-matrix) for the
+full triple → package suffix table.
 
 ## Who Should Not Be Here
 
@@ -327,8 +364,9 @@ This repository is the source, and most readers want the published package inste
   options, and the differences between the two engines.
 - **Sharing one watcher between several processes** — read
   [the daemon README](src/daemon/README.md), because nothing else needs the daemon.
-- **Comparing watchers** — no comparison against other watchers is claimed here, because
-  none was measured in the same run.
+- **Wanting the lowest possible raw watch latency** — Retrigger is not that product; see
+  [Measured Performance](#measured-performance). Use it when skipping no-op rebuilds is
+  the win.
 
 ## Reporting a Problem
 
@@ -341,8 +379,9 @@ Everything published out of this repository is tracked in one place.
 - **A vulnerability** — follow [the security policy](.github/SECURITY.md), which reports
   privately through GitHub Security Advisories rather than the issue tracker, and sets out
   what is in scope.
-- **Slow first-event delivery** — that is usually the platform backend rather than
-  Retrigger, as the measurements above set out.
+- **Slow first-event delivery** — Retrigger is not racing Chokidar on per-event latency;
+  see [Measured Performance](#measured-performance). If a real edit is missed, that is a
+  bug — open an issue.
 
 ## License
 

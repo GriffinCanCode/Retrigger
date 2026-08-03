@@ -177,9 +177,9 @@ describe('vite plugin', () => {
     // never be classified at all — which is a property of this test's timing, not of the plugin.
     await waitForQuiet(hashed, { quietMs: 300, timeout: 3000 });
 
-    // Everything reaching Vite is watched, not just what this plugin dispatches: Vite's own
-    // chokidar sees this write too, and an implementation that only declined to add a dispatch of
-    // its own would still let chokidar invalidate the module and reload the browser.
+    // Vite's own chokidar does not run at all (`server.watch: null`): Retrigger is the only
+    // possible source of an event on `server.watcher`, so this is also proof that nothing else
+    // is quietly feeding it.
     const emitted = [];
     for (const name of ['add', 'change', 'unlink']) {
       server.watcher.on(name, (file) => emitted.push(`${name} ${file}`));
@@ -212,8 +212,10 @@ describe('vite plugin', () => {
     await server.transformRequest('/mod.js');
 
     const hashed = () => plugin.api.getStats().watcher.content.filesHashed;
-    // Two watchers see this write — Retrigger's and Vite's own chokidar — and both used to reach
-    // the module graph, so every save cost two invalidations and two HMR payloads.
+    // Historically two watchers saw this write — Retrigger's and Vite's own chokidar — and both
+    // reached the module graph, so every save cost two invalidations and two HMR payloads. Vite's
+    // own chokidar no longer runs, but the guarantee this pins down (one write, one invalidation)
+    // still matters on its own terms.
     const edited = normalizePath(project.mod);
     const emitted = [];
     server.watcher.on('change', (file) => emitted.push(file));
@@ -328,13 +330,10 @@ describe('vite plugin', () => {
 
     const baseline = plugin.api.getStats().metrics.triggers;
     writeFile(project.mod, 'export const n = 9;\n');
-    // Counting Retrigger's own dispatches rather than the events arriving on
-    // Vite's watcher: after teardown this plugin must contribute nothing, but
-    // Vite's chokidar is still running and is free to report one write however
-    // many times it likes -- on macOS a single write commonly surfaces as both
-    // a content change and a metadata change, so a total-based bound fails for
-    // a reason that has nothing to do with this plugin.
+    // `server.watcher` is Vite's inert `NoopWatcher`; nothing but this plugin ever emits on it, so
+    // after teardown the edit above must produce silence on both counters, not just the plugin's.
     await waitForQuiet(() => dispatched, { quietMs: 200, timeout: 2000 });
+    expect(dispatched).toBe(0);
     expect(plugin.api.getStats().metrics.triggers).toBe(baseline);
   });
 
@@ -362,6 +361,187 @@ describe('vite plugin', () => {
       if (previous === undefined) delete process.env.RETRIGGER_SILENT;
       else process.env.RETRIGGER_SILENT = previous;
     }
+  });
+
+  it('lets a plugin whose configureServer runs later still receive events via server.watcher', async () => {
+    // enforce: 'pre' makes retrigger's own configureServer run first regardless of array order;
+    // the claim under test is that server.watcher's identity survives that -- a listener attached
+    // by a plugin configured strictly after it still sees every event.
+    const project = fixture();
+    const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
+    const laterEvents = [];
+    const laterPlugin = {
+      name: 'independently-authored',
+      configureServer(devServer) {
+        devServer.watcher.on('change', (file) => laterEvents.push(file));
+      },
+    };
+    const server = await startServer(project.dir, [plugin, laterPlugin]);
+    live.add(server);
+    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started' });
+
+    writeFile(project.mod, 'export const n = 21;\n');
+    await waitFor(() => laterEvents.includes(normalizePath(project.mod)), {
+      timeout: 10000,
+      message: 'a plugin configured after retrigger still saw the change',
+    });
+  });
+
+  it('emits exactly once per real edit regardless of how many listeners are attached', async () => {
+    const project = fixture();
+    const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
+    const server = await startServer(project.dir, [plugin]);
+    live.add(server);
+    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started' });
+    await server.transformRequest('/mod.js');
+
+    const edited = normalizePath(project.mod);
+    let emitCalls = 0;
+    const originalEmit = server.watcher.emit.bind(server.watcher);
+    // Instrumentation only, not an override left installed: proves dispatch() calls `.emit()`
+    // exactly once for this edit, independent of how many listeners are subscribed to it.
+    server.watcher.emit = (name, ...args) => {
+      if (name === 'change' && args[0] === edited) emitCalls += 1;
+      return originalEmit(name, ...args);
+    };
+    const listenerA = [];
+    const listenerB = [];
+    server.watcher.on('change', (f) => listenerA.push(f));
+    server.watcher.on('change', (f) => listenerB.push(f));
+
+    writeFile(project.mod, 'export const n = 31;\n');
+    await waitFor(() => listenerA.includes(edited) && listenerB.includes(edited), {
+      timeout: 10000,
+      message: 'both listeners saw the edit',
+    });
+    await waitForQuiet(() => emitCalls, { quietMs: 300, timeout: 3000 });
+    expect(emitCalls, 'server.watcher.emit called exactly once for the edit').toBe(1);
+  });
+
+  it('suppresses HMR for an identical-byte rewrite but not for a real edit', async () => {
+    const project = fixture();
+    const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
+    /** @type {string[]} */
+    const hotUpdates = [];
+    const spy = {
+      name: 'spy',
+      handleHotUpdate(ctx) {
+        hotUpdates.push(ctx.file);
+      },
+    };
+    const server = await startServer(project.dir, [plugin, spy]);
+    live.add(server);
+    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started' });
+    await server.transformRequest('/main.js');
+    await server.transformRequest('/mod.js');
+
+    // Prime with a real edit first -- the fixture's own initial bytes are not a fair "before" to
+    // rewrite identically, since every fixture starts unread by the module graph.
+    const contents = 'export const n = 61;\n';
+    writeFile(project.mod, contents);
+    await waitFor(() => hotUpdates.includes(normalizePath(project.mod)), {
+      timeout: 10000,
+      message: 'priming edit reached handleHotUpdate',
+    });
+    await waitForQuiet(() => plugin.api.getStats().watcher.content.filesHashed, {
+      quietMs: 300,
+      timeout: 3000,
+    });
+    hotUpdates.length = 0;
+    const sent = spyOnHotChannels(server);
+
+    writeFile(project.mod, contents);
+    await waitFor(() => plugin.api.getStats().metrics.eventsUnchanged > 0, {
+      timeout: 10000,
+      message: 'the no-op write was observed and classified',
+    });
+    await waitForQuiet(() => hotUpdates.length, { quietMs: 300, timeout: 2000 });
+    expect(hotUpdates, 'an identical-byte rewrite must not reach handleHotUpdate').toEqual([]);
+    expect(sent, 'and must not produce an HMR payload').toEqual([]);
+
+    writeFile(project.mod, 'export const n = 62;\n');
+    await waitFor(() => hotUpdates.includes(normalizePath(project.mod)), {
+      timeout: 10000,
+      message: 'a real edit still reaches handleHotUpdate',
+    });
+    await waitFor(() => sent.some((m) => m && (m.type === 'update' || m.type === 'full-reload')), {
+      timeout: 10000,
+      message: 'and produces an HMR payload',
+    });
+  });
+
+  it('keeps delivering events through a fallback watcher after mid-session degradation', async () => {
+    const project = fixture();
+    const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
+    const server = await startServer(project.dir, [plugin]);
+    live.add(server);
+    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started' });
+
+    const changes = [];
+    server.watcher.on('change', (file) => changes.push(file));
+
+    // Forces the same path a run of engine errors would: stop trusting Retrigger and engage a
+    // real watcher, without depending on an OS-specific way to make the engine itself misbehave.
+    plugin.api.degrade('synthetic mid-session failure');
+    expect(plugin.api.isWatching()).toBe(false);
+    const stats = plugin.api.getStats();
+    expect(stats.degraded).toBe(true);
+    expect(stats.fallback).toBe(true);
+
+    // The dev server itself must never notice.
+    const { port } = server.httpServer.address();
+    const response = await fetch(`http://127.0.0.1:${port}/main.js`);
+    expect(response.status).toBe(200);
+
+    writeFile(project.mod, 'export const n = 71;\n');
+    await waitFor(() => changes.includes(normalizePath(project.mod)), {
+      timeout: 15000,
+      message: 'the fallback watcher delivered the edit onto server.watcher',
+    });
+  });
+
+  it('tears down the fail-open fallback watcher cleanly too', async () => {
+    const project = fixture();
+    const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
+    const server = await startServer(project.dir, [plugin]);
+    live.add(server);
+    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started' });
+
+    plugin.api.degrade('synthetic failure for the teardown test');
+    await waitFor(() => plugin.api.getStats().fallback === true, { message: 'fallback engaged' });
+
+    const before = countHandles();
+    await server.close();
+    live.delete(server);
+    await sleep(150);
+
+    expect(plugin.api.getStats().fallback).toBe(false);
+    const after = countHandles();
+    expect(after).toBeLessThanOrEqual(before);
+  });
+
+  it('restores the pre-rewrite shared-watcher design with legacyWatcher: true', async () => {
+    const project = fixture();
+    const plugin = createRetriggerVitePlugin({
+      engine: 'javascript',
+      debounceMs: 0,
+      legacyWatcher: true,
+    });
+    const server = await startServer(project.dir, [plugin]);
+    live.add(server);
+    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started' });
+
+    // Vite's own chokidar is left running, unlike the default design.
+    expect(server.config.server.watch).not.toBe(null);
+    expect(server.watcher.constructor.name).not.toBe('NoopWatcher');
+
+    const changes = [];
+    server.watcher.on('change', (file) => changes.push(file));
+    writeFile(project.mod, 'export const n = 81;\n');
+    await waitFor(() => changes.includes(normalizePath(project.mod)), {
+      timeout: 10000,
+      message: 'the edit still reaches Vite in legacy mode',
+    });
   });
 
   it('tolerates hooks called out of order or twice', () => {

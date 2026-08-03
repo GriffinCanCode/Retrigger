@@ -12,6 +12,7 @@
 const jsHash = require('./hash-js');
 const { JsWatcher } = require('./js-watcher');
 const { getNative } = require('./native');
+const { WatchmanWatcher, detectWatchman } = require('./watchman-watcher');
 
 const XXH3 = 'xxh3-64';
 
@@ -79,17 +80,54 @@ function javascriptEngine(reason) {
   };
 }
 
+/**
+ * @param {{kind: string, reason: string, binary: string|null, module: object|null}} probe a
+ *   successful {@link detectWatchman} result (`probe.kind` truthy)
+ * @returns {object} engine
+ */
+function watchmanEngine(probe) {
+  return {
+    name: 'watchman',
+    // Watchman is a watch-only backend; content hashing is unrelated to how changes were
+    // observed, so this reuses the exact xxh3-64 implementation the JavaScript fallback does.
+    hashAlgorithm: XXH3,
+    reason: probe.reason,
+    createWatcher: (options) => new WatchmanWatcher(options, probe),
+    hashBytesSync: jsHash.hashBytesSync,
+    hashFileSync: jsHash.hashFileSync,
+    hashFile: jsHash.hashFile,
+    benchmarkHash: jsHash.benchmarkHash,
+    getSimdSupport: () => 'scalar',
+    getCpuLevel: () => 'scalar',
+    getAvailableLevels: () => ['scalar'],
+  };
+}
+
 let cachedEngine = null;
 
 /**
  * Resolve the engine for this process. Never throws.
- * @param {{prefer?: 'auto'|'native'|'javascript', env?: object}} [options]
+ * @param {{prefer?: 'auto'|'native'|'javascript'|'watchman', env?: object}} [options]
  * @returns {object} engine
  */
 function getEngine(options = {}) {
   const prefer = options.prefer || 'auto';
   if (prefer === 'javascript') {
     return javascriptEngine('explicitly requested by the caller');
+  }
+  // Never auto-selected: a caller gets Watchman only by asking for it by name, and an
+  // unavailable Watchman falls back to the ordinary native/JavaScript resolution below rather
+  // than throwing -- the same "a fallback is expected, not a crash" rule every other engine
+  // choice here follows.
+  if (prefer === 'watchman') {
+    const probe = detectWatchman({ env: options.env, fresh: options.fresh });
+    if (probe.kind) return watchmanEngine(probe);
+    warnOnce(
+      `watchman engine requested but unavailable (${probe.reason}); falling back to the ` +
+        'native/JavaScript engine. Install the "watchman" binary, or add "fb-watchman" as a ' +
+        'dependency of your application, to use it. Set RETRIGGER_SILENT=1 to hide this.',
+      options.env
+    );
   }
 
   let engine = options.fresh ? null : cachedEngine;
@@ -102,7 +140,8 @@ function getEngine(options = {}) {
       if (prefer !== 'native') {
         warnOnce(
           `native engine unavailable, using the JavaScript fallback (${reason}). ` +
-            `Hashes use ${jsHash.ALGORITHM}, not xxh3-64. Set RETRIGGER_SILENT=1 to hide this.`,
+            'Watching falls back to fs.watch polling; hashing stays xxh3-64 (via WebAssembly), ' +
+            'just slower than the native addon. Set RETRIGGER_SILENT=1 to hide this.',
           options.env
         );
       }
@@ -129,11 +168,16 @@ function resetEngineCache() {
 
 /**
  * @returns {{engine: 'native'|'javascript', backend: string, reason: string,
- *   hashAlgorithm: string, simd: string, platform: string, nativeAttempts: object[]}}
+ *   hashAlgorithm: string, simd: string, platform: string, nativeAttempts: object[],
+ *   watchman: {available: boolean, kind: 'fb-watchman'|'cli'|null, reason: string}}}
  */
 function getEngineInfo() {
   const engine = getEngine();
   const { attempts } = getNative();
+  // Mirrors `nativeAttempts`: reported unconditionally, whether or not anything asked for the
+  // Watchman engine, so a caller can tell *why* `prefer: 'watchman'` would or would not work
+  // without instantiating a watcher.
+  const watchmanProbe = detectWatchman();
   let backend = 'unknown';
   let simd = 'unknown';
   try {
@@ -156,6 +200,11 @@ function getEngineInfo() {
     simd,
     platform: `${process.platform}-${process.arch}`,
     nativeAttempts: attempts,
+    watchman: {
+      available: Boolean(watchmanProbe.kind),
+      kind: watchmanProbe.kind,
+      reason: watchmanProbe.reason,
+    },
   };
 }
 
@@ -167,4 +216,5 @@ module.exports = {
   nativeEngine,
   resetEngineCache,
   resetWarning,
+  watchmanEngine,
 };

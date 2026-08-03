@@ -2,6 +2,11 @@ import { describe, it, expect, afterEach, afterAll } from 'vitest';
 import { createRequire } from 'module';
 import path from 'path';
 import fs from 'fs';
+// A real `import`, not `require('webpack')`: this is what lets `vitest.rspack.config.mjs` retarget
+// this exact suite at `@rspack/core` (see `test:rspack`) via a resolve alias -- Vite's resolver
+// only rewrites the ESM import graph it controls, and a `createRequire`d `require()` call bypasses
+// that graph entirely and would always hit the real `webpack` package regardless of any alias.
+import webpack from 'webpack';
 
 const require = createRequire(import.meta.url);
 const {
@@ -13,7 +18,6 @@ const {
   sleep,
 } = require('./helpers/tmp.js');
 
-const webpack = require('webpack');
 const RetriggerWebpackPlugin = require('../plugins/webpack-plugin.js');
 const { RetriggerWatchFileSystem } = RetriggerWebpackPlugin;
 

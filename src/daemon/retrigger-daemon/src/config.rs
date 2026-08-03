@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use retrigger_system::{EventFilter, ProcessorConfig, WatcherConfig};
+use retrigger_system::{
+    AwaitWriteFinishConfig, BackendMode, EventFilter, ProcessorConfig, WatcherConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// The file name `start`, `validate`, and `config` reach for when none is given.
@@ -86,13 +88,64 @@ pub struct WatchConfig {
     pub hash_cache_size: usize,
     /// How long a cached fingerprint is trusted, in seconds.
     pub hash_cache_ttl_secs: u64,
+    /// Fold an atomic-save `RenamedTo` for a path already seen to arrive into `Modified`. See
+    /// [`retrigger_system::WatcherConfig::atomic_write_normalization`].
+    pub atomic_write_normalization: bool,
+    /// Which backend drives event delivery.
+    ///
+    /// Declared after the scalar fields above and before `paths`: TOML requires every `key =
+    /// value` in a table to precede its nested `[section]` tables, and an array of tables like
+    /// `paths` must come last of all.
+    pub backend: BackendConfig,
+    /// Hold a changed file until it stops growing before reporting it.
+    pub await_write_finish: AwaitWriteFinishSetting,
     /// Paths watched at startup. More can be added at runtime with `POST /watch`.
     ///
-    /// Declared last because TOML requires scalars to precede tables in a serialized section.
-    /// Skipped when empty so that a generated file does not contain `paths = []`, which would
-    /// make appending the `[[watcher.paths]]` block the comments suggest a duplicate-key error.
+    /// Declared last because TOML requires scalars and tables to precede an array of tables in a
+    /// serialized section. Skipped when empty so that a generated file does not contain `paths =
+    /// []`, which would make appending the `[[watcher.paths]]` block the comments suggest a
+    /// duplicate-key error.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<WatchPath>,
+}
+
+/// [`WatchConfig::backend`]: which backend implementation drives event delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackendConfig {
+    /// `"auto"` picks the platform-native backend; `"poll"` forces the portable,
+    /// interval-driven fallback for network/remote file systems where kernel watch events
+    /// cannot be trusted.
+    pub mode: BackendModeSetting,
+    /// Re-scan interval in milliseconds. Only meaningful for `mode = "poll"`.
+    pub poll_interval_ms: u64,
+    /// Also hash file contents on each poll, to catch a same-size, same-mtime rewrite that
+    /// `stat` alone would miss. Only meaningful for `mode = "poll"`.
+    pub poll_compare_contents: bool,
+}
+
+/// [`BackendConfig::mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendModeSetting {
+    /// The platform-native backend, selected at compile time. The default.
+    #[default]
+    Auto,
+    /// `notify`'s portable polling backend.
+    Poll,
+}
+
+/// [`WatchConfig::await_write_finish`]: coalesce a chunked write into one final event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AwaitWriteFinishSetting {
+    /// Off by default, which preserves the daemon's original behaviour: a change is reported as
+    /// soon as the backend sees it.
+    pub enabled: bool,
+    /// How often to re-`stat` a path while waiting for it to settle.
+    pub poll_interval_ms: u64,
+    /// How long a path's size and modification time must be unchanged before it is reported.
+    pub stability_threshold_ms: u64,
 }
 
 /// One watched root.
@@ -190,8 +243,54 @@ impl Default for WatchConfig {
             follow_symlinks: true,
             hash_cache_size: ProcessorConfig::default().max_entries,
             hash_cache_ttl_secs: ProcessorConfig::default().ttl.as_secs(),
+            atomic_write_normalization: false,
+            backend: BackendConfig::default(),
+            await_write_finish: AwaitWriteFinishSetting::default(),
             paths: Vec::new(),
         }
+    }
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            mode: BackendModeSetting::Auto,
+            poll_interval_ms: 1000,
+            poll_compare_contents: false,
+        }
+    }
+}
+
+impl Default for AwaitWriteFinishSetting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: 100,
+            stability_threshold_ms: 2000,
+        }
+    }
+}
+
+impl BackendConfig {
+    /// The [`BackendMode`] this section describes.
+    fn to_backend_mode(&self) -> BackendMode {
+        match self.mode {
+            BackendModeSetting::Auto => BackendMode::Auto,
+            BackendModeSetting::Poll => BackendMode::Poll {
+                interval: Duration::from_millis(self.poll_interval_ms),
+                compare_contents: self.poll_compare_contents,
+            },
+        }
+    }
+}
+
+impl AwaitWriteFinishSetting {
+    /// The [`AwaitWriteFinishConfig`] this section describes, or `None` when disabled.
+    fn to_config(&self) -> Option<AwaitWriteFinishConfig> {
+        self.enabled.then(|| AwaitWriteFinishConfig {
+            poll_interval: Duration::from_millis(self.poll_interval_ms),
+            stability_threshold: Duration::from_millis(self.stability_threshold_ms),
+        })
     }
 }
 
@@ -299,6 +398,24 @@ impl DaemonConfig {
                 bail!("watcher.paths contains an entry with an empty path");
             }
         }
+        if self.watcher.backend.mode == BackendModeSetting::Poll
+            && self.watcher.backend.poll_interval_ms == 0
+        {
+            bail!("watcher.backend.poll_interval_ms must be at least 1 when mode = \"poll\"");
+        }
+        if self.watcher.await_write_finish.enabled {
+            if self.watcher.await_write_finish.poll_interval_ms == 0 {
+                bail!(
+                    "watcher.await_write_finish.poll_interval_ms must be at least 1 when enabled"
+                );
+            }
+            if self.watcher.await_write_finish.stability_threshold_ms == 0 {
+                bail!(
+                    "watcher.await_write_finish.stability_threshold_ms must be at least 1 when \
+                     enabled"
+                );
+            }
+        }
         // Compiling the filter is the only honest way to validate the globs: it is the same
         // code path, so a pattern that passes here cannot fail at startup.
         self.filter()?;
@@ -344,6 +461,9 @@ impl DaemonConfig {
             debounce: Duration::from_millis(self.watcher.debounce_ms),
             follow_symlinks: self.watcher.follow_symlinks,
             filter: self.filter()?,
+            backend: self.watcher.backend.to_backend_mode(),
+            await_write_finish: self.watcher.await_write_finish.to_config(),
+            atomic_write_normalization: self.watcher.atomic_write_normalization,
         })
     }
 
@@ -572,6 +692,80 @@ hash_cache_ttl_secs = 9
     }
 
     #[test]
+    fn backend_and_await_write_finish_default_to_the_original_behaviour() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.watcher.backend.mode, BackendModeSetting::Auto);
+        assert!(!config.watcher.await_write_finish.enabled);
+        assert!(!config.watcher.atomic_write_normalization);
+
+        let watcher = config.watcher_config().expect("valid");
+        assert_eq!(watcher.backend, retrigger_system::BackendMode::Auto);
+        assert_eq!(watcher.await_write_finish, None);
+        assert!(!watcher.atomic_write_normalization);
+    }
+
+    #[test]
+    fn a_poll_backend_and_await_write_finish_are_carried_through() -> Result<()> {
+        let config = DaemonConfig::parse(
+            r#"
+[watcher.backend]
+mode = "poll"
+poll_interval_ms = 250
+poll_compare_contents = true
+
+[watcher.await_write_finish]
+enabled = true
+poll_interval_ms = 20
+stability_threshold_ms = 400
+"#,
+        )?;
+        config.validate()?;
+        let watcher = config.watcher_config()?;
+        assert_eq!(
+            watcher.backend,
+            retrigger_system::BackendMode::Poll {
+                interval: Duration::from_millis(250),
+                compare_contents: true,
+            }
+        );
+        assert_eq!(
+            watcher.await_write_finish,
+            Some(AwaitWriteFinishConfig {
+                poll_interval: Duration::from_millis(20),
+                stability_threshold: Duration::from_millis(400),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_zero_poll_interval_is_rejected_only_when_the_section_using_it_is_active() -> Result<()> {
+        // `mode = "auto"` never reads `poll_interval_ms`, so a stray 0 left over from switching
+        // back from `"poll"` must not fail validation.
+        let inert =
+            DaemonConfig::parse("[watcher.backend]\nmode = \"auto\"\npoll_interval_ms = 0\n")?;
+        inert.validate()?;
+
+        let active =
+            DaemonConfig::parse("[watcher.backend]\nmode = \"poll\"\npoll_interval_ms = 0\n")?;
+        assert!(active.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn await_write_finish_rejects_a_zero_threshold_only_when_enabled() -> Result<()> {
+        let inert =
+            DaemonConfig::parse("[watcher.await_write_finish]\nstability_threshold_ms = 0\n")?;
+        inert.validate()?;
+
+        let active = DaemonConfig::parse(
+            "[watcher.await_write_finish]\nenabled = true\nstability_threshold_ms = 0\n",
+        )?;
+        assert!(active.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn the_default_excludes_cover_the_trees_that_exhaust_inotify() -> Result<()> {
         let filter = DaemonConfig::default().filter()?;
         assert!(!filter.matches(Path::new("/p/node_modules/react/index.js")));
@@ -683,6 +877,37 @@ mod property_tests {
         ]
     }
 
+    fn backend_mode() -> impl Strategy<Value = BackendModeSetting> {
+        prop_oneof![
+            Just(BackendModeSetting::Auto),
+            Just(BackendModeSetting::Poll)
+        ]
+    }
+
+    prop_compose! {
+        // Starts at 1, never 0: both `poll_interval_ms` fields are validation failures at 0
+        // regardless of whether the section they belong to is even active, so keeping the
+        // property generator out of that space entirely means it only ever exercises
+        // configurations `validate()` is supposed to accept.
+        fn backend_config()(
+            mode in backend_mode(),
+            poll_interval_ms in 1_u64..=60_000,
+            poll_compare_contents in any::<bool>(),
+        ) -> BackendConfig {
+            BackendConfig { mode, poll_interval_ms, poll_compare_contents }
+        }
+    }
+
+    prop_compose! {
+        fn await_write_finish_setting()(
+            enabled in any::<bool>(),
+            poll_interval_ms in 1_u64..=10_000,
+            stability_threshold_ms in 1_u64..=60_000,
+        ) -> AwaitWriteFinishSetting {
+            AwaitWriteFinishSetting { enabled, poll_interval_ms, stability_threshold_ms }
+        }
+    }
+
     prop_compose! {
         // Sizes stay within i64 range because TOML integers are signed 64-bit; a value the format
         // cannot represent would be a TOML limitation surfacing as a false failure, not a bug here.
@@ -694,6 +919,9 @@ mod property_tests {
             follow_symlinks in any::<bool>(),
             hash_cache_size in 1_usize..=100_000,
             hash_cache_ttl_secs in 0_u64..=1_000_000,
+            atomic_write_normalization in any::<bool>(),
+            backend in backend_config(),
+            await_write_finish in await_write_finish_setting(),
             paths in prop::collection::vec((safe_path(), any::<bool>()), 0..4),
             include in prop::collection::vec(valid_glob(), 0..3),
             exclude in prop::collection::vec(valid_glob(), 0..3),
@@ -708,6 +936,9 @@ mod property_tests {
                     follow_symlinks,
                     hash_cache_size,
                     hash_cache_ttl_secs,
+                    atomic_write_normalization,
+                    backend,
+                    await_write_finish,
                     paths: paths
                         .into_iter()
                         .map(|(path, recursive)| WatchPath { path, recursive })

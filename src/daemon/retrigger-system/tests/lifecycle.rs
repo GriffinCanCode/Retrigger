@@ -582,3 +582,40 @@ fn watching_a_symlinked_root_reports_events() {
     );
     let _ = Path::new("");
 }
+
+/// Whether registering a watch even touches the target's own permission bits is backend-specific:
+/// `inotify` opens the directory and so needs read access to it, while `FSEvents` subscribes to a
+/// volume-wide event stream and needs none. Root bypasses the check either way. This asserts the
+/// mapping only when the current backend and privilege level can actually produce the failure —
+/// the same "skip, don't fail, when we cannot prove the negative" shape as
+/// [`watching_a_symlinked_root_reports_events`] uses for platform differences. The mapping itself
+/// is proven unconditionally and deterministically by `error::tests::io_permission_denied_maps_to_permission_denied`.
+#[cfg(unix)]
+#[test]
+fn watching_a_permission_denied_directory_yields_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tree = Tree::new();
+    let locked = tree.mkdir("locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    // The backend must actually be attached for registration to touch the kernel at all: watching
+    // an unstarted watcher only records scope and defers the real syscall to `start`.
+    let watcher = watcher();
+    watcher.start().expect("start");
+    let result = watcher.watch(&locked, true);
+
+    // Restored before any assertion can panic, so a failing test never leaves the temp tree
+    // (and its `Drop` cleanup) unable to remove itself.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+    match result {
+        Err(WatchError::PermissionDenied(_)) => {}
+        Ok(()) => eprintln!(
+            "skipping assertion: watch of a chmod-000 directory succeeded, \
+             which means either this process is root or the current backend (e.g. FSEvents) \
+             does not need read access on the target to register a watch"
+        ),
+        Err(other) => panic!("expected PermissionDenied, got {other:?}"),
+    }
+}

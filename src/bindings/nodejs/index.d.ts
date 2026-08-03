@@ -50,6 +50,31 @@ export interface FileEvent {
   hash?: string | null;
 }
 
+/** One entry of a {@link SnapshotEnvelope}. */
+export interface SnapshotEntry {
+  /** Absolute path. */
+  path: string;
+  isDirectory: boolean;
+  /** Always `0` for a directory. */
+  size: number;
+  /** Nanoseconds since the Unix epoch, `null` when the file system reports none. */
+  modifiedNs: bigint | null;
+}
+
+/**
+ * A self-describing, portable directory-tree inventory, returned by {@link Retrigger.snapshot}
+ * and {@link Retrigger.watchWithSnapshot}. Safe to persist as JSON and load back later: `algorithm`
+ * and `version` are what let a reader tell whether a persisted snapshot still matches what this
+ * package produces before trusting it.
+ */
+export interface SnapshotEnvelope {
+  /** The digest algorithm this envelope's format is defined in terms of. Currently `"xxh3-64"`. */
+  algorithm: string;
+  /** Envelope schema version. */
+  version: number;
+  entries: SnapshotEntry[];
+}
+
 /** Content-hashing counters, `null` when `contentHashing: false`. */
 export interface ContentStats {
   /** Digests currently cached. Never exceeds the configured ceiling. */
@@ -74,6 +99,10 @@ export interface WatchStats {
   isRunning: boolean;
   content: ContentStats | null;
   metrics: MetricsSnapshot;
+  /** Async hashes of oversized files (see `maxHashBytes`) currently reading. Bounded by `maxConcurrentHashes`. */
+  asyncHashesInFlight: number;
+  /** Oversized-file hashes queued behind `maxConcurrentHashes` already-running ones. */
+  asyncHashesQueued: number;
 }
 
 export interface MetricsSnapshot {
@@ -93,20 +122,57 @@ export interface MetricsSnapshot {
 }
 
 export interface EngineInfo {
-  engine: 'native' | 'javascript';
-  /** "inotify" | "fsevents" | "rdcw" | "kqueue" | "polling" | "unknown" */
+  /** `'watchman'` is only ever reported here if a watcher explicitly requested it and it was
+   * available; `getEngine()`'s default `'auto'` resolution never selects it. */
+  engine: 'native' | 'javascript' | 'watchman';
+  /** "inotify" | "fsevents" | "rdcw" | "kqueue" | "polling" | "watchman" | "unknown" */
   backend: string;
   /** Why this engine was selected — the load failure reason when falling back. */
   reason: string;
   /**
-   * `"xxh3-64"` on the native engine. The JavaScript engine reports a
-   * different algorithm (`"blake2b-64"` or `"sha256-64"`); digests are NOT
-   * comparable between engines.
+   * `"xxh3-64"` on every engine: the JavaScript and Watchman engines both hash with the same
+   * algorithm compiled to WebAssembly, so a digest from one is comparable to a digest from
+   * another.
    */
   hashAlgorithm: string;
   simd: string;
   platform: string;
   nativeAttempts: Array<{ type: string; id: string; error?: string }>;
+  /** Whether `prefer: 'watchman'` would succeed right now, and why, reported unconditionally —
+   * mirrors `nativeAttempts` for the optional Watchman engine. */
+  watchman: { available: boolean; kind: 'fb-watchman' | 'cli' | null; reason: string };
+}
+
+/**
+ * Which watcher backend drives event delivery. `'auto'` (the default) is the
+ * platform-native backend (`inotify`/`FSEvents`/`ReadDirectoryChangesW`).
+ * `'poll'` forces the portable, interval-driven fallback `notify` itself
+ * ships, for network/remote file systems where kernel watch events cannot be
+ * trusted. Ignored by the JavaScript fallback engine, which always polls.
+ */
+export interface BackendOptions {
+  mode?: 'auto' | 'poll';
+  /** Re-scan interval in milliseconds. Only meaningful for `mode: 'poll'`. Default 1000. */
+  pollIntervalMs?: number;
+  /**
+   * Also hash file contents on each poll, to catch a same-size, same-mtime
+   * rewrite that `stat` alone would miss. Only meaningful for `mode: 'poll'`.
+   * Default `false`.
+   */
+  compareContents?: boolean;
+}
+
+/**
+ * Hold a changed file until it stops growing before reporting it (chokidar
+ * calls this the same thing). `undefined` (the default) reports as soon as
+ * the backend sees a change, which for a large file written in chunks means
+ * the first chunk.
+ */
+export interface AwaitWriteFinishOptions {
+  /** How often to re-`stat` a path while waiting for it to settle. Default 100. */
+  pollIntervalMs?: number;
+  /** How long size and mtime must be unchanged before the path is reported. Default 2000. */
+  stabilityThresholdMs?: number;
 }
 
 export interface RetriggerOptions {
@@ -117,8 +183,12 @@ export interface RetriggerOptions {
   debounceMs?: number;
   capacity?: number;
   pollIntervalMs?: number;
-  /** `'native'` throws if the addon is unavailable; `'auto'` never throws. */
-  engine?: 'auto' | 'native' | 'javascript';
+  /**
+   * `'native'` throws if the addon is unavailable; `'auto'` never throws and never selects
+   * `'watchman'` on its own. `'watchman'` falls back to `'auto'`'s resolution, with a warning,
+   * when neither the `fb-watchman` client nor the `watchman` binary can be reached.
+   */
+  engine?: 'auto' | 'native' | 'javascript' | 'watchman';
   emitDirectories?: boolean;
   unref?: boolean;
   /**
@@ -127,10 +197,27 @@ export interface RetriggerOptions {
    */
   contentHashing?: boolean;
   /**
-   * Files larger than this are reported as changed without being read, because
-   * hashing runs on the drain loop. Default 4 MiB.
+   * The synchronous/asynchronous hashing threshold. A changed file at or under this size is
+   * hashed synchronously on the drain loop; a larger one is hashed on the non-blocking async
+   * path instead (see `maxConcurrentHashes`) so it cannot stall delivery of other events.
+   * Default 4 MiB.
    */
   maxHashBytes?: number;
+  /**
+   * Ceiling on async hashes (see `maxHashBytes`) running at once; the rest wait their turn in a
+   * FIFO queue. Default 4.
+   */
+  maxConcurrentHashes?: number;
+  /** Which backend implementation drives event delivery. See {@link BackendOptions}. */
+  backend?: BackendOptions;
+  /** Coalesce a chunked write into one final event. See {@link AwaitWriteFinishOptions}. */
+  awaitWriteFinish?: AwaitWriteFinishOptions;
+  /**
+   * Fold an atomic-save `renamedTo` for a path already seen to arrive into
+   * `change`, so an editor's write-temp-then-rename save is never missed by a
+   * listener that only reacts to content changes. Default `false`.
+   */
+  atomicWriteNormalization?: boolean;
 }
 
 export declare class Retrigger extends EventEmitter {
@@ -154,6 +241,13 @@ export declare class Retrigger extends EventEmitter {
   /** Alias of `add`. */
   watch(target: string, recursive?: boolean): this;
   unwatch(target: string): this;
+  /** Crawl `target`'s current contents, without registering a watch on it. */
+  snapshot(target: string): Promise<SnapshotEnvelope>;
+  /**
+   * `add(target, recursive)` followed by `snapshot(target)`, with the watch registered before the
+   * crawl begins so nothing created during the crawl is lost.
+   */
+  watchWithSnapshot(target: string, recursive?: boolean): Promise<SnapshotEnvelope>;
   start(): this;
   stop(): this;
   close(): this;
@@ -235,11 +329,19 @@ export interface RetriggerVitePluginOptions {
   stats?: boolean;
   /** Skip HMR for files rewritten with identical bytes. Default `true`. */
   contentHashing?: boolean;
+  /**
+   * Escape hatch: restore the pre-rewrite design (Vite's own chokidar watcher left running,
+   * gated by content hash) instead of disabling it via `server.watch: null`. Default `false`.
+   * See the header comment in `plugins/vite-plugin.js` for the composability trade-off.
+   */
+  legacyWatcher?: boolean;
 }
 
 export interface RetriggerVitePlugin {
   name: 'retrigger';
   apply: 'serve';
+  enforce: 'pre';
+  config(): { server: { watch: null } } | undefined;
   configureServer(server: any): () => void;
   buildStart(): void;
   buildEnd(): void;
@@ -248,6 +350,8 @@ export interface RetriggerVitePlugin {
     getStats(): Record<string, unknown>;
     isWatching(): boolean;
     dispatch(event: FileEvent): 'watcher' | 'fallback' | 'skipped';
+    /** Force fail-open to a real watcher, as a repeated engine error would. Idempotent. */
+    degrade(reason?: Error | string): void;
   };
 }
 

@@ -95,17 +95,19 @@ jobs:
           exit 1
 
   # Every target is built on a runner of that same OS and architecture rather
-  # than cross-compiled. That costs a few more runners and buys two things:
-  # the C hash engine needs no cross toolchain, and — more importantly — each
-  # artifact can be executed on its real platform before it is published.
+  # than cross-compiled, except where free GitHub-hosted hardware does not
+  # exist: win-arm64 is cross-built-unexecuted (flagged below), FreeBSD runs
+  # inside `vmactions/freebsd-vm`, and the Node Tier-2 Linux arches
+  # (armv7 / ppc64le / s390x) are cross-built then executed under QEMU.
   # Publishing a binary nobody ever ran is how "works on my machine" ships.
   #
-  # This matrix plus `build-musl` must cover exactly package.json#napi.targets.
-  # `napi artifacts` in CLI v3 fails on a configured target with no binary
-  # rather than skipping it the way v2 did, so a target added in one place and
-  # not the other breaks the release instead of silently shipping nothing.
-  # api-contract.test.mjs holds napi.targets and optionalDependencies together
-  # from the other side, so the three lists cannot drift apart unnoticed.
+  # This matrix plus `build-musl`, `build-freebsd`, and `build-emulated` must
+  # cover exactly package.json#napi.targets. `napi artifacts` in CLI v3 fails
+  # on a configured target with no binary rather than skipping it the way v2
+  # did, so a target added in one place and not the other breaks the release
+  # instead of silently shipping nothing. api-contract.test.mjs holds
+  # napi.targets and optionalDependencies together from the other side, so the
+  # lists cannot drift apart unnoticed.
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.host }}
@@ -243,10 +245,130 @@ jobs:
           path: ${{ env.NODE_DIR }}/*.node
           if-no-files-found: error
 
+  # FreeBSD has no GitHub-hosted runner. `vmactions/freebsd-vm` boots a real
+  # FreeBSD guest on the free ubuntu-latest runner (QEMU), installs the
+  # toolchain inside the guest, and builds+executes the addon there. The
+  # artifact is copied back for `napi artifacts` / publish. This is the
+  # headline gap the platform matrix exists to close — not a cross-build.
+  build-freebsd:
+    name: x86_64-unknown-freebsd
+    runs-on: ubuntu-latest
+    needs: guard
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and verify on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.3'
+          usesh: true
+          copyback: true
+          envs: NODE_DIR
+          prepare: |
+            pkg install -y gmake curl
+            pkg install -y node22 || pkg install -y node
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            set -eu
+            . "$HOME/.cargo/env"
+            cd "$NODE_DIR"
+            npm ci --no-audit --no-fund
+            npm run build
+            node scripts/verify-artifact.js
+            test -f retrigger-nodejs-bindings.freebsd-x64.node
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bindings-x86_64-unknown-freebsd
+          path: ${{ env.NODE_DIR }}/*.node
+          if-no-files-found: error
+
+  # Node Tier-2 Linux arches with no GitHub-hosted runner. Cross-compile on
+  # ubuntu-latest (free), then load the .node under QEMU via a multi-arch
+  # node:22 image and run the same verify-artifact gate as every native job.
+  # That is stronger than the win-arm64 precedent (cross-built, never executed).
+  build-emulated:
+    name: ${{ matrix.target }} (qemu)
+    runs-on: ubuntu-latest
+    needs: guard
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: armv7-unknown-linux-gnueabihf
+            platform: linux/arm/v7
+            suffix: linux-arm-gnueabihf
+            gcc: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+          - target: powerpc64le-unknown-linux-gnu
+            platform: linux/ppc64le
+            suffix: linux-ppc64-gnu
+            gcc: gcc-powerpc64le-linux-gnu
+            linker: powerpc64le-linux-gnu-gcc
+          - target: s390x-unknown-linux-gnu
+            platform: linux/s390x
+            suffix: linux-s390x-gnu
+            gcc: gcc-s390x-linux-gnu
+            linker: s390x-linux-gnu-gcc
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang ${{ matrix.gcc }}
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: ${{ env.NODE_DIR }}
+
+      - name: Cross-build native addon
+        working-directory: ${{ env.NODE_DIR }}
+        env:
+          TARGET: ${{ matrix.target }}
+          LINKER: ${{ matrix.linker }}
+        run: |
+          env_target=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
+          export "CARGO_TARGET_${env_target}_LINKER=$LINKER"
+          export "CC_$(echo "$TARGET" | tr '-' '_')=$LINKER"
+          npm run build -- --target "$TARGET"
+          test -f "retrigger-nodejs-bindings.${{ matrix.suffix }}.node"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - name: Execute artifact under QEMU
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD:/work" \
+            -w "/work/$NODE_DIR" \
+            node:22-bookworm \
+            node scripts/verify-artifact.js
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.target }}
+          path: ${{ env.NODE_DIR }}/*.node
+          if-no-files-found: error
+
   publish:
     name: Publish
     runs-on: ubuntu-latest
-    needs: [build, build-musl]
+    needs: [build, build-musl, build-freebsd, build-emulated]
     permissions:
       contents: write
       id-token: write
@@ -287,10 +409,10 @@ jobs:
       # publishes them. Both halves matter here.
       #
       # The publishing half needs a registry token of its own. Without one the
-      # eight platform packages never reach npm, and the root package below
-      # still ships optionalDependencies naming them: every install then
-      # resolves no native package and degrades to the JavaScript engine while
-      # looking like a clean install. That is exactly how 1.0.4 shipped.
+      # platform packages never reach npm, and the root package below still
+      # ships optionalDependencies naming them: every install then resolves no
+      # native package and degrades to the JavaScript engine while looking like
+      # a clean install. That is exactly how 1.0.4 shipped.
       #
       # The publishing half must also not run on a dry run. Publishing is the
       # one step in this workflow that cannot be undone — npm refuses to reuse
@@ -410,6 +532,87 @@ jobs:
             console.log('ok');
           "
 
+  # FreeBSD post-publish proof: install from the registry inside a real FreeBSD
+  # guest and require engine === 'native'. Same bar as the GitHub-hosted OS legs.
+  verify-published-freebsd:
+    name: Verify install / freebsd-x64
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.event_name == 'push'
+    timeout-minutes: 60
+    steps:
+      - name: Wait for registry propagation
+        run: sleep 45
+
+      - name: Install from the registry on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.3'
+          usesh: true
+          copyback: false
+          envs: GITHUB_REF_NAME
+          prepare: |
+            pkg install -y node22 || pkg install -y node
+          run: |
+            set -eu
+            mkdir -p /tmp/verify && cd /tmp/verify
+            npm init -y >/dev/null
+            npm install "@retrigger/core@${GITHUB_REF_NAME#v}"
+            node -e "
+              const r = require('@retrigger/core');
+              const info = r.getEngineInfo();
+              console.log('engine:', JSON.stringify(info));
+              if (!r.hashBytesSync(Buffer.from('retrigger'))) throw new Error('hash failed');
+              if (info.engine !== 'native') {
+                throw new Error('expected the native engine on FreeBSD, got ' + info.engine);
+              }
+              console.log('ok');
+            "
+
+  # Tier-2 Linux arches: install from the registry under QEMU and require
+  # engine === 'native'. Proves the published optionalDependency resolves and
+  # loads, not merely that a local cross-build once verified.
+  verify-published-emulated:
+    name: Verify install / ${{ matrix.suffix }} (qemu)
+    runs-on: ubuntu-latest
+    needs: publish
+    if: github.event_name == 'push'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/arm/v7,  suffix: linux-arm-gnueabihf }
+          - { platform: linux/ppc64le, suffix: linux-ppc64-gnu }
+          - { platform: linux/s390x,   suffix: linux-s390x-gnu }
+    steps:
+      - uses: docker/setup-qemu-action@v3
+
+      - name: Wait for registry propagation
+        run: sleep 45
+
+      - name: Install from the registry under QEMU
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e VERSION="${GITHUB_REF_NAME#v}" \
+            node:22-bookworm \
+            bash -c '
+              set -eu
+              mkdir -p /tmp/verify && cd /tmp/verify
+              npm init -y >/dev/null
+              npm install "@retrigger/core@$VERSION"
+              node -e "
+                const r = require(\"@retrigger/core\");
+                const info = r.getEngineInfo();
+                console.log(\"engine:\", JSON.stringify(info));
+                if (!r.hashBytesSync(Buffer.from(\"retrigger\"))) throw new Error(\"hash failed\");
+                if (info.engine !== \"native\") {
+                  throw new Error(\"expected the native engine under QEMU, got \" + info.engine);
+                }
+                console.log(\"ok\");
+              "
+            '
+
   # The same proof as above on musl, which is the platform this release exists
   # to fix: before the musl packages were built, an Alpine install resolved to
   # no native package and degraded to the JavaScript engine without complaining.
@@ -482,7 +685,7 @@ jobs:
   github-release:
     name: GitHub release
     runs-on: ubuntu-latest
-    needs: [build, build-musl, publish, publish-daemon]
+    needs: [build, build-musl, build-freebsd, build-emulated, publish, publish-daemon]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write

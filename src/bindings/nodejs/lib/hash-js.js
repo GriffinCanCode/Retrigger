@@ -1,68 +1,109 @@
 'use strict';
 
 /**
- * JavaScript-engine content hashing.
+ * JavaScript-engine content hashing: genuine XXH3-64, byte-identical to the native engine.
  *
- * IMPORTANT — this is NOT XXH3-64.
- *
- * The native engine returns XXH3-64. A correct pure-JS XXH3-64 needs 64-bit
- * arithmetic that JavaScript can only do through BigInt, which is roughly two
- * orders of magnitude slower than the native path and easy to get subtly wrong.
- * Rather than ship a plausible-looking near-miss, the fallback uses a hash Node
- * already implements in C — BLAKE2b-512 truncated to its first 8 bytes (or
- * SHA-256 truncated, on Node builds without BLAKE2) — and reports which one it
- * used via `getEngineInfo().hashAlgorithm`.
+ * The digest is computed by a ~16 KB WebAssembly module compiled ahead of time from the same
+ * `xxhash-rust` crate's XXH3 implementation the native addon and the Rust daemon's `Xxh3Hasher`
+ * ultimately agree with (see `wasm-xxh3/`, rebuilt by `npm run build:wasm`) -- not reimplemented
+ * by hand in JavaScript's much slower BigInt arithmetic, and not a plausible-looking near-miss.
+ * `require()` never touches the Rust or `wasm32` toolchain: the compiled artifact ships prebuilt
+ * at `lib/xxh3.wasm`, and instantiating it needs nothing from the host beyond the linear memory
+ * every WebAssembly runtime already provides -- no imports, so no `env` object to fake.
  *
  * Consequences, stated plainly:
- *   - Digests are 16 lowercase hex characters on both engines, so the shape is
- *     interchangeable and callers need no branching.
- *   - Digest *values* are NOT comparable across engines. Never persist a hash
- *     produced by one engine and compare it against the other.
+ *   - Digests are 16 lowercase hex characters on both engines, and `getEngineInfo().hashAlgorithm`
+ *     reports `"xxh3-64"` for both.
+ *   - Digest *values* are canonically comparable across engines: the same bytes and the same seed
+ *     produce the same 64-bit number whichever engine computed it. `hash.test.mjs` proves this
+ *     against the compiled addon and the official XXH3-64 reference vectors, not merely against
+ *     this module's own prior output.
  */
 
 const crypto = require('crypto');
 const fs = require('fs');
-
-const AVAILABLE = new Set(safeGetHashes());
-const NODE_ALGORITHM = AVAILABLE.has('blake2b512') ? 'blake2b512' : 'sha256';
+const path = require('path');
 
 /** Public, stable identifier reported through `getEngineInfo()`. */
-const ALGORITHM = NODE_ALGORITHM === 'blake2b512' ? 'blake2b-64' : 'sha256-64';
+const ALGORITHM = 'xxh3-64';
 
-const DIGEST_BYTES = 8;
+const DIGEST_HEX_LENGTH = 16;
 
 /**
- * Bytes held resident while hashing a file.
+ * Bytes held resident per chunk while hashing a file.
  *
  * Reading a whole file into a Buffer costs its full size in memory, and a watcher does not get to
  * choose what it is pointed at: a build output, a bundle, a source map, or a dataset committed by
  * mistake are all ordinary things to find in a repository, and any of them can be far larger than the
- * events describing them suggest. Above two gigabytes it is not merely expensive — Node cannot
+ * events describing them suggest. Above two gigabytes it is not merely expensive -- Node cannot
  * allocate the Buffer at all and the read throws. Chunking makes the cost of hashing a file
- * independent of that file's size, which is the same reason the native core reads in chunks.
+ * independent of that file's size, which is the same reason the native core reads in chunks -- and
+ * why the wasm module has an incremental hasher ([`openStream`]) rather than only a one-shot export.
  */
 const CHUNK_BYTES = 1 << 20;
 
-function safeGetHashes() {
+/**
+ * Load the bundled module once, at require time. Never throws: a failure here is exceedingly
+ * unlikely (this is a fixed local file, not a network fetch or a toolchain invocation) but every
+ * other module in this package holds `require()` to the same standard, so this one does too --
+ * the error is captured and re-raised, with an actionable message, only if a hash is attempted.
+ * @returns {{exports: WebAssembly.Exports}|{error: Error}}
+ */
+function loadWasm() {
   try {
-    return crypto.getHashes();
-  } catch {
-    return ['sha256'];
+    const bytes = fs.readFileSync(path.join(__dirname, 'xxh3.wasm'));
+    const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), {});
+    return { exports: instance.exports };
+  } catch (error) {
+    return { error };
   }
 }
 
+const wasm = loadWasm();
+
+/** @returns {WebAssembly.Exports} */
+function engine() {
+  if (wasm.error) {
+    throw new Error(
+      `the bundled XXH3 WebAssembly module (lib/xxh3.wasm) failed to load: ${wasm.error.message}. ` +
+        'This is an installation problem, not a usage error -- reinstalling the package should fix it.'
+    );
+  }
+  return wasm.exports;
+}
+
 /**
- * XXH3 accepts a 64-bit seed. There is no keyed variant of `createHash`, so a
- * non-zero seed is domain-separated by prefixing its little-endian bytes.
- * Documented rather than silently ignored.
+ * Copy `buf` into the module's linear memory, run `fn(ptr)`, and always free the allocation.
+ *
+ * The view onto `memory.buffer` is created *after* `alloc` returns and not before: `alloc` can
+ * grow the module's memory to satisfy the request, and growing detaches any `ArrayBuffer`
+ * reference taken before it, which would otherwise make this write silently a no-op.
+ * @param {WebAssembly.Exports} wasmExports
+ * @param {Buffer} buf
+ * @param {(ptr: number) => T} fn
+ * @returns {T}
+ * @template T
  */
-function seedPrefix(seed) {
-  if (seed === undefined || seed === null) return null;
-  const value = typeof seed === 'bigint' ? seed : BigInt(seed);
-  if (value === 0n) return null;
-  const buf = Buffer.allocUnsafe(8);
-  buf.writeBigUInt64LE(BigInt.asUintN(64, value));
-  return buf;
+function withCopy(wasmExports, buf, fn) {
+  const { memory, alloc, dealloc } = wasmExports;
+  const ptr = alloc(buf.length);
+  try {
+    if (buf.length > 0) new Uint8Array(memory.buffer, ptr, buf.length).set(buf);
+    return fn(ptr);
+  } finally {
+    dealloc(ptr, buf.length);
+  }
+}
+
+/** @returns {bigint} */
+function normalizeSeed(seed) {
+  if (seed === undefined || seed === null) return 0n;
+  return BigInt.asUintN(64, typeof seed === 'bigint' ? seed : BigInt(seed));
+}
+
+/** @returns {string} 16 lowercase hex characters */
+function toHex(digest) {
+  return BigInt.asUintN(64, digest).toString(16).padStart(DIGEST_HEX_LENGTH, '0');
 }
 
 /**
@@ -72,11 +113,39 @@ function seedPrefix(seed) {
  */
 function hashBytesSync(data, seed) {
   const buf = toBuffer(data);
-  const hash = crypto.createHash(NODE_ALGORITHM);
-  const prefix = seedPrefix(seed);
-  if (prefix) hash.update(prefix);
-  hash.update(buf);
-  return hash.digest().subarray(0, DIGEST_BYTES).toString('hex');
+  const wasmExports = engine();
+  const seedValue = normalizeSeed(seed);
+  return toHex(
+    withCopy(wasmExports, buf, (ptr) => wasmExports.xxh3_64(ptr, buf.length, seedValue))
+  );
+}
+
+/**
+ * An incremental XXH3-64 hash over the module's own linear memory, one chunk at a time.
+ *
+ * The one-shot export used by {@link hashBytesSync} has no way to hash a file without holding
+ * all of it in memory at once; this wraps the module's `xxh3_new`/`update`/`digest`/`free`
+ * quartet so {@link hashFileSync} and {@link hashFile} can stay within {@link CHUNK_BYTES}
+ * regardless of the file's size, and produce the *identical* digest a one-shot call over the
+ * concatenated bytes would (`memory.test.mjs` holds this to that standard explicitly).
+ * @param {bigint} [seed]
+ */
+function openStream(seed = 0n) {
+  const wasmExports = engine();
+  const handle = wasmExports.xxh3_new(seed);
+  return {
+    /** @param {Buffer} chunk */
+    update(chunk) {
+      withCopy(wasmExports, chunk, (ptr) => wasmExports.xxh3_update(handle, ptr, chunk.length));
+    },
+    /** @returns {string} */
+    digestHex() {
+      return toHex(wasmExports.xxh3_digest(handle));
+    },
+    free() {
+      wasmExports.xxh3_free(handle);
+    },
+  };
 }
 
 /**
@@ -85,7 +154,7 @@ function hashBytesSync(data, seed) {
  * @returns {{hash: string, size: number}}
  */
 function hashFileSync(filePath) {
-  const hash = crypto.createHash(NODE_ALGORITHM);
+  const stream = openStream();
   const fd = fs.openSync(filePath, 'r');
   let size = 0;
   try {
@@ -102,37 +171,63 @@ function hashFileSync(filePath) {
       const read = fs.readSync(fd, buf, 0, capacity, null);
       if (read === 0) break;
       // A view, not a copy: nothing beyond `buf` is allocated per chunk.
-      hash.update(buf.subarray(0, read));
+      stream.update(buf.subarray(0, read));
       size += read;
     }
+    return { hash: stream.digestHex(), size };
   } finally {
     fs.closeSync(fd);
+    stream.free();
   }
-  return { hash: hash.digest().subarray(0, DIGEST_BYTES).toString('hex'), size };
 }
 
 /**
- * Asynchronous variant, equally bounded — `createReadStream` reads in chunks.
+ * Asynchronous variant, equally bounded -- `createReadStream` reads in chunks, so hashing a large
+ * file costs the event loop nothing beyond the ordinary I/O it takes to read one anyway. This is
+ * what lets `ContentTracker#annotateAsync` (`lib/content.js`) fingerprint a file too large for the
+ * synchronous path without blocking whatever else is scheduled on this tick.
  * @param {string} filePath
+ * @param {{signal?: AbortSignal}} [options] `signal` lets a caller give up on a hash already in
+ *   flight -- `Retrigger#stop` (`lib/retrigger.js`) does, for every hash a stopped watcher no
+ *   longer has a reason to finish -- by destroying the underlying read stream, which releases its
+ *   file descriptor exactly as promptly as an error from the file system itself would.
  * @returns {Promise<{hash: string, size: number}>}
  */
-function hashFile(filePath) {
+function hashFile(filePath, options = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
-    const hash = crypto.createHash(NODE_ALGORITHM);
+    const { signal } = options;
+    if (signal && signal.aborted) {
+      rejectPromise(abortError());
+      return;
+    }
+    const stream = openStream();
     let size = 0;
-    const stream = fs.createReadStream(filePath);
-    stream.on('error', rejectPromise);
-    stream.on('data', (chunk) => {
+    let settled = false;
+    const finish = (run) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener('abort', onAbort);
+      stream.free();
+      run();
+    };
+    const readable = fs.createReadStream(filePath);
+    const onAbort = () => readable.destroy(abortError());
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    readable.on('error', (err) => finish(() => rejectPromise(err)));
+    readable.on('data', (chunk) => {
       size += chunk.length;
-      hash.update(chunk);
+      stream.update(chunk);
     });
-    stream.on('end', () => {
-      resolvePromise({
-        hash: hash.digest().subarray(0, DIGEST_BYTES).toString('hex'),
-        size,
-      });
-    });
+    readable.on('end', () => finish(() => resolvePromise({ hash: stream.digestHex(), size })));
   });
+}
+
+/** @returns {Error} named and coded the way Node's own abort errors are. */
+function abortError() {
+  const error = new Error('hashFile was aborted');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
 }
 
 /**
@@ -147,7 +242,7 @@ async function benchmarkHash(size, iterations) {
   const runs = Math.max(1, Math.floor(iterations));
   const buf = crypto.randomBytes(bytes);
 
-  hashBytesSync(buf); // warm the OpenSSL context out of the timed region
+  hashBytesSync(buf); // warm the wasm instance's allocator out of the timed region
 
   const start = process.hrtime.bigint();
   for (let i = 0; i < runs; i += 1) hashBytesSync(buf);
@@ -172,9 +267,9 @@ function toBuffer(data) {
 
 module.exports = {
   ALGORITHM,
-  NODE_ALGORITHM,
   benchmarkHash,
   hashBytesSync,
   hashFile,
   hashFileSync,
+  openStream,
 };

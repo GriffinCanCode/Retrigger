@@ -1,0 +1,30 @@
+[workspace]
+# Deliberately its own workspace, not a member of the repository's Cargo workspace at the root.
+# Nothing here participates in that workspace's lints, `cargo test`, or `[profile.release]`
+# (which sets `panic = "unwind"` for the Node addon's benefit — the opposite of what a
+# host-import-free `.wasm` needs). This crate builds exactly one artifact, on demand, via
+# `npm run build:wasm`; it is not part of the crate graph anything else depends on.
+
+[package]
+name = "retrigger-wasm-xxh3"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "XXH3-64, compiled to WebAssembly, for the Node.js fallback engine's canonical digest."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned to the exact version vendored in this workspace's Cargo.lock, so the WASM digest and the
+# native/daemon digest are provably the same algorithm, not merely the same name.
+xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+# No unwinding machinery, so the compiled module imports nothing from a host environment and
+# `WebAssembly.instantiate` needs no `env` object.
+panic = "abort"
+strip = true

@@ -147,6 +147,79 @@ jobs:
         run: npm run test:pack
         working-directory: src/bindings/nodejs
 
+  # FreeBSD has no GitHub-hosted runner. Same free `vmactions/freebsd-vm`
+  # guest used by the release build: prove the Node package builds, passes its
+  # suite, and packs on a real FreeBSD x64 kernel. The full Rust workspace
+  # suite stays on the GitHub-hosted OS matrix above — this leg is the Node
+  # addon contract for the platform the matrix previously omitted.
+  test-freebsd:
+    name: freebsd-x64 / node 22
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.3'
+          usesh: true
+          copyback: false
+          prepare: |
+            pkg install -y gmake curl
+            pkg install -y node22 || pkg install -y node
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            set -eu
+            . "$HOME/.cargo/env"
+            cd src/bindings/nodejs
+            npm ci --no-audit --no-fund
+            npm run build
+            npm test
+            npm run test:pack
+
+  # ------------------------------------------------------------- bundler-legs
+  # test/vite.test.mjs and test/webpack.test.mjs run against the pinned vite@6
+  # and webpack@5 on every leg above via plain `npm test`. This job re-runs
+  # those exact same suites retargeted at vite@7 and @rspack/core (see
+  # vitest.vite7.config.mjs / vitest.rspack.config.mjs) plus the Rspack-only
+  # persistent-cache case, on the one Node version (22) that clears every
+  # floor involved: vite@7's rolldown needs node:util#styleText (20.12+),
+  # @rspack/core needs 20.19+/22.12+, and Astro (already exercised by the
+  # matrix's Node-22 legs through plain `npm test`, self-skipped elsewhere --
+  # see test/astro.test.mjs) needs 22.12+. Both scripts are also
+  # version-gated internally, so this job stays a true no-op rather than a
+  # failure if that floor ever moves out from under it.
+  bundler-legs:
+    name: Bundler compatibility (vite@7, Rspack, Astro)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bundler-legs
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/bindings/nodejs/package-lock.json
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: make build-core
+      - run: npm ci --no-audit --no-fund
+        working-directory: src/bindings/nodejs
+      - run: npm run build
+        working-directory: src/bindings/nodejs
+      - name: vite@7
+        run: npm run test:vite7
+        working-directory: src/bindings/nodejs
+      - name: Rspack
+        run: npm run test:rspack
+        working-directory: src/bindings/nodejs
+      - name: Astro dev server
+        run: npx vitest run test/astro.test.mjs
+        working-directory: src/bindings/nodejs
+
   # ------------------------------------------------------------------- musl
   # Alpine is a separate risk surface from Debian: different libc, and the
   # package's libc detection has to pick the musl binaries. It has been wrong
@@ -292,7 +365,8 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [lint, test, test-musl, sanitizers, fallback, fallback-recursive, msrv]
+    needs:
+      [lint, test, test-freebsd, bundler-legs, test-musl, sanitizers, fallback, fallback-recursive, msrv]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any dependency failed

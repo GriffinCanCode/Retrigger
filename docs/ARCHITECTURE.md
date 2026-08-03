@@ -11,13 +11,13 @@ them.
 
 ## The layers
 
-| Path                         | Language   | Responsibility                                    |
-| ---------------------------- | ---------- | ------------------------------------------------- |
-| `src/core`                   | C11        | XXH3-64, with a kernel per SIMD level              |
-| `src/daemon/retrigger-core`  | Rust       | Safe FFI over the C engine                        |
-| `src/daemon/retrigger-system`| Rust       | The watcher: backends, filtering, coalescing      |
-| `src/daemon/retrigger-daemon`| Rust       | Optional standalone daemon over HTTP/JSON and SSE |
-| `src/bindings/nodejs`        | Rust + JS  | N-API addon, JS fallback, bundler plugins         |
+| Path                          | Language  | Responsibility                                    |
+| ----------------------------- | --------- | ------------------------------------------------- |
+| `src/core`                    | C11       | XXH3-64, with a kernel per SIMD level             |
+| `src/daemon/retrigger-core`   | Rust      | Safe FFI over the C engine                        |
+| `src/daemon/retrigger-system` | Rust      | The watcher: backends, filtering, coalescing      |
+| `src/daemon/retrigger-daemon` | Rust      | Optional standalone daemon over HTTP/JSON and SSE |
+| `src/bindings/nodejs`         | Rust + JS | N-API addon, JS fallback, bundler plugins         |
 
 Each depends only on the one above it in the hash column, and the watcher and the hash
 meet for the first time in the layer that consumes both.
@@ -64,7 +64,7 @@ on by themselves:
   preceded it.
 - **Uniform semantics across backends.** Recursion, and the meaning of each event kind,
   are the same on all three platforms. macOS needs the most work here: FSEvents reports a
-  *union of flags* accumulated since the last notification rather than a sequence of
+  _union of flags_ accumulated since the last notification rather than a sequence of
   operations, so event kinds are re-derived from the file system before delivery.
 - **Filtering before queueing.** Include and exclude globs are applied before an event
   reaches the queue, so an excluded tree cannot consume the capacity a watched one needs.
@@ -82,14 +82,12 @@ The decision is implemented twice, in Rust (`processor.rs`) and in JavaScript
 (`lib/content.js`), and the two decision tables are deliberately identical so the
 in-process watcher and the daemon cannot disagree about what counts as a change.
 
-The digests themselves are *not* comparable across engines — the addon hashes with XXH3-64
-and the JavaScript fallback with BLAKE2b-64 — and they do not need to be. Each path is
-only ever compared against its own previous digest, taken by the same engine in the same
-process. Both engines therefore reach identical `contentChanged` answers from
-non-identical digest values.
-
-Unreadable, oversized, and deleted files all resolve to "changed". Failing open is the
-only safe direction: a missed rebuild is a wrong answer that looks correct.
+Both engines hash with **canonical XXH3-64** (native via the C engine; the JavaScript
+fallback via a prebuilt WebAssembly module), so digests are comparable across engines and
+safe to persist. Each path's `contentChanged` decision still compares that path against
+its own previous digest; unreadable, oversized, and deleted files all resolve to
+"changed". Failing open is the only safe direction: a missed rebuild is a wrong answer
+that looks correct.
 
 ## Boundary 4: native to JavaScript
 
@@ -109,11 +107,13 @@ expected rather than exceptional. A shared parity suite runs both engines agains
 assertions, and CI has a job that deletes every `.node` file and runs the suite to prove
 the fallback alone is sufficient.
 
-Above the engine sit the two bundler integrations. Both are gated through the same content
-oracle, including each bundler's own watcher where it keeps one running — Vite's chokidar
-is deliberately left alive so a failure here can never be the reason a dev server stops
-reloading, but its events are passed through the same digest cache so a no-op save does
-not reload the browser and a real edit is not invalidated twice.
+Above the engine sit the bundler integrations (webpack / Rspack, Vite 5/6/7 and Astro,
+Rollup, esbuild). All are gated through the same content oracle. The Vite plugin's default
+path sets `server.watch = null` and injects events onto Vite's `NoopWatcher` so Retrigger
+is the sole filesystem event source; if Retrigger cannot start (or degrades mid-session),
+a minimal `fs.watch` fallback keeps relaying onto `server.watcher`. `legacyWatcher: true`
+restores the older shared-watcher design. The thesis everywhere is the same: skip work
+when the bytes did not change — not "be the fastest watcher."
 
 ## The daemon is optional
 

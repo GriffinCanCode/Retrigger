@@ -11,5 +11,12 @@
     "skipLibCheck": false,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.d.ts", "plugins/*.d.ts"]
+  "include": [
+    "index.d.ts",
+    "plugins/*.d.ts",
+    "lib/chokidar-adapter.d.ts",
+    "lib/rebuild-driver.d.ts",
+    "lib/rollup-plugin.d.ts",
+    "lib/esbuild-plugin.d.ts"
+  ]
 }

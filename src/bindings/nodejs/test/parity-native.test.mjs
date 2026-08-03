@@ -26,7 +26,16 @@ const PKG_ROOT = path.resolve(HERE, '..');
 const TRIPLES = {
   darwin: ['darwin-arm64', 'darwin-x64'],
   win32: ['win32-x64-msvc', 'win32-arm64-msvc'],
-  linux: ['linux-x64-gnu', 'linux-x64-musl', 'linux-arm64-gnu', 'linux-arm64-musl'],
+  linux: [
+    'linux-x64-gnu',
+    'linux-x64-musl',
+    'linux-arm64-gnu',
+    'linux-arm64-musl',
+    'linux-arm-gnueabihf',
+    'linux-ppc64-gnu',
+    'linux-s390x-gnu',
+  ],
+  freebsd: ['freebsd-x64'],
 };
 
 /** @returns {string|null} the addon built for this host, if any */

@@ -16,7 +16,12 @@
  *     reported as `deleted` for the old path and `created` for the new one.
  *     `renamedFrom` / `renamedTo` are never emitted and `cookie` is always
  *     `null`.
- *   - Symlinked directories are not traversed.
+ *   - Symlinked directories are not traversed, and — unlike the native engine, which reports the
+ *     link itself as a non-directory entry — `snapshot()`/`watchWithSnapshot()` omit it
+ *     altogether: both are built on `_walk`, which already drops a symlink for the same reason
+ *     `watch()` does (see `_walk`). For the same reason, `snapshot()` here also prunes excluded
+ *     subtrees, where the native engine's `Watcher::snapshot` deliberately does not: `_walk` is
+ *     the one traversal this engine has, and it already knows how to skip what `watch()` would.
  *   - `backend()` reports `"polling"`, the contract's label for any
  *     non-kernel-native backend.
  *   - On macOS `fs.watch` brings its FSEvents stream up on another thread, so
@@ -25,6 +30,13 @@
  *     wait on; a caller that must not miss the very first change should read
  *     the tree once after `start()` rather than trusting the event stream for
  *     that instant.
+ *   - `backend`, `pollCompareContents`, and `atomicWriteNormalization` are
+ *     accepted and ignored: this engine has exactly one backend (`fs.watch`),
+ *     so there is nothing for a backend selection to choose between, and it
+ *     never emits `renamedTo` in the first place (see above), so there is
+ *     nothing for atomic-write normalization to fold. `awaitWriteFinish` is
+ *     the one option here honestly implemented, on the same single-timer
+ *     machinery as `debounceMs`'s trailing correction.
  */
 
 const fs = require('fs');
@@ -32,6 +44,18 @@ const path = require('path');
 
 const { Matcher } = require('./matcher');
 const { BoundedSet } = require('./bounded');
+
+/**
+ * Algorithm named by a snapshot envelope's `algorithm` field.
+ *
+ * Matches `retrigger_system::SNAPSHOT_ALGORITHM` and the native addon's `JsSnapshotEnvelope`, so a
+ * snapshot persisted by one engine is self-describing to a reader that used the other. No entry
+ * here carries a digest today; the field is forward-looking, exactly as it is on the Rust side.
+ */
+const SNAPSHOT_ALGORITHM = 'xxh3-64';
+
+/** Matches `retrigger_system::SNAPSHOT_ENVELOPE_VERSION`. */
+const SNAPSHOT_ENVELOPE_VERSION = 1;
 
 /** @type {readonly string[]} */
 const EVENT_KINDS = Object.freeze([
@@ -78,6 +102,20 @@ const KNOWN_PATH_LIMIT = 100_000;
 const PENDING_LIMIT = 4096;
 
 /**
+ * Ceiling on paths held for {@link JsWatcher#awaitWriteFinish}. Matches {@link PENDING_LIMIT}'s
+ * reasoning: past this point a new path is delivered immediately as `modified` rather than
+ * tracked, which degrades to "as if the option were unset" for the overflow instead of growing
+ * without bound.
+ */
+const STABILIZE_LIMIT = 4096;
+
+/** `awaitWriteFinish.pollIntervalMs` when configured but not given one. */
+const DEFAULT_STABILIZE_POLL_MS = 100;
+
+/** `awaitWriteFinish.stabilityThresholdMs` when configured but not given one. */
+const DEFAULT_STABILIZE_THRESHOLD_MS = 2000;
+
+/**
  * Delivered slots tolerated at the front of the queue before it is compacted.
  *
  * The queue is drained from a moving cursor rather than with `shift`, which on a full 8192-event
@@ -119,7 +157,10 @@ const RECURSIVE_WATCH =
 
 class JsWatcher {
   /**
-   * @param {{capacity?: number, debounceMs?: number, include?: string[], exclude?: string[]}} [options]
+   * @param {{capacity?: number, debounceMs?: number, include?: string[], exclude?: string[],
+   *   awaitWriteFinish?: {pollIntervalMs?: number, stabilityThresholdMs?: number},
+   *   backend?: string, pollCompareContents?: boolean,
+   *   atomicWriteNormalization?: boolean}} [options]
    */
   constructor(options = {}) {
     const capacity = Number(options.capacity);
@@ -128,6 +169,8 @@ class JsWatcher {
     const debounce = Number(options.debounceMs);
     this.debounceMs = Number.isFinite(debounce) && debounce > 0 ? Math.floor(debounce) : 0;
     this.matcher = new Matcher({ include: options.include, exclude: options.exclude });
+    /** @type {{pollIntervalMs: number, stabilityThresholdMs: number}|null} */
+    this.awaitWriteFinish = normaliseAwaitWriteFinish(options.awaitWriteFinish);
 
     /** @type {Map<string, {recursive: boolean}>} registered roots */
     this._roots = new Map();
@@ -164,6 +207,13 @@ class JsWatcher {
      * @type {NodeJS.Timeout|null}
      */
     this._sweep = null;
+    /**
+     * Paths held for {@link JsWatcher#awaitWriteFinish}, `null` until first used.
+     * @type {Map<string, {last: {size: number, mtimeMs: number}|null, stableSince: number, nextPoll: number}>}
+     */
+    this._stabilizing = new Map();
+    /** The single timer servicing every path in {@link JsWatcher#_stabilizing}. */
+    this._stabilizeTimer = null;
     /** @type {Array<Error>} */
     this._errors = [];
     /** @type {Map<string, number>} consecutive failed watch attempts, keyed by directory */
@@ -226,7 +276,14 @@ class JsWatcher {
       clearTimeout(this._sweep);
       this._sweep = null;
     }
+    if (this._stabilizeTimer) {
+      clearTimeout(this._stabilizeTimer);
+      this._stabilizeTimer = null;
+    }
     this._pending.clear();
+    // Nothing owed here is ever delivered late: a stopped watcher has no consumer to tell, same as
+    // the debounce window above.
+    this._stabilizing.clear();
     // Replaced rather than truncated so a burst-sized queue is not retained across a restart.
     this._queue = [];
     this._head = 0;
@@ -282,6 +339,71 @@ class JsWatcher {
   /** @returns {string} */
   backend() {
     return 'polling';
+  }
+
+  /**
+   * Crawl `target`'s current contents into a snapshot envelope, without registering a watch on it.
+   *
+   * Built on {@link JsWatcher#_walk}, so it agrees with what `watch()` itself would see: whatever
+   * the include/exclude filter excludes, or a symlinked directory `_walk` does not descend into,
+   * is likewise absent here. `async` only for interface parity with the native engine's
+   * pool-thread task — the crawl itself is synchronous, exactly like `watch()`'s own initial walk.
+   *
+   * `_walk` also records every directory it visits into `_knownDirs`, which is otherwise this
+   * engine's bookkeeping for telling a live watch's freshly-created directory from one it already
+   * knew about. A snapshot of a path this instance never ends up watching leaves harmless,
+   * unreferenced entries there; only a directory later deleted and recreated under a watch that
+   * was never told about the earlier snapshot could have its `created` event suppressed by them —
+   * a narrow enough race that forking `_walk` to skip the side effect was not worth the
+   * duplication.
+   * @param {string} target
+   * @returns {Promise<{algorithm: string, version: number, entries: Array<{path: string,
+   *   isDirectory: boolean, size: number, modifiedNs: bigint|null}>}>}
+   */
+  async snapshot(target) {
+    if (typeof target !== 'string' || target.length === 0) {
+      throw new TypeError('snapshot(path) requires a non-empty string path');
+    }
+    const abs = path.resolve(target);
+    try {
+      fs.statSync(abs);
+    } catch (err) {
+      const error = new Error(`cannot snapshot ${abs}: ${err.message}`);
+      error.code = err.code || 'ENOENT';
+      throw error;
+    }
+    const entries = [];
+    // `_walk` visits the root itself first; `abs` is excluded below to match the native engine's
+    // `Watcher::snapshot`, which never reports the crawled path as one of its own entries.
+    this._walk(abs, true, (entryPath, isDirectory) => {
+      if (entryPath === abs) return;
+      let stat;
+      try {
+        stat = fs.statSync(entryPath);
+      } catch {
+        return; // raced with a delete between the walk and this stat
+      }
+      entries.push({
+        path: entryPath,
+        isDirectory,
+        size: isDirectory ? 0 : stat.size,
+        modifiedNs: Number.isFinite(stat.mtimeMs) ? BigInt(Math.round(stat.mtimeMs * 1e6)) : null,
+      });
+    });
+    return { algorithm: SNAPSHOT_ALGORITHM, version: SNAPSHOT_ENVELOPE_VERSION, entries };
+  }
+
+  /**
+   * `watch(target, recursive)` followed by `snapshot(target)`, with the watch registered before
+   * the crawl begins so nothing created during the crawl is lost — mirroring the native engine's
+   * `watchWithSnapshot` and `retrigger_system::Watcher::watch_with_snapshot`.
+   * @param {string} target
+   * @param {boolean} [recursive=true]
+   * @returns {Promise<{algorithm: string, version: number, entries: Array}>}
+   */
+  async watchWithSnapshot(target, recursive = true) {
+    this.watch(target, recursive);
+    return this.snapshot(target);
   }
 
   // -------------------------------------------------------------- extensions
@@ -562,8 +684,95 @@ class JsWatcher {
   _emitIfMatched(target, kind, isDirectory, size) {
     if (!isDirectory && !this.matcher.matches(target)) return;
     if (isDirectory && !this.matcher.allowsDirectory(target)) return;
+    if (this.awaitWriteFinish) {
+      if (kind === 'deleted') {
+        // Never held behind a write that will not finish under a name that no longer exists.
+        this._stabilizing.delete(target);
+      } else if (!isDirectory && COALESCABLE.has(kind)) {
+        this._trackStabilization(target);
+        return;
+      }
+    }
     if (this.debounceMs > 0) this._enqueueDebounced(target, kind, isDirectory, size);
     else this._enqueue(this._makeEvent(target, kind, isDirectory, size));
+  }
+
+  /**
+   * Begin (or continue) holding `target` for {@link JsWatcher#awaitWriteFinish} instead of
+   * delivering its event immediately.
+   *
+   * Mirrors `retrigger-system::stabilize`: re-`stat` on `pollIntervalMs` until size and
+   * modification time have held for `stabilityThresholdMs`, then deliver exactly one `modified`.
+   */
+  _trackStabilization(target) {
+    if (this._stabilizing.has(target)) return;
+    if (this._stabilizing.size >= STABILIZE_LIMIT) {
+      // The work list is full: fall back to delivering immediately rather than losing the event
+      // or growing without bound.
+      this._enqueue(this._makeEvent(target, 'modified', false, this._sizeOf(target)));
+      return;
+    }
+    const now = Date.now();
+    this._stabilizing.set(target, {
+      last: null,
+      stableSince: now,
+      nextPoll: now + this.awaitWriteFinish.pollIntervalMs,
+    });
+    this._scheduleStabilizeSweep();
+  }
+
+  /** @returns {number} */
+  _sizeOf(target) {
+    try {
+      return fs.statSync(target).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Arm the single stabilization timer for the earliest poll due, if not already armed. */
+  _scheduleStabilizeSweep() {
+    if (this._stabilizeTimer || this._stabilizing.size === 0) return;
+    let earliest = Infinity;
+    for (const entry of this._stabilizing.values()) earliest = Math.min(earliest, entry.nextPoll);
+    const delay = Math.max(0, earliest - Date.now());
+    this._stabilizeTimer = setTimeout(() => {
+      this._stabilizeTimer = null;
+      this._stabilizeSweep();
+    }, delay);
+    if (typeof this._stabilizeTimer.unref === 'function') this._stabilizeTimer.unref();
+  }
+
+  /** Re-`stat` every path whose poll is due, deliver settled ones, and re-arm the rest. */
+  _stabilizeSweep() {
+    const now = Date.now();
+    for (const [target, entry] of this._stabilizing) {
+      if (entry.nextPoll > now) continue;
+      let stat;
+      try {
+        stat = fs.statSync(target);
+      } catch {
+        // Gone without an explicit removal event ever reaching this module -- a race this method
+        // cannot close. Nothing to deliver, and holding it further would wait forever.
+        this._stabilizing.delete(target);
+        continue;
+      }
+      const snapshot = { size: stat.size, mtimeMs: stat.mtimeMs };
+      const unchanged =
+        entry.last && entry.last.size === snapshot.size && entry.last.mtimeMs === snapshot.mtimeMs;
+      if (unchanged) {
+        if (now - entry.stableSince >= this.awaitWriteFinish.stabilityThresholdMs) {
+          this._stabilizing.delete(target);
+          this._enqueue(this._makeEvent(target, 'modified', false, snapshot.size));
+          continue;
+        }
+      } else {
+        entry.last = snapshot;
+        entry.stableSince = now;
+      }
+      entry.nextPoll = now + this.awaitWriteFinish.pollIntervalMs;
+    }
+    this._scheduleStabilizeSweep();
   }
 
   /**
@@ -709,6 +918,26 @@ class JsWatcher {
     this._errors.push(err instanceof Error ? err : new Error(String(err)));
     if (this._errors.length > 64) this._errors.shift();
   }
+}
+
+/**
+ * @param {unknown} value
+ * @returns {{pollIntervalMs: number, stabilityThresholdMs: number}|null}
+ */
+function normaliseAwaitWriteFinish(value) {
+  if (!value || typeof value !== 'object') return null;
+  const pollIntervalMs = Number(value.pollIntervalMs);
+  const stabilityThresholdMs = Number(value.stabilityThresholdMs);
+  return {
+    pollIntervalMs:
+      Number.isFinite(pollIntervalMs) && pollIntervalMs > 0
+        ? Math.floor(pollIntervalMs)
+        : DEFAULT_STABILIZE_POLL_MS,
+    stabilityThresholdMs:
+      Number.isFinite(stabilityThresholdMs) && stabilityThresholdMs > 0
+        ? Math.floor(stabilityThresholdMs)
+        : DEFAULT_STABILIZE_THRESHOLD_MS,
+  };
 }
 
 module.exports = { COALESCABLE, EVENT_KINDS, JsWatcher, RECURSIVE_WATCH };

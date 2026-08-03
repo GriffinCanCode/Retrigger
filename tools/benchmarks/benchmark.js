@@ -2,170 +2,150 @@
 'use strict';
 
 /**
- * Retrigger benchmarks.
+ * Retrigger reproducible performance laboratory.
  *
- * Replaces six earlier scripts that were written against `RetriggerWrapper`
- * and a `/tmp` mmap IPC bridge, neither of which exists any more.
+ * Suites:
+ *   hash       — content-hash throughput
+ *   watch      — raw per-event latency (honest vs chokidar)
+ *   rebuild    — FLAGSHIP: Vite/webpack rebuild counts + wall time
+ *   scenarios  — crawl, storm, CPU/RSS, large tree, poll, snapshot, adapter
  *
- * Every number printed is measured in this process, now. Comparators
- * (chokidar, watchpack, @parcel/watcher) are optional: a missing one is
- * reported as "not installed" rather than silently skipped or estimated.
+ *   node tools/benchmarks/benchmark.js              # all suites
+ *   node tools/benchmarks/benchmark.js rebuild
+ *   node tools/benchmarks/benchmark.js hash watch
+ *   node tools/benchmarks/benchmark.js --json results/run.json
+ *   node tools/benchmarks/benchmark.js --gate        # exit 1 if a same-run gate fails
  *
- *   node tools/benchmarks/benchmark.js            # both suites
- *   node tools/benchmarks/benchmark.js hash
- *   node tools/benchmarks/benchmark.js watch
+ * Comparators (chokidar, watchpack, @parcel/watcher, vite, webpack) are optional:
+ * a missing one prints "not installed" and is never estimated.
  */
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
-const CORE = path.resolve(__dirname, '../../src/bindings/nodejs');
-const { benchmarkHash, createRetrigger, getEngineInfo } = require(CORE);
+const { captureEnv, ensureCore } = require('./lib/env');
+const { SCHEMA_ID, SCHEMA_VERSION, validateResults, writeResults } = require('./lib/io');
+const { renderSummary } = require('./lib/report');
+const { runHashSuite } = require('./suites/hash');
+const { runWatchSuite } = require('./suites/watch');
+const { runRebuildSuite } = require('./suites/rebuild');
+const { runScenariosSuite } = require('./suites/scenarios');
 
-const FILE_COUNT = 200;
-const SAMPLES = 40;
+const SUITES = {
+  hash: runHashSuite,
+  watch: runWatchSuite,
+  rebuild: runRebuildSuite,
+  scenarios: runScenariosSuite,
+};
 
-async function hashSuite() {
-  const info = getEngineInfo();
-  console.log(`\nhash throughput  engine=${info.engine}  algorithm=${info.hashAlgorithm}`);
-  console.log('  size      throughput      ns/byte');
-  for (const size of [1024, 64 * 1024, 1024 * 1024, 16 * 1024 * 1024]) {
-    const iterations = Math.max(4, Math.floor(64 * 1024 * 1024 / size));
-    const result = await benchmarkHash(size, iterations);
-    console.log(
-      `  ${pad(bytes(size), 8)}  ${pad(`${result.throughputMbps.toFixed(1)} MB/s`, 14)}  ${result.nsPerByte.toFixed(3)}`
-    );
-  }
-}
-
-async function watchSuite() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'retrigger-bench-'));
-  try {
-    for (let i = 0; i < FILE_COUNT; i += 1) {
-      fs.writeFileSync(path.join(dir, `file-${i}.js`), `export const v = ${i};\n`);
-    }
-
-    console.log(`\nwatch latency  ${FILE_COUNT} files, ${SAMPLES} samples, ${dir}`);
-    const results = [];
-    results.push(await measure('retrigger', dir, retriggerHarness));
-    results.push(await measure('chokidar', dir, chokidarHarness));
-    results.push(await measure('watchpack', dir, watchpackHarness));
-    results.push(await measure('parcel', dir, parcelHarness));
-
-    console.log('  watcher      p50        p95        max        events');
-    for (const r of results) {
-      if (r.error) {
-        console.log(`  ${pad(r.name, 11)}  ${r.error}`);
-        continue;
-      }
-      console.log(
-        `  ${pad(r.name, 11)}  ${pad(ms(r.p50), 9)}  ${pad(ms(r.p95), 9)}  ${pad(ms(r.max), 9)}  ${r.count}/${SAMPLES}`
-      );
-    }
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-/**
- * Times the wall gap between writing a file and the watcher reporting it.
- * @param {string} name
- * @param {string} dir
- * @param {(dir: string, onChange: (p: string) => void) => Promise<{close: () => unknown}>} harness
- */
-async function measure(name, dir, harness) {
-  let handle;
-  try {
-    let resolveHit = null;
-    handle = await harness(dir, (changed) => {
-      if (resolveHit) resolveHit(changed);
-    });
-    await sleep(300); // let the watcher finish its initial scan
-
-    const samples = [];
-    for (let i = 0; i < SAMPLES; i += 1) {
-      const target = path.join(dir, `file-${i % FILE_COUNT}.js`);
-      const hit = new Promise((resolve) => {
-        resolveHit = resolve;
-      });
-      const started = process.hrtime.bigint();
-      fs.writeFileSync(target, `export const v = ${Date.now()};\n`);
-      const winner = await Promise.race([hit, sleep(2000).then(() => null)]);
-      resolveHit = null;
-      if (winner === null) continue;
-      samples.push(Number(process.hrtime.bigint() - started) / 1e6);
-      await sleep(30);
-    }
-    if (samples.length === 0) return { name, error: 'no events observed' };
-    samples.sort((a, b) => a - b);
-    return {
-      name,
-      p50: samples[Math.floor(samples.length * 0.5)],
-      p95: samples[Math.floor(samples.length * 0.95)] ?? samples[samples.length - 1],
-      max: samples[samples.length - 1],
-      count: samples.length,
-    };
-  } catch (err) {
-    const missing = err.code === 'MODULE_NOT_FOUND' || err.code === 'ERR_MODULE_NOT_FOUND';
-    return { name, error: missing ? 'not installed' : err.message };
-  } finally {
-    try {
-      if (handle) await handle.close();
-    } catch {
-      /* nothing to clean up */
+function parseArgs(argv) {
+  const args = {
+    suites: [],
+    json: null,
+    gate: false,
+    quiet: false,
+    summary: true,
+  };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '--json') args.json = argv[++i];
+    else if (a.startsWith('--json=')) args.json = a.slice('--json='.length);
+    else if (a === '--gate') args.gate = true;
+    else if (a === '--quiet') args.quiet = true;
+    else if (a === '--no-summary') args.summary = false;
+    else if (a === '--help' || a === '-h') args.help = true;
+    else if (a.startsWith('-')) {
+      console.error(`unknown flag: ${a}`);
+      process.exit(2);
+    } else if (SUITES[a]) args.suites.push(a);
+    else {
+      console.error(`unknown suite: ${a}`);
+      console.error(`known: ${Object.keys(SUITES).join(', ')}`);
+      process.exit(2);
     }
   }
+  if (!args.suites.length) args.suites = Object.keys(SUITES);
+  return args;
 }
 
-async function retriggerHarness(dir, onChange) {
-  const watcher = createRetrigger({ paths: dir, pollIntervalMs: 1 });
-  watcher.on('change', onChange);
-  watcher.on('add', onChange);
-  watcher.start();
-  return { close: () => watcher.close() };
-}
+function usage() {
+  console.log(`Usage: node benchmark.js [suites...] [--json path] [--gate] [--quiet]
 
-async function chokidarHarness(dir, onChange) {
-  const { watch } = await import('chokidar'); // v5 is ESM-only
-  const watcher = watch(dir, { ignoreInitial: true });
-  watcher.on('change', onChange);
-  watcher.on('add', onChange);
-  await Promise.race([new Promise((r) => watcher.once('ready', r)), sleep(2000)]);
-  return { close: () => watcher.close() };
-}
+Suites: ${Object.keys(SUITES).join(', ')}
+Default: all suites.
 
-async function watchpackHarness(dir, onChange) {
-  const Watchpack = require('watchpack');
-  const wp = new Watchpack({ aggregateTimeout: 0, poll: false });
-  wp.on('change', onChange);
-  wp.watch({ files: [], directories: [dir], missing: [], startTime: Date.now() });
-  return { close: () => wp.close() };
+  --json path   write results.v1 JSON (also validates against the schema)
+  --gate        exit 1 if any same-run gate fails
+  --quiet       suppress per-suite console tables (JSON still written)
+  --no-summary  skip the final human summary`);
 }
-
-async function parcelHarness(dir, onChange) {
-  const parcel = require('@parcel/watcher');
-  const sub = await parcel.subscribe(dir, (err, events) => {
-    if (err) return;
-    for (const event of events) onChange(event.path);
-  });
-  return { close: () => sub.unsubscribe() };
-}
-
-const sleep = (msValue) => new Promise((resolve) => setTimeout(resolve, msValue));
-const pad = (value, width) => String(value).padEnd(width);
-const ms = (value) => `${value.toFixed(2)}ms`;
-const bytes = (value) =>
-  value >= 1024 * 1024 ? `${value / 1024 / 1024}MB` : `${value / 1024}KB`;
 
 async function main() {
-  const which = process.argv[2];
-  const info = getEngineInfo();
-  console.log(`retrigger benchmark  ${info.engine} engine on ${info.platform}`);
-  if (info.engine !== 'native') console.log(`  native unavailable: ${info.reason}`);
-  if (!which || which === 'hash') await hashSuite();
-  if (!which || which === 'watch') await watchSuite();
-  console.log('');
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help) {
+    usage();
+    return;
+  }
+
+  ensureCore();
+  const env = captureEnv();
+  console.log(
+    `retrigger benchmark  ${env.engine} engine on ${env.platform}-${env.arch}  hash=${env.hashAlgorithm}`
+  );
+  if (env.engine !== 'native') console.log(`  native unavailable: ${env.engineReason}`);
+  console.log(`  ${env.cpuCount}× ${env.cpuModel || '?'}  node ${env.node}`);
+
+  const suites = [];
+  const gates = [];
+  for (const name of args.suites) {
+    const result = await SUITES[name]({ quiet: args.quiet });
+    suites.push(result);
+    if (result.gates) gates.push(...result.gates);
+  }
+
+  const doc = {
+    schema: SCHEMA_ID,
+    schemaVersion: SCHEMA_VERSION,
+    env,
+    config: {
+      suites: args.suites,
+      warmup: true,
+      note: 'Gates compare Retrigger to a stock watcher measured in THIS run only.',
+    },
+    suites,
+    gates,
+  };
+
+  const check = validateResults(doc);
+  if (!check.ok) {
+    console.error('\nresults failed schema validation:');
+    for (const e of check.errors) console.error(`  - ${e}`);
+    process.exit(1);
+  }
+
+  const jsonPath =
+    args.json ||
+    path.join(__dirname, 'results', `run-${env.timestamp.replace(/[:.]/g, '-')}.json`);
+  writeResults(doc, jsonPath);
+  // Convenience pointer for summary.js defaults.
+  try {
+    fs.copyFileSync(jsonPath, path.join(__dirname, 'results', 'latest.json'));
+  } catch {
+    /* results dir may be read-only in some sandboxes */
+  }
+  console.log(`\nwrote ${jsonPath}`);
+
+  if (args.summary && !args.quiet) {
+    console.log('');
+    renderSummary(doc);
+  } else if (gates.length) {
+    console.log('\n── gates ──');
+    for (const g of gates) console.log(`  ${g.pass ? 'PASS' : 'FAIL'}  ${g.id}: ${g.detail}`);
+  }
+
+  if (args.gate && gates.some((g) => !g.pass)) {
+    process.exit(1);
+  }
 }
 
 main().then(

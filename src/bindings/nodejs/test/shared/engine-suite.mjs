@@ -34,6 +34,8 @@ export const STATS_KEYS = [
   'isRunning',
   'content',
   'metrics',
+  'asyncHashesInFlight',
+  'asyncHashesQueued',
 ];
 
 /**

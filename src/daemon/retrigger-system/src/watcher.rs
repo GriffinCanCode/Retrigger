@@ -7,18 +7,21 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher, WatcherKind};
+use notify::{
+    PollWatcher, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher, WatcherKind,
+};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::broadcast;
 use tracing::{debug, trace, warn};
 
 use crate::bounded::BoundedMap;
-use crate::config::{Backend, WatcherConfig, WatcherStats};
+use crate::config::{Backend, BackendMode, WatcherConfig, WatcherStats};
 use crate::error::WatchError;
 use crate::event::{now_ns, EventKind, FileEvent};
 use crate::flush::{self, Flusher};
 use crate::queue::{EventQueue, Push};
 use crate::scan::{self, Reconciler};
+use crate::stabilize::{self, Stabilizer};
 
 /// Hard ceiling on paths tracked by the delivery ledger.
 ///
@@ -38,18 +41,50 @@ const SYNTH_DEDUPE_WINDOW: Duration = Duration::from_secs(3);
 /// Upper bound on the preallocated broadcast ring, independent of queue capacity.
 const BROADCAST_CAPACITY_LIMIT: usize = 1024;
 
-/// Which backend `notify` will select here. Fixed at compile time, so it is knowable before a
-/// watcher starts and cheap enough to ask repeatedly.
-fn detect_backend() -> Backend {
+/// Which backend a given [`BackendMode`] resolves to. Fixed given `mode`, so it is knowable
+/// before a watcher starts and cheap enough to ask repeatedly.
+fn effective_backend(mode: &BackendMode) -> Backend {
+    if matches!(mode, BackendMode::Poll { .. }) {
+        return Backend::Polling;
+    }
     match <RecommendedWatcher as NotifyWatcher>::kind() {
         WatcherKind::Inotify => Backend::Inotify,
         WatcherKind::Fsevent => Backend::FsEvents,
         WatcherKind::Kqueue => Backend::KQueue,
         WatcherKind::ReadDirectoryChangesWatcher => Backend::ReadDirectoryChangesW,
-        // `PollWatcher` is the portable fallback; `NullWatcher` never occurs for
-        // `RecommendedWatcher` on any platform this crate builds for, and re-scanning is the
-        // only honest description of a watcher that reports nothing.
+        // `PollWatcher` is `notify`'s own portable fallback, selected as `RecommendedWatcher` only
+        // on platforms without a native backend; `NullWatcher` never occurs for it on any platform
+        // this crate builds for. Re-scanning is the only honest description of either.
         _ => Backend::Polling,
+    }
+}
+
+/// The concrete watcher attached to the OS: either the platform-native backend `notify`
+/// recommends, or its portable polling fallback, chosen explicitly rather than by platform.
+///
+/// Kept as an enum rather than a `Box<dyn notify::Watcher>` so that dropping it — which is how
+/// [`Watcher::shutdown`] detaches — needs no vtable and stays exactly as cheap as it was before
+/// this type existed.
+enum ActiveBackend {
+    /// The OS-native backend: `inotify`, `FSEvents`, `ReadDirectoryChangesW`, or `kqueue`.
+    Native(RecommendedWatcher),
+    /// `notify`'s portable, interval-driven fallback. See [`BackendMode::Poll`].
+    Poll(PollWatcher),
+}
+
+impl ActiveBackend {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        match self {
+            Self::Native(watcher) => watcher.watch(path, mode),
+            Self::Poll(watcher) => watcher.watch(path, mode),
+        }
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        match self {
+            Self::Native(watcher) => watcher.unwatch(path),
+            Self::Poll(watcher) => watcher.unwatch(path),
+        }
     }
 }
 
@@ -180,6 +215,24 @@ fn born_under_observation(created_ns: Option<u64>, started_ns: u64, claimed: Eve
     )
 }
 
+/// Fold a `RenamedTo` for a path the consumer has already seen arrive into
+/// [`Modified`](EventKind::Modified), for [`WatcherConfig::atomic_write_normalization`].
+///
+/// An editor or build tool that saves atomically writes a sibling temp file and `rename`s it over
+/// the target, which every backend reports as `RenamedTo` for a path that already existed. From a
+/// consumer's point of view that is a content change, not an arrival — the name never stopped
+/// meaning the same file — and one that only reacts to `Modified` would otherwise miss it. A
+/// `RenamedTo` for a path that has never been announced is a genuine arrival regardless of
+/// `announced`, and every other kind (crucially `RenamedFrom`, which claims nothing arrived) is
+/// left untouched.
+fn normalize_atomic_write(kind: EventKind, announced: bool) -> EventKind {
+    if announced && kind == EventKind::RenamedTo {
+        EventKind::Modified
+    } else {
+        kind
+    }
+}
+
 /// State shared with the backend thread.
 ///
 /// Deliberately does *not* contain the backend handle, so the event handler closure can hold an
@@ -215,6 +268,8 @@ pub(crate) struct Core {
     /// Locked only from inside [`Core::suppressed`], which already holds `coalesce`; the lock order
     /// is therefore always `coalesce` then `flusher`, and nothing takes them the other way round.
     flusher: Flusher,
+    /// Paths held for [`WatcherConfig::await_write_finish`]. See [`crate::stabilize`].
+    stabilizer: Stabilizer,
     events_synthesized: AtomicU64,
     /// Test seam: when set, [`Watcher::spawn_reconcile_thread`] reports a spawn failure without
     /// touching the OS, so the degraded-start path can be proven deterministically. There is no
@@ -244,6 +299,11 @@ impl Core {
     /// The trailing-correction work list, for [`crate::flush`].
     pub(crate) fn flusher(&self) -> &Flusher {
         &self.flusher
+    }
+
+    /// The write-stabilization work list, for [`crate::stabilize`].
+    pub(crate) fn stabilizer(&self) -> &Stabilizer {
+        &self.stabilizer
     }
 
     /// Handle one item from the backend.
@@ -319,6 +379,33 @@ impl Core {
         } else {
             kind
         };
+        // Gated on the flag before touching the ledger at all: the lookup is real lock-and-hash
+        // work, and paying it on every event when nobody asked for this behaviour would be a
+        // performance regression `atomic_write_normalization: false` is supposed to guarantee
+        // does not happen.
+        let kind = if self.config.atomic_write_normalization {
+            normalize_atomic_write(kind, self.announced(&path))
+        } else {
+            kind
+        };
+
+        // A coalescable, non-directory event configured for write stabilization is held rather
+        // than delivered: [`crate::stabilize`] re-`stat`s it until it settles and then emits
+        // exactly one `Modified` of its own. A removal or rename is never coalescable, so it can
+        // never be diverted here — it always falls through to the ordinary path below — and it
+        // cancels any hold already in progress for the same path, so a delete is never left
+        // waiting behind a write that will not finish under a name that no longer exists.
+        if let Some(config) = self.config.await_write_finish {
+            if !kind.is_coalescable() {
+                self.stabilizer.cancel(&path);
+            } else if !probe.is_directory
+                && probe.exists
+                && self.stabilizer.track(&path, config.poll_interval)
+            {
+                trace!(path = %path.display(), ?kind, "event held for write stabilization");
+                return;
+            }
+        }
 
         // A directory that has just appeared inside a recursive watch is not yet watched on every
         // backend, so anything already inside it may never be reported. Queue it for
@@ -550,6 +637,35 @@ impl Core {
         ));
     }
 
+    /// Deliver the single [`Modified`](EventKind::Modified) a stabilized write earns, once
+    /// [`crate::stabilize`] has judged it settled.
+    ///
+    /// Parallel to [`emit_trailing`](Self::emit_trailing): always a `Modified`, because settling
+    /// is a judgement about *timing*, not about what kind of event started the hold. Deliberately
+    /// bypasses [`suppressed`](Self::suppressed) rather than re-checking it: the whole point of
+    /// [`WatcherConfig::await_write_finish`] is a delivery this crate can promise happens exactly
+    /// once, and a debounce window closing at the wrong moment must not be able to swallow it.
+    pub(crate) fn emit_stabilized(&self, path: &Path) {
+        if !self.is_running() || !self.in_scope(path) || !self.config.filter.matches(path) {
+            return;
+        }
+        let probe = self.probe(path, EventKind::Modified, None);
+        if !probe.exists {
+            // Vanished between the last stable poll and now, without an event this module saw —
+            // see [`crate::stabilize::run`]. Reporting a modification for something absent is
+            // exactly what stabilization exists to avoid, so there is nothing to deliver.
+            trace!(path = %path.display(), "path gone before stabilizing; nothing to report");
+            return;
+        }
+        trace!(path = %path.display(), "write stabilized");
+        self.deliver(FileEvent::new(
+            path.to_path_buf(),
+            EventKind::Modified,
+            probe.size,
+            probe.is_directory,
+        ));
+    }
+
     /// Inspect a path at event time.
     ///
     /// The backend's directory hint wins when it has one, because it was accurate when the event
@@ -611,7 +727,11 @@ impl Core {
         self.suppressed(path, kind, exists, Origin::Backend)
     }
 
-    fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+    /// `stat` (or `lstat`, per [`WatcherConfig::follow_symlinks`]) a path.
+    ///
+    /// `pub(crate)` so [`crate::stabilize`] can judge stability by the same rule `probe` inspects
+    /// events by, rather than a second, potentially disagreeing, notion of what a path "is".
+    pub(crate) fn metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
         if self.config.follow_symlinks {
             std::fs::metadata(path)
         } else {
@@ -667,13 +787,17 @@ pub struct Watcher {
     core: Arc<Core>,
     /// The backend handle. Dropping it joins the backend thread, which is how `stop` joins.
     /// Never locked from the event handler, so the handler can never deadlock against `stop`.
-    backend: Mutex<Option<RecommendedWatcher>>,
+    backend: Mutex<Option<ActiveBackend>>,
     /// The reconciler thread (see [`crate::scan`]). Joined by `stop` before the backend is
     /// dropped, so no scan can outlive the watcher.
     reconciler: Mutex<Option<JoinHandle<()>>>,
     /// The trailing-correction thread (see [`crate::flush`]). Joined by `stop` on the same terms
     /// and for the same reason as the reconciler.
     flusher: Mutex<Option<JoinHandle<()>>>,
+    /// The write-stabilization thread (see [`crate::stabilize`]). Joined by `stop` on the same
+    /// terms as the flusher; `None` whenever [`WatcherConfig::await_write_finish`] is unset, so a
+    /// watcher that never asked for the feature never pays for the thread.
+    stabilizer: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Watcher {
@@ -689,6 +813,7 @@ impl Watcher {
         // poll queue: a 100k-capacity queue should not cost 100k preallocated slots per
         // subscriber generation. Subscribers may therefore lag before the queue overflows.
         let (events, _) = broadcast::channel(capacity.min(BROADCAST_CAPACITY_LIMIT));
+        let derives_kinds = effective_backend(&config.backend) == Backend::FsEvents;
         Ok(Self {
             core: Arc::new(Core {
                 queue: EventQueue::new(capacity),
@@ -696,11 +821,12 @@ impl Watcher {
                 config,
                 coalesce: Mutex::new(BoundedMap::new(COALESCE_MAP_LIMIT)),
                 started_ns: AtomicU64::new(now_ns()),
-                derives_kinds: detect_backend() == Backend::FsEvents,
+                derives_kinds,
                 scope: RwLock::new(Vec::new()),
                 running: AtomicBool::new(false),
                 reconciler: Reconciler::default(),
                 flusher: Flusher::default(),
+                stabilizer: Stabilizer::default(),
                 events_synthesized: AtomicU64::new(0),
                 #[cfg(test)]
                 fail_reconciler_spawn: AtomicBool::new(false),
@@ -708,6 +834,7 @@ impl Watcher {
             backend: Mutex::new(None),
             reconciler: Mutex::new(None),
             flusher: Mutex::new(None),
+            stabilizer: Mutex::new(None),
         })
     }
 
@@ -797,8 +924,24 @@ impl Watcher {
         let notify_config = notify::Config::default()
             .with_follow_symlinks(self.core.config.follow_symlinks)
             .with_poll_interval(Duration::from_secs(1));
-        let mut watcher = RecommendedWatcher::new(move |res| core.ingest(res), notify_config)
-            .map_err(WatchError::Backend)?;
+        let mut active = match self.core.config.backend {
+            BackendMode::Auto => {
+                let watcher = RecommendedWatcher::new(move |res| core.ingest(res), notify_config)
+                    .map_err(WatchError::Backend)?;
+                ActiveBackend::Native(watcher)
+            }
+            BackendMode::Poll {
+                interval,
+                compare_contents,
+            } => {
+                let poll_config = notify_config
+                    .with_poll_interval(interval)
+                    .with_compare_contents(compare_contents);
+                let watcher = PollWatcher::new(move |res| core.ingest(res), poll_config)
+                    .map_err(WatchError::Backend)?;
+                ActiveBackend::Poll(watcher)
+            }
+        };
 
         for entry in self.core.scope.read().iter() {
             // Inspected before the backend sees it, for the same reason `watch` does it: the
@@ -809,7 +952,7 @@ impl Watcher {
             self.core
                 .metadata(&entry.path)
                 .map_err(|err| WatchError::from_io(&entry.path, err))?;
-            watcher
+            active
                 .watch(&entry.path, mode(entry.recursive))
                 .map_err(|e| WatchError::from_notify(&entry.path, e))?;
         }
@@ -819,10 +962,11 @@ impl Watcher {
         // which keeps "events arrive after start() returns" true rather than approximately true.
         self.core.running.store(true, Ordering::Release);
         self.core.queue.set_active(true);
-        *backend = Some(watcher);
+        *backend = Some(active);
 
         self.launch_reconciler();
         self.launch_flusher();
+        self.launch_stabilizer();
         Ok(())
     }
 
@@ -845,6 +989,32 @@ impl Watcher {
             Err(err) => warn!(
                 error = %err,
                 "could not start the trailing-correction thread; coalescing stays leading-edge only"
+            ),
+        }
+    }
+
+    /// Start the write-stabilization thread, or carry on without it. A no-op — no thread, no
+    /// cost — when [`WatcherConfig::await_write_finish`] is unset.
+    ///
+    /// A failed spawn here degrades the same way a failed flusher spawn does: nothing tracked by
+    /// [`crate::stabilize`] is ever the *only* report of a path, since a coalescable event that
+    /// cannot be held is delivered immediately instead (see [`Core::emit`]), so losing this thread
+    /// costs the "wait until it stops changing" guarantee and nothing else.
+    fn launch_stabilizer(&self) {
+        if self.core.config.await_write_finish.is_none() {
+            return;
+        }
+        self.core.stabilizer.resume();
+        let core = Arc::clone(&self.core);
+        match std::thread::Builder::new()
+            .name("retrigger-stabilize".to_owned())
+            .spawn(move || stabilize::run(&core))
+        {
+            Ok(handle) => *self.stabilizer.lock() = Some(handle),
+            Err(err) => warn!(
+                error = %err,
+                "could not start the write-stabilization thread; await_write_finish is inactive \
+                 for this run"
             ),
         }
     }
@@ -927,6 +1097,12 @@ impl Watcher {
             let _ = handle.join();
         }
 
+        // Same terms again; `None` here just means the thread was never spawned.
+        self.core.stabilizer.stop();
+        if let Some(handle) = self.stabilizer.lock().take() {
+            let _ = handle.join();
+        }
+
         let handle = self.backend.lock().take();
         // Dropping the backend joins its thread. Done outside the handler's lock set, and the
         // handler never touches `self.backend`, so this cannot deadlock.
@@ -983,16 +1159,23 @@ impl Watcher {
 
     /// Which kernel facility this build will use.
     ///
-    /// Known before [`start`](Self::start), because the backend is selected at compile time.
+    /// Known before [`start`](Self::start): [`BackendMode::Auto`] resolves at compile time, and
+    /// [`BackendMode::Poll`] is [`Backend::Polling`] by construction.
     #[must_use]
     pub fn backend(&self) -> Backend {
-        detect_backend()
+        effective_backend(&self.core.config.backend)
     }
 
     /// Whether the backend is attached.
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.core.is_running()
+    }
+
+    /// The shared state, for other modules within this crate (see [`crate::snapshot`]) that need
+    /// it without duplicating what [`Watcher`] already exposes.
+    pub(crate) fn core(&self) -> &Core {
+        &self.core
     }
 
     /// The shared state, for tests that exercise it without a live backend.
@@ -1362,6 +1545,20 @@ mod tests {
         assert_eq!(backend, Backend::ReadDirectoryChangesW);
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         let _ = backend;
+    }
+
+    #[test]
+    fn poll_backend_reports_polling_before_start_on_every_os() {
+        let config = WatcherConfig {
+            backend: BackendMode::Poll {
+                interval: Duration::from_millis(200),
+                compare_contents: false,
+            },
+            ..Default::default()
+        };
+        let watcher = Watcher::new(config).expect("new");
+        assert!(!watcher.is_running());
+        assert_eq!(watcher.backend(), Backend::Polling);
     }
 
     #[test]
@@ -2219,6 +2416,35 @@ mod tests {
         assert!(EventKind::RenamedTo.is_arrival(), "so the ledger agrees");
     }
 
+    #[test]
+    fn atomic_write_normalization_folds_renamed_to_only_for_an_announced_path() {
+        for (kind, announced, expected) in [
+            (EventKind::RenamedTo, true, EventKind::Modified),
+            (EventKind::RenamedTo, false, EventKind::RenamedTo),
+            (EventKind::RenamedFrom, true, EventKind::RenamedFrom),
+            (EventKind::RenamedFrom, false, EventKind::RenamedFrom),
+            (EventKind::Modified, true, EventKind::Modified),
+            (EventKind::Created, true, EventKind::Created),
+            (EventKind::Deleted, true, EventKind::Deleted),
+        ] {
+            assert_eq!(
+                normalize_atomic_write(kind, announced),
+                expected,
+                "{kind:?} announced={announced}"
+            );
+        }
+    }
+
+    /// With the flag off (the default), `emit`'s output must be byte-identical to before this
+    /// feature existed: `normalize_atomic_write` itself is never even called, but the table above
+    /// already proves the function is a no-op for every kind except an announced `RenamedTo` — and
+    /// `atomic_write_normalization` defaults to `false`, so that call site is dead weight until a
+    /// caller opts in.
+    #[test]
+    fn atomic_write_normalization_defaults_to_off() {
+        assert!(!WatcherConfig::default().atomic_write_normalization);
+    }
+
     /// A file born after the watch attached stays born after the watch attached, so the birth clock
     /// alone would call every write it ever receives a creation. Whether the arrival has already
     /// been announced is what separates the one from the many.
@@ -2300,6 +2526,7 @@ mod tests {
             running: AtomicBool::new(true),
             reconciler: Reconciler::default(),
             flusher: Flusher::default(),
+            stabilizer: Stabilizer::default(),
             events_synthesized: AtomicU64::new(0),
             fail_reconciler_spawn: AtomicBool::new(false),
         }

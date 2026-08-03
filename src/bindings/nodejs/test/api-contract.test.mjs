@@ -99,6 +99,8 @@ describe('instance surface', () => {
     'add',
     'watch',
     'unwatch',
+    'snapshot',
+    'watchWithSnapshot',
     'start',
     'stop',
     'close',
@@ -117,13 +119,25 @@ describe('instance surface', () => {
   it('returns the documented shape from getEngineInfo()', () => {
     const info = core.getEngineInfo();
     expect(Object.keys(info).sort()).toEqual(
-      ['backend', 'engine', 'hashAlgorithm', 'nativeAttempts', 'platform', 'reason', 'simd'].sort()
+      [
+        'backend',
+        'engine',
+        'hashAlgorithm',
+        'nativeAttempts',
+        'platform',
+        'reason',
+        'simd',
+        'watchman',
+      ].sort()
     );
     expect(['native', 'javascript']).toContain(info.engine);
     expect(typeof info.backend).toBe('string');
     expect(typeof info.reason).toBe('string');
     expect(typeof info.hashAlgorithm).toBe('string');
     expect(Array.isArray(info.nativeAttempts)).toBe(true);
+    expect(typeof info.watchman.available).toBe('boolean');
+    expect([null, 'fb-watchman', 'cli']).toContain(info.watchman.kind);
+    expect(typeof info.watchman.reason).toBe('string');
   });
 
   it('chains the fluent methods', () => {
@@ -231,7 +245,10 @@ describe('package manifest', () => {
       'aarch64-unknown-linux-gnu': 'linux-arm64-gnu',
       'x86_64-unknown-linux-musl': 'linux-x64-musl',
       'aarch64-unknown-linux-musl': 'linux-arm64-musl',
+      'x86_64-unknown-freebsd': 'freebsd-x64',
       'armv7-unknown-linux-gnueabihf': 'linux-arm-gnueabihf',
+      'powerpc64le-unknown-linux-gnu': 'linux-ppc64-gnu',
+      's390x-unknown-linux-gnu': 'linux-s390x-gnu',
     };
 
     const built = pkg.napi.targets.map((triple) => {

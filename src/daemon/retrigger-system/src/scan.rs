@@ -55,7 +55,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use parking_lot::{Condvar, Mutex};
 use tracing::{debug, trace, warn};
@@ -77,6 +77,15 @@ pub(crate) const MAX_SCAN_DEPTH: usize = 32;
 
 /// Directories that may be awaiting reconciliation at once.
 pub(crate) const MAX_PENDING_DIRS: usize = 1024;
+
+/// Entries a single [`inventory`] may report before it gives up.
+///
+/// An order of magnitude above [`MAX_SCAN_ENTRIES`] on purpose: reconciliation exists to catch up
+/// on one newly-created directory, while an inventory describes a whole watched tree, which is
+/// routinely larger than any single `npm install` package directory. Still finite, so a caller
+/// pointed at an unexpectedly enormous root gets [`WatchError::ScanTooLarge`](crate::WatchError::ScanTooLarge)
+/// instead of an inventory that grows until the process runs out of memory.
+pub(crate) const MAX_SNAPSHOT_ENTRIES: usize = 1 << 20;
 
 /// Delays, measured from the directory's creation event, at which it is read.
 ///
@@ -257,13 +266,43 @@ pub(crate) enum Outcome {
     Vanished,
 }
 
-/// Read `directory` and synthesize events for what is already in it.
+/// One directory entry discovered by [`walk`], before any policy decision has been applied to it.
 ///
-/// `budget` caps the number of entries examined across the whole descent. Symbolic links are
-/// reported but never descended into: a link cannot be distinguished from the tree it points at
-/// without risking a cycle, and the backend will report changes through the real path anyway.
-pub(crate) fn reconcile(core: &Core, directory: &Path, budget: usize) -> Outcome {
-    let mut stack = vec![(directory.to_path_buf(), 0_usize)];
+/// Carries the raw [`fs::DirEntry`] rather than a pre-extracted size or modification time, so a
+/// caller that needs more than the file type — [`inventory`], which wants a full [`fs::Metadata`]
+/// — can fetch it lazily, without [`reconcile`] (the walk's original, latency-sensitive caller)
+/// paying for a `stat` it never needed.
+pub(crate) struct WalkEntry<'a> {
+    pub(crate) entry: &'a fs::DirEntry,
+    pub(crate) path: &'a Path,
+    pub(crate) is_directory: bool,
+}
+
+/// How a [`walk`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkOutcome {
+    /// The whole subtree was visited within budget. `read_anything` is `false` only when `root`
+    /// itself could not be read at all, which is how a caller distinguishes "empty directory"
+    /// from "directory that no longer exists".
+    Complete { read_anything: bool },
+    /// The budget ran out before the descent finished.
+    Abandoned { seen: usize },
+}
+
+/// Walk `root`, calling `visit` once for every entry found, honoring `budget` and
+/// [`MAX_SCAN_DEPTH`], and never descending into a symlinked directory — a link cannot be
+/// distinguished from the tree it points at without risking a cycle.
+///
+/// `visit` returns whether to descend into the entry if it turned out to be a (non-symlinked)
+/// directory; the return value is ignored for anything else. This is the one traversal both
+/// [`reconcile`] (which prunes excluded subtrees) and [`inventory`] (which descends everything)
+/// are built from, so the two can never disagree about what "the tree beneath a path" means.
+pub(crate) fn walk(
+    root: &Path,
+    budget: usize,
+    mut visit: impl FnMut(&WalkEntry) -> bool,
+) -> WalkOutcome {
+    let mut stack = vec![(root.to_path_buf(), 0_usize)];
     let mut seen = 0_usize;
     let mut read_anything = false;
 
@@ -283,7 +322,7 @@ pub(crate) fn reconcile(core: &Core, directory: &Path, budget: usize) -> Outcome
             let Ok(entry) = entry else { continue };
             seen += 1;
             if seen > budget {
-                return Outcome::Abandoned { seen };
+                return WalkOutcome::Abandoned { seen };
             }
 
             let path = entry.path();
@@ -293,36 +332,110 @@ pub(crate) fn reconcile(core: &Core, directory: &Path, budget: usize) -> Outcome
                 continue;
             };
             let is_directory = file_type.is_dir();
+            let is_symlink = file_type.is_symlink();
 
-            let size = if is_directory {
-                0
-            } else {
-                entry.metadata().map_or(0, |metadata| metadata.len())
-            };
-            core.emit_synthesized(&path, EventKind::Created, size, is_directory);
+            let descend = visit(&WalkEntry {
+                entry: &entry,
+                path: &path,
+                is_directory,
+            });
 
-            if is_directory && !file_type.is_symlink() {
+            if is_directory && !is_symlink {
                 if depth + 1 > MAX_SCAN_DEPTH {
                     debug!(
                         directory = %path.display(),
-                        "reconciliation depth limit reached; requesting rescan"
+                        "walk depth limit reached; requesting rescan"
                     );
-                    return Outcome::Abandoned { seen };
+                    return WalkOutcome::Abandoned { seen };
                 }
-                if subtree_excluded(&core.config().filter, &path) {
-                    trace!(directory = %path.display(), "excluded subtree not reconciled");
-                    continue;
+                if descend {
+                    stack.push((path, depth + 1));
                 }
-                stack.push((path, depth + 1));
             }
         }
     }
 
-    if read_anything {
-        Outcome::Complete
-    } else {
-        Outcome::Vanished
+    WalkOutcome::Complete { read_anything }
+}
+
+/// Read `directory` and synthesize events for what is already in it.
+///
+/// `budget` caps the number of entries examined across the whole descent.
+pub(crate) fn reconcile(core: &Core, directory: &Path, budget: usize) -> Outcome {
+    match walk(directory, budget, |walked| {
+        let size = if walked.is_directory {
+            0
+        } else {
+            walked.entry.metadata().map_or(0, |metadata| metadata.len())
+        };
+        core.emit_synthesized(walked.path, EventKind::Created, size, walked.is_directory);
+
+        if subtree_excluded(&core.config().filter, walked.path) {
+            trace!(directory = %walked.path.display(), "excluded subtree not reconciled");
+            return false;
+        }
+        true
+    }) {
+        WalkOutcome::Complete {
+            read_anything: true,
+        } => Outcome::Complete,
+        WalkOutcome::Complete {
+            read_anything: false,
+        } => Outcome::Vanished,
+        WalkOutcome::Abandoned { seen } => Outcome::Abandoned { seen },
     }
+}
+
+/// One entry in a directory-tree inventory. The crate-internal twin of
+/// [`SnapshotEntry`](crate::SnapshotEntry); [`crate::snapshot`] converts between them at the
+/// public boundary so this module does not need to know about the public type's derives.
+pub(crate) struct Inventoried {
+    pub(crate) path: PathBuf,
+    pub(crate) is_directory: bool,
+    pub(crate) size: u64,
+    pub(crate) modified_ns: Option<u64>,
+}
+
+/// Crawl `root` and describe every entry beneath it — the same bounded, symlink-safe walk
+/// [`reconcile`] uses, without the exclusion pruning or the side effect of emitting events:
+/// callers of a snapshot want the tree as it is, not as one watcher's filter sees it.
+///
+/// `root` itself is not one of the returned entries, matching [`reconcile`]: both describe a
+/// directory's *contents*, not the directory named in the call.
+///
+/// # Errors
+///
+/// Returns the number of entries seen if `budget` is exceeded before the descent finishes.
+pub(crate) fn inventory(root: &Path, budget: usize) -> Result<Vec<Inventoried>, usize> {
+    let mut out = Vec::new();
+    match walk(root, budget, |walked| {
+        let metadata = walked.entry.metadata().ok();
+        let size = metadata
+            .as_ref()
+            .map_or(0, |m| if walked.is_directory { 0 } else { m.len() });
+        let modified_ns = metadata.as_ref().and_then(modified_ns);
+        out.push(Inventoried {
+            path: walked.path.to_path_buf(),
+            is_directory: walked.is_directory,
+            size,
+            modified_ns,
+        });
+        true
+    }) {
+        WalkOutcome::Complete { .. } => Ok(out),
+        WalkOutcome::Abandoned { seen } => Err(seen),
+    }
+}
+
+/// A file's modification time in nanoseconds since the Unix epoch, or `None` on a volume, or for
+/// an entry kind, that does not report one.
+fn modified_ns(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_nanos()).ok())
 }
 
 /// Whether descending into `directory` could produce anything the filter would let through.

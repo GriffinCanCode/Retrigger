@@ -51,9 +51,11 @@ describe('the mock addon really is loaded as native', () => {
     const js = getEngine({ prefer: 'javascript', fresh: true });
     expect(native.hashAlgorithm).not.toBe(js.hashAlgorithm);
     const data = Buffer.from('cross-engine');
-    // Digests are deliberately NOT compared for equality: the two engines use
-    // different algorithms and the package documents that they are not
-    // interchangeable. Only the shape is a shared contract.
+    // This is about the mock specifically, not the package's real engines: `mock-native.js`
+    // deliberately reports `mock-sha1-64` so this suite can prove `getEngineInfo()` faithfully
+    // relays whatever a native binding's own `hashAlgorithm()` claims, rather than assuming
+    // xxh3-64. The real compiled addon and the real JavaScript fallback both compute genuine
+    // XXH3-64 and their digests DO agree -- see `parity-native.test.mjs` and `hash.test.mjs`.
     expect(native.hashBytesSync(data)).toMatch(/^[0-9a-f]{16}$/);
     expect(js.hashBytesSync(data)).toMatch(/^[0-9a-f]{16}$/);
     expect(native.hashBytesSync(data)).not.toBe(js.hashBytesSync(data));

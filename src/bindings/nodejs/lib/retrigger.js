@@ -10,6 +10,15 @@ const { Metrics } = require('./metrics');
 
 const DEFAULT_POLL_INTERVAL_MS = 5;
 const DEFAULT_CAPACITY = 8192;
+// A handful of large files land on the async hash path at once far more often than dozens do, so
+// this bounds memory (each in-flight hash holds one open file descriptor and one WASM/native
+// buffer) without meaningfully limiting throughput on the common case.
+const DEFAULT_MAX_CONCURRENT_HASHES = 4;
+// Matches the native addon's own fallbacks (`src/bindings/nodejs/src/lib.rs`), so a caller who
+// specifies one engine's option and gets the other on a given platform sees the same number.
+const DEFAULT_BACKEND_POLL_INTERVAL_MS = 1000;
+const DEFAULT_AWAIT_WRITE_FINISH_POLL_MS = 100;
+const DEFAULT_AWAIT_WRITE_FINISH_STABILITY_MS = 2000;
 
 /** Contract event kind -> public event name. */
 const KIND_TO_EVENT = {
@@ -39,6 +48,14 @@ const KIND_TO_EVENT = {
  * withheld: a watcher that silently dropped events would be unable to report a file being touched,
  * which some consumers do want. Deciding what to do with a no-op write belongs to the consumer, and
  * both bundler plugins in this package decide to skip it.
+ *
+ * A file past `maxHashBytes` is hashed on the async path (`ContentTracker#annotateAsync`, chunked
+ * and I/O-driven on both engines) rather than the drain loop's own tick, so a burst of large
+ * artifacts cannot stall delivery of every other event the same tick would otherwise carry. Those
+ * events reach listeners once their hash resolves, out of order with respect to whatever else the
+ * drain loop already emitted — the price of not blocking on them — bounded to
+ * `maxConcurrentHashes` in flight at once, and abandoned without emitting if `stop()`/`close()`
+ * runs before they resolve.
  */
 class Retrigger extends EventEmitter {
   /**
@@ -46,7 +63,9 @@ class Retrigger extends EventEmitter {
    *   exclude?: string[], debounceMs?: number, capacity?: number,
    *   pollIntervalMs?: number, engine?: 'auto'|'native'|'javascript',
    *   emitDirectories?: boolean, unref?: boolean, contentHashing?: boolean,
-   *   maxHashBytes?: number}} [options]
+   *   maxHashBytes?: number, maxConcurrentHashes?: number, backend?: {mode?: 'auto'|'poll',
+   *   pollIntervalMs?: number, compareContents?: boolean}, awaitWriteFinish?: {pollIntervalMs?:
+   *   number, stabilityThresholdMs?: number}, atomicWriteNormalization?: boolean}} [options]
    */
   constructor(options = {}) {
     super();
@@ -65,6 +84,10 @@ class Retrigger extends EventEmitter {
       unref: options.unref === true,
       contentHashing: options.contentHashing !== false,
       maxHashBytes: options.maxHashBytes,
+      maxConcurrentHashes: positiveOr(options.maxConcurrentHashes, DEFAULT_MAX_CONCURRENT_HASHES),
+      backend: normaliseBackend(options.backend),
+      awaitWriteFinish: normaliseAwaitWriteFinish(options.awaitWriteFinish),
+      atomicWriteNormalization: options.atomicWriteNormalization === true,
     };
 
     this.engine = getEngine({ prefer: options.engine || 'auto' });
@@ -78,12 +101,27 @@ class Retrigger extends EventEmitter {
       debounceMs: this.options.debounceMs,
       include: this.options.include,
       exclude: this.options.exclude,
+      backend: this.options.backend.mode,
+      pollIntervalMs: this.options.backend.pollIntervalMs,
+      pollCompareContents: this.options.backend.compareContents,
+      // `?? undefined`, not the `null` this.options carries for "off": napi-rs's generated
+      // constructor accepts an absent nested `#[napi(object)]` field but rejects an explicit
+      // `null` for one, unlike its handling of `null` for scalar `Option<T>` fields.
+      awaitWriteFinish: this.options.awaitWriteFinish ?? undefined,
+      atomicWriteNormalization: this.options.atomicWriteNormalization,
     });
 
     this._timer = null;
     this._draining = false;
     this._drainQueued = false;
     this._started = false;
+    // The async hash path's own queue and concurrency limiter -- see the class doc comment above.
+    // `_sessionAbort` is `null` outside of a start()/stop() bracket, and is exactly what makes an
+    // async hash from a since-stopped session recognisable as abandoned: it is a fresh object each
+    // start(), so a closure holding the previous one always finds it aborted after stop().
+    this._asyncQueue = [];
+    this._asyncInFlight = 0;
+    this._sessionAbort = null;
 
     // The JavaScript engine can nudge us the moment an event lands; the native
     // engine has no such hook and is served by the interval alone.
@@ -130,11 +168,38 @@ class Retrigger extends EventEmitter {
     return this;
   }
 
+  /**
+   * Crawl `target`'s current contents, without registering a watch on it.
+   *
+   * The result is a self-describing envelope — `{ algorithm, version, entries }` — so it can be
+   * persisted (to disk, to a database) and loaded back later without guessing which crate version
+   * or digest algorithm produced it. Comparing two of them to recover what changed between them is
+   * `retrigger_system::diff_snapshots`'s job on the Rust side; this package does not duplicate it.
+   * @param {string} target
+   * @returns {Promise<{algorithm: string, version: number, entries: Array<{path: string,
+   *   isDirectory: boolean, size: number, modifiedNs: bigint|null}>}>}
+   */
+  snapshot(target) {
+    return this._watcher.snapshot(path.resolve(target));
+  }
+
+  /**
+   * {@link Retrigger#add} `target`, then {@link Retrigger#snapshot} it, with the watch registered
+   * before the crawl begins so nothing created during the crawl is lost.
+   * @param {string} target
+   * @param {boolean} [recursive]
+   * @returns {Promise<{algorithm: string, version: number, entries: Array}>}
+   */
+  watchWithSnapshot(target, recursive = this.options.recursive) {
+    return this._watcher.watchWithSnapshot(path.resolve(target), recursive !== false);
+  }
+
   /** @returns {this} */
   start() {
     if (this._started) return this;
     this._watcher.start();
     this._started = true;
+    this._sessionAbort = new AbortController();
     this.metrics.markStarted();
     this._timer = setInterval(() => this._drain(), this.options.pollIntervalMs);
     if (this.options.unref && typeof this._timer.unref === 'function') this._timer.unref();
@@ -162,6 +227,14 @@ class Retrigger extends EventEmitter {
       }
     }
     this._started = false;
+    // Abandon every async hash this session started: `_runAsyncHash` sees its own captured
+    // controller as aborted and drops the result instead of emitting into a watcher that is now
+    // stopped. Queued-but-not-yet-started ones are simply discarded, having cost nothing yet.
+    if (this._sessionAbort) {
+      this._sessionAbort.abort();
+      this._sessionAbort = null;
+    }
+    this._asyncQueue.length = 0;
     // The digests describe a watch that is over, and the next start() must treat every path as new
     // anyway: the file system was free to change while nothing was watching it.
     if (this._content) this._content.clear();
@@ -187,6 +260,8 @@ class Retrigger extends EventEmitter {
       ...normaliseStats(engineStats),
       content: this._content ? this._content.stats() : null,
       metrics: this.metrics.snapshot(),
+      asyncHashesInFlight: this._asyncInFlight,
+      asyncHashesQueued: this._asyncQueue.length,
     };
   }
 
@@ -273,11 +348,70 @@ class Retrigger extends EventEmitter {
 
   _dispatch(event) {
     this.metrics.recordEvent(event.kind);
+    if (this._content && this._content.needsFingerprint(event) && this._isOversized(event)) {
+      this._asyncQueue.push(event);
+      this._pumpAsyncQueue();
+      return;
+    }
     if (this._content) {
       this._content.annotate(event);
       if (event.contentChanged === false) this.metrics.recordUnchanged();
     }
+    this._emitDispatched(event);
+  }
 
+  /**
+   * Whether `event` is large enough that hashing it belongs on the async path rather than this
+   * tick of the drain loop. `event.size` unknown is treated as "not oversized": a size the engine
+   * could not determine is no reason to prefer a queue and a `Promise` over just reading it.
+   * @param {{size?: number}} event
+   * @returns {boolean}
+   */
+  _isOversized(event) {
+    return Number.isFinite(event.size) && event.size > this._content.maxBytes;
+  }
+
+  /**
+   * Start async hashes for queued events up to `maxConcurrentHashes`, in the order they were
+   * queued. Called both when a new oversized event arrives and when an in-flight hash finishes
+   * and frees its slot.
+   */
+  _pumpAsyncQueue() {
+    while (
+      this._started &&
+      this._asyncInFlight < this.options.maxConcurrentHashes &&
+      this._asyncQueue.length > 0
+    ) {
+      const event = this._asyncQueue.shift();
+      this._asyncInFlight += 1;
+      this._runAsyncHash(event, this._sessionAbort);
+    }
+  }
+
+  /**
+   * Fingerprint one event off the drain loop's own tick, then emit it exactly as
+   * {@link _dispatch} would have, unless `controller` was aborted first (`stop()`/`close()` ran
+   * while this hash was in flight) — in which case the event is dropped, never delivered into a
+   * watcher its own caller was told had stopped.
+   * @param {object} event
+   * @param {AbortController} controller the session this event was queued under
+   */
+  async _runAsyncHash(event, controller) {
+    try {
+      await this._content.annotateAsync(event, { signal: controller.signal });
+      if (!controller.signal.aborted) {
+        if (event.contentChanged === false) this.metrics.recordUnchanged();
+        this._emitDispatched(event);
+      }
+    } catch (err) {
+      if (!controller.signal.aborted) this._fail(err);
+    } finally {
+      this._asyncInFlight -= 1;
+      this._pumpAsyncQueue();
+    }
+  }
+
+  _emitDispatched(event) {
     if (event.kind === 'rescanRequired') {
       this._safeEmit('rescan', event);
       this._safeEmit('all', event);
@@ -379,6 +513,42 @@ function atLeast(value, floor) {
 function positiveOr(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Normalise `backend`, the same tolerant way every other option here is read: an unrecognised
+ * `mode` costs the caller a working watcher never, falling back to `'auto'` rather than throwing,
+ * because a config file typo must not be worse than not setting the option at all. The native
+ * engine still validates its own `'auto'`/`'poll'` strings, so a genuinely malformed value thrown
+ * from elsewhere is not silently swallowed — only a value that never reaches it is.
+ * @param {unknown} value
+ * @returns {{mode: 'auto'|'poll', pollIntervalMs: number, compareContents: boolean}}
+ */
+function normaliseBackend(value) {
+  const raw = value && typeof value === 'object' ? value : {};
+  const mode = raw.mode === 'poll' ? 'poll' : 'auto';
+  return {
+    mode,
+    pollIntervalMs: positiveOr(raw.pollIntervalMs, DEFAULT_BACKEND_POLL_INTERVAL_MS),
+    compareContents: raw.compareContents === true,
+  };
+}
+
+/**
+ * Normalise `awaitWriteFinish`. `undefined`/`false`/anything not an object means "off", matching
+ * both engines' default of reporting a change as soon as it is seen.
+ * @param {unknown} value
+ * @returns {{pollIntervalMs: number, stabilityThresholdMs: number}|null}
+ */
+function normaliseAwaitWriteFinish(value) {
+  if (!value || typeof value !== 'object') return null;
+  return {
+    pollIntervalMs: positiveOr(value.pollIntervalMs, DEFAULT_AWAIT_WRITE_FINISH_POLL_MS),
+    stabilityThresholdMs: positiveOr(
+      value.stabilityThresholdMs,
+      DEFAULT_AWAIT_WRITE_FINISH_STABILITY_MS
+    ),
+  };
 }
 
 /**

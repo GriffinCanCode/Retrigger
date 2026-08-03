@@ -138,8 +138,8 @@ describe('platform candidate table', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8'));
     const declared = new Set(Object.keys(pkg.optionalDependencies));
     const attempted = new Set();
-    for (const platform of ['darwin', 'win32', 'linux']) {
-      for (const arch of ['x64', 'arm64', 'arm', 'ia32', 'riscv64', 's390x']) {
+    for (const platform of ['darwin', 'win32', 'linux', 'freebsd']) {
+      for (const arch of ['x64', 'arm64', 'arm', 'ia32', 'riscv64', 's390x', 'ppc64']) {
         const { candidates } = getCandidates({}, platform, arch);
         for (const c of candidates) if (c.type === 'package') attempted.add(c.id);
       }
@@ -177,7 +177,9 @@ describe('engine selection', () => {
   it('serves an explicit javascript request without consulting the addon', () => {
     const engine = getEngine({ prefer: 'javascript' });
     expect(engine.name).toBe('javascript');
-    expect(engine.hashAlgorithm).not.toBe('xxh3-64');
+    // Same algorithm as the native engine (see hash.test.mjs) -- what distinguishes this engine
+    // is `name`/`backend`, not the digest it produces.
+    expect(engine.hashAlgorithm).toBe('xxh3-64');
   });
 
   it('refuses a native request even after the JavaScript engine was memoised', () => {
@@ -240,7 +242,8 @@ describe('require() never throws (subprocess)', () => {
     const info = run({ RETRIGGER_NATIVE_PATH: NO_BINARY });
     expect(info.engine).toBe('javascript');
     expect(info.backend).toBe('polling');
-    expect(info.hashAlgorithm).not.toBe('xxh3-64');
+    // Same algorithm as the native engine would have reported (see hash.test.mjs).
+    expect(info.hashAlgorithm).toBe('xxh3-64');
     expect(info.reason).toBeTruthy();
   });
 

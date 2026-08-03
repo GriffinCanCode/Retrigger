@@ -140,12 +140,20 @@ mod hash;
 mod processor;
 mod queue;
 mod scan;
+mod snapshot;
+mod stabilize;
 mod watcher;
 
-pub use config::{Backend, WatcherConfig, WatcherStats, DEFAULT_CAPACITY, DEFAULT_DEBOUNCE};
+pub use config::{
+    AwaitWriteFinishConfig, Backend, BackendMode, WatcherConfig, WatcherStats, DEFAULT_CAPACITY,
+    DEFAULT_DEBOUNCE,
+};
 pub use error::WatchError;
 pub use event::{EventKind, FileEvent};
 pub use filter::EventFilter;
 pub use hash::{fnv1a_64, ContentHasher, Fnv1aHasher};
 pub use processor::{FileEventProcessor, ProcessedEvent, ProcessorConfig, ProcessorStats};
+pub use snapshot::{
+    diff_snapshots, SnapshotEntry, SnapshotEnvelope, SNAPSHOT_ALGORITHM, SNAPSHOT_ENVELOPE_VERSION,
+};
 pub use watcher::Watcher;

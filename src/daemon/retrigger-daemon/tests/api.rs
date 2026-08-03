@@ -359,6 +359,66 @@ async fn bad_watch_requests_are_rejected_with_a_code_the_client_can_act_on() -> 
 }
 
 #[tokio::test]
+async fn snapshot_returns_a_self_describing_inventory_without_registering_a_watch() -> Result<()> {
+    let harness = Harness::start().await?;
+    std::fs::write(harness.path("a.txt"), b"hello")?;
+    std::fs::create_dir(harness.path("sub"))?;
+    std::fs::write(harness.path("sub/b.txt"), b"world")?;
+
+    let response = harness
+        .get(&format!("/snapshot?path={}", harness.dir.path().display()))
+        .await?;
+    assert_eq!(response.status, 200, "{}", response.body);
+    let body: Value = serde_json::from_str(&response.body)?;
+    assert_eq!(body["algorithm"], "xxh3-64");
+    assert_eq!(body["version"], 1);
+    let entries = body["entries"].as_array().expect("entries array");
+    let paths: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path is a string"))
+        .collect();
+    assert!(paths.iter().any(|p| p.ends_with("a.txt")), "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with("sub")), "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with("b.txt")), "{paths:?}");
+
+    let a_txt = entries
+        .iter()
+        .find(|entry| entry["path"].as_str().is_some_and(|p| p.ends_with("a.txt")))
+        .expect("a.txt entry");
+    assert_eq!(a_txt["is_directory"], false);
+    assert_eq!(a_txt["size"], 5);
+    assert!(a_txt["modified_ns"].is_number() || a_txt["modified_ns"].is_string());
+
+    // A snapshot is read-only: it must not have registered a watch on anything it crawled.
+    assert_eq!(
+        harness.status().await?["watched"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn a_snapshot_of_a_missing_path_is_not_found() -> Result<()> {
+    let harness = Harness::start().await?;
+    let response = harness
+        .get(&format!("/snapshot?path={}", absent("snapshot")))
+        .await?;
+    assert_eq!(response.status, 404, "{}", response.body);
+    assert!(response.body.contains("error"), "{}", response.body);
+    harness.shutdown().await
+}
+
+#[tokio::test]
+async fn a_snapshot_request_reuses_the_same_path_vetting_as_watch() -> Result<()> {
+    let harness = Harness::start().await?;
+    // A relative path fails `vet` for the same reason a relative `/watch` body does.
+    let response = harness.get("/snapshot?path=relative/path").await?;
+    assert_eq!(response.status, 400, "{}", response.body);
+    harness.shutdown().await
+}
+
+#[tokio::test]
 async fn a_file_change_reaches_a_subscriber_with_the_xxh3_digest() -> Result<()> {
     let harness = Harness::start().await?;
     let contents = b"the bytes that must be hashed".to_vec();

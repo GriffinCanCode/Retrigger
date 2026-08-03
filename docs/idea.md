@@ -1,1 +1,15 @@
-Retrigger is a hybrid C/Zig/Rust file system watcher and hasher that replaces Webpack's slow JavaScript file watching with a native daemon achieving 100-160x faster hot reload times - using C for the core SIMD-accelerated hashing engine (computing file hashes in <1ms with AVX-512 instructions), Zig for zero-overhead system integration with Linux's inotify/macOS FSEvents kernel APIs to detect file changes instantly without polling, and Rust for the safe high-level API, Node.js bindings via napi-rs, and parallel processing with rayon - all communicating through shared memory to eliminate IPC overhead; the daemon runs continuously in the background watching your entire project directory, maintaining an in-memory hash cache of all files, and when you save a file it instantly (<5ms) detects the change via kernel notification, hashes only the modified blocks using incremental hashing, and notifies webpack through a simple plugin interface, turning the painful 500-2000ms hot reload delay on large projects into imperceptible sub-10ms updates while using 90% less CPU than JavaScript-based watchers, ultimately saving developers hours daily and making the development experience instant rather than frustratingly sluggish on codebases with 10K+ files.
+# Idea
+
+**Skip byte-identical rebuilds.** Editors, formatters, generators, and branch switches
+often rewrite a file with the same bytes. A stock Vite or webpack watcher still rebuilds.
+Retrigger hashes each changed path with XXH3-64 and withholds the event when the digest
+matches, so those no-ops cost nothing.
+
+Raw per-event latency is not the goal and is not the win: Retrigger honestly trails a
+light watcher like Chokidar on single-event p50. The trade is a few milliseconds of watch
+latency for skipping entire rebuilds — the right trade for dev-server rebuild suppression.
+
+Everything else in the tree (platform watchers, native + WASM hashing, bundler plugins,
+snapshots, optional daemon, Watchman, chokidar adapter) exists to deliver that gate
+reliably across engines and machines. Turbopack is out of scope until upstream exposes a
+watcher or veto seam; Next.js is supported in webpack mode today.

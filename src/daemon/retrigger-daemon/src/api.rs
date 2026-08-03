@@ -13,6 +13,7 @@
 //! | `/status` | GET | everything in [`DaemonStats`] |
 //! | `/metrics` | GET | the same numbers in Prometheus exposition format |
 //! | `/events` | GET | server-sent stream of processed events |
+//! | `/snapshot` | GET | `?path=...`, a self-describing inventory of that tree right now |
 //! | `/watch` | POST | `{"path": "...", "recursive": true}` |
 //! | `/unwatch` | POST | `{"path": "..."}` |
 //! | `/shutdown` | POST | graceful shutdown |
@@ -28,13 +29,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use retrigger_system::WatchError;
+use retrigger_system::{SnapshotEnvelope, WatchError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -59,6 +60,7 @@ pub fn router(daemon: Arc<Daemon>) -> Router {
         .route("/status", get(status))
         .route("/metrics", get(metrics))
         .route("/events", get(events))
+        .route("/snapshot", get(snapshot))
         .route("/watch", post(watch))
         .route("/unwatch", post(unwatch))
         .route("/shutdown", post(shutdown))
@@ -87,6 +89,7 @@ async fn index() -> Json<serde_json::Value> {
             "GET /status": "watcher, cache, and process statistics",
             "GET /metrics": "the same numbers, Prometheus exposition format",
             "GET /events": "server-sent stream of processed file events",
+            "GET /snapshot": "?path=..., a self-describing inventory of that tree right now",
             "POST /watch": "{\"path\": \"...\", \"recursive\": true}",
             "POST /unwatch": "{\"path\": \"...\"}",
             "POST /shutdown": "graceful shutdown",
@@ -209,6 +212,28 @@ fn vet(path: &Path) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// `GET /snapshot` query string.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotQuery {
+    path: PathBuf,
+}
+
+/// Crawl `path`'s current contents and return a self-describing, portable inventory.
+///
+/// Reuses [`vet`], the same trust boundary `/watch` and `/unwatch` sit behind: this reads
+/// arbitrary directories the daemon's user can see, so it is refused the same paths a watch
+/// request would be. Unlike a watch, nothing here is registered — a caller polling `/snapshot` in
+/// a loop is exactly as safe as calling it once.
+async fn snapshot(
+    State(daemon): State<Arc<Daemon>>,
+    Query(request): Query<SnapshotQuery>,
+) -> Result<Json<SnapshotEnvelope>, ApiError> {
+    vet(&request.path)?;
+    let entries = daemon.snapshot(&request.path)?;
+    Ok(Json(SnapshotEnvelope::new(entries)))
+}
+
 async fn watch(
     State(daemon): State<Arc<Daemon>>,
     Json(request): Json<WatchRequest>,
@@ -269,7 +294,9 @@ impl From<WatchError> for ApiError {
             WatchError::NotFound(_) => StatusCode::NOT_FOUND,
             WatchError::PermissionDenied(_) => StatusCode::FORBIDDEN,
             WatchError::InvalidPattern(_) => StatusCode::BAD_REQUEST,
-            WatchError::WatchLimitExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
+            WatchError::WatchLimitExceeded(_) | WatchError::ScanTooLarge(_) => {
+                StatusCode::INSUFFICIENT_STORAGE
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {

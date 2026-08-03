@@ -25,6 +25,24 @@
       "require": "./plugins/vite-plugin.js",
       "default": "./plugins/vite-plugin.js"
     },
+    "./chokidar": {
+      "types": "./lib/chokidar-adapter.d.ts",
+      "import": "./lib/chokidar-adapter.mjs",
+      "require": "./lib/chokidar-adapter.js",
+      "default": "./lib/chokidar-adapter.js"
+    },
+    "./rollup": {
+      "types": "./lib/rollup-plugin.d.ts",
+      "import": "./lib/rollup-plugin.mjs",
+      "require": "./lib/rollup-plugin.js",
+      "default": "./lib/rollup-plugin.js"
+    },
+    "./esbuild": {
+      "types": "./lib/esbuild-plugin.d.ts",
+      "import": "./lib/esbuild-plugin.mjs",
+      "require": "./lib/esbuild-plugin.js",
+      "default": "./lib/esbuild-plugin.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -49,12 +67,17 @@
       "x86_64-unknown-linux-gnu",
       "aarch64-unknown-linux-gnu",
       "x86_64-unknown-linux-musl",
-      "aarch64-unknown-linux-musl"
+      "aarch64-unknown-linux-musl",
+      "x86_64-unknown-freebsd",
+      "armv7-unknown-linux-gnueabihf",
+      "powerpc64le-unknown-linux-gnu",
+      "s390x-unknown-linux-gnu"
     ]
   },
   "scripts": {
     "artifacts": "napi artifacts",
     "build": "napi build --platform --release --no-js --dts .napi/binding.d.ts",
+    "build:wasm": "cargo build --manifest-path wasm-xxh3/Cargo.toml --release --target wasm32-unknown-unknown && node -e \"require('fs').copyFileSync('wasm-xxh3/target/wasm32-unknown-unknown/release/retrigger_wasm_xxh3.wasm', 'lib/xxh3.wasm')\"",
     "build:debug": "napi build --platform --no-js --dts .napi/binding.d.ts",
     "format": "prettier --write \"**/*.{js,mjs,json,md,ts}\"",
     "format:check": "prettier --check \"**/*.{js,mjs,json,md,ts}\"",
@@ -65,26 +88,38 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:vite7": "node scripts/test-vite7.js",
+    "test:rspack": "node scripts/test-rspack.js",
     "test:pack": "node scripts/verify-package.js",
     "test:all": "npm run test && npm run test:pack",
     "version": "napi version"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.8.2",
+    "@rspack/core": "^2.1.7",
     "@types/node": "^20.19.17",
     "@vitest/coverage-v8": "^4.1.10",
+    "astro": "^7.1.6",
+    "chokidar": "^5.0.0",
+    "esbuild": "^0.25.12",
     "fast-check": "^4.9.0",
     "prettier": "^3.9.6",
+    "rollup": "^4.62.4",
     "typescript": "^7.0.2",
     "vite": "^6.4.3",
+    "vite7": "npm:vite@^7.3.6",
     "vitest": "^4.1.10",
     "webpack": "^5.109.2"
   },
   "optionalDependencies": {
     "@retrigger/core-darwin-arm64": "2.0.0",
     "@retrigger/core-darwin-x64": "2.0.0",
+    "@retrigger/core-freebsd-x64": "2.0.0",
+    "@retrigger/core-linux-arm-gnueabihf": "2.0.0",
     "@retrigger/core-linux-arm64-gnu": "2.0.0",
     "@retrigger/core-linux-arm64-musl": "2.0.0",
+    "@retrigger/core-linux-ppc64-gnu": "2.0.0",
+    "@retrigger/core-linux-s390x-gnu": "2.0.0",
     "@retrigger/core-linux-x64-gnu": "2.0.0",
     "@retrigger/core-linux-x64-musl": "2.0.0",
     "@retrigger/core-win32-arm64-msvc": "2.0.0",
@@ -107,6 +142,7 @@
     "watchpack",
     "fsevents",
     "inotify",
+    "watchman",
     "hmr",
     "hot-reload",
     "hot-module-replacement",

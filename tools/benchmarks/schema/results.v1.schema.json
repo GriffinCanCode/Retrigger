@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://retrigger.dev/schemas/benchmarks/results.v1.schema.json",
+  "title": "Retrigger benchmark results v1",
+  "type": "object",
+  "required": ["schema", "schemaVersion", "env", "suites"],
+  "additionalProperties": true,
+  "properties": {
+    "schema": { "const": "retrigger.benchmarks.results.v1" },
+    "schemaVersion": { "const": 1 },
+    "env": {
+      "type": "object",
+      "required": ["timestamp", "node", "platform", "arch", "engine", "hashAlgorithm"],
+      "properties": {
+        "timestamp": { "type": "string" },
+        "gitSha": { "type": ["string", "null"] },
+        "node": { "type": "string" },
+        "platform": { "type": "string" },
+        "arch": { "type": "string" },
+        "osRelease": { "type": "string" },
+        "cpuModel": { "type": ["string", "null"] },
+        "cpuCount": { "type": "integer" },
+        "totalMemoryBytes": { "type": "number" },
+        "engine": { "type": "string" },
+        "backend": { "type": "string" },
+        "hashAlgorithm": { "type": "string" },
+        "simd": { "type": ["string", "null"] },
+        "engineReason": { "type": ["string", "null"] },
+        "corePath": { "type": "string" }
+      }
+    },
+    "config": { "type": "object" },
+    "suites": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "cases"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "cases": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id"],
+              "properties": {
+                "id": { "type": "string" },
+                "watcher": { "type": "string" },
+                "status": { "enum": ["ok", "error", "not_installed", "skipped"] },
+                "error": { "type": "string" },
+                "metrics": { "type": "object" },
+                "samples": {
+                  "type": "array",
+                  "items": { "type": "number" }
+                },
+                "resources": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "pass", "detail"],
+        "properties": {
+          "id": { "type": "string" },
+          "pass": { "type": "boolean" },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

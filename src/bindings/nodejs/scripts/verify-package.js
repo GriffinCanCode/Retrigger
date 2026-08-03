@@ -20,6 +20,7 @@ const { execFileSync, spawnSync } = require('child_process');
 
 const PKG_ROOT = path.resolve(__dirname, '..');
 const KEEP = process.argv.includes('--keep');
+const PKG = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8'));
 
 const checks = [];
 
@@ -131,8 +132,21 @@ function main() {
         'index.d.ts',
         'lib/native.js',
         'lib/js-watcher.js',
+        'lib/watchman-watcher.js',
         'lib/engine.js',
         'lib/retrigger.js',
+        'lib/hash-js.js',
+        'lib/xxh3.wasm',
+        'lib/chokidar-adapter.js',
+        'lib/chokidar-adapter.mjs',
+        'lib/chokidar-adapter.d.ts',
+        'lib/rebuild-driver.js',
+        'lib/rollup-plugin.js',
+        'lib/rollup-plugin.mjs',
+        'lib/rollup-plugin.d.ts',
+        'lib/esbuild-plugin.js',
+        'lib/esbuild-plugin.mjs',
+        'lib/esbuild-plugin.d.ts',
         'plugins/webpack-plugin.js',
         'plugins/vite-plugin.js',
         'README.md',
@@ -176,7 +190,9 @@ function main() {
            const info = c.getEngineInfo();
            if (info.engine !== 'javascript') throw new Error('expected the JS engine, got ' + info.engine);
            if (info.backend !== 'polling') throw new Error('unexpected backend ' + info.backend);
-           if (info.hashAlgorithm === 'xxh3-64') throw new Error('fallback must not claim xxh3-64');
+           if (info.hashAlgorithm !== 'xxh3-64') throw new Error('fallback must claim xxh3-64, got ' + info.hashAlgorithm);
+           const digest = c.hashBytesSync(Buffer.alloc(0));
+           if (digest !== '2d06800538d394c2') throw new Error('fallback must produce genuine XXH3-64, got ' + digest);
            process.stdout.write(info.engine + '/' + info.hashAlgorithm);`
         ),
         'require()'
@@ -225,8 +241,11 @@ function main() {
           consumer,
           `const w = require('@retrigger/core/webpack');
            const v = require('@retrigger/core/vite');
+           const c = require('@retrigger/core/chokidar');
            if (typeof w !== 'function') throw new Error('webpack subpath is not a constructor');
            if (typeof v.createRetriggerVitePlugin !== 'function') throw new Error('vite subpath missing');
+           if (typeof c.watch !== 'function') throw new Error('chokidar subpath missing watch()');
+           if (typeof c.FSWatcher !== 'function') throw new Error('chokidar subpath missing FSWatcher');
            require('@retrigger/core/package.json');`,
           { env: { RETRIGGER_SILENT: '1' } }
         ),
@@ -237,12 +256,147 @@ function main() {
           consumer,
           `import Webpack from '@retrigger/core/webpack';
            import { createRetriggerVitePlugin } from '@retrigger/core/vite';
+           import { watch, FSWatcher } from '@retrigger/core/chokidar';
            if (typeof Webpack !== 'function') throw new Error('webpack ESM subpath broken');
-           if (typeof createRetriggerVitePlugin !== 'function') throw new Error('vite ESM subpath broken');`,
+           if (typeof createRetriggerVitePlugin !== 'function') throw new Error('vite ESM subpath broken');
+           if (typeof watch !== 'function') throw new Error('chokidar ESM subpath missing watch()');
+           if (typeof FSWatcher !== 'function') throw new Error('chokidar ESM subpath missing FSWatcher');`,
           { esm: true, env: { RETRIGGER_SILENT: '1' } }
         ),
         'ESM subpaths'
       );
+    });
+
+    check('the ./chokidar subpath actually watches, with no native binary present', () => {
+      const out = expectClean(
+        runInConsumer(
+          consumer,
+          `const fs = require('fs');
+           const os = require('os');
+           const path = require('path');
+           const { watch } = require('@retrigger/core/chokidar');
+           const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rt-chokidar-')));
+           const seen = [];
+           const w = watch(dir, { ignoreInitial: true });
+           w.on('add', (p) => seen.push('add:' + path.basename(p)));
+           w.on('change', (p) => seen.push('change:' + path.basename(p)));
+           w.on('unlink', (p) => seen.push('unlink:' + path.basename(p)));
+           const target = path.join(dir, 'watched.js');
+           const deadline = Date.now() + 10000;
+           setTimeout(() => fs.writeFileSync(target, 'v1'), 50);
+           setTimeout(() => fs.writeFileSync(target, 'v2-longer'), 400);
+           setTimeout(() => fs.unlinkSync(target), 800);
+           const poll = setInterval(async () => {
+             const done = seen.some(s => s.startsWith('add:')) &&
+                          seen.some(s => s.startsWith('change:')) &&
+                          seen.some(s => s.startsWith('unlink:'));
+             if (done || Date.now() > deadline) {
+               clearInterval(poll);
+               await w.close();
+               fs.rmSync(dir, { recursive: true, force: true });
+               if (!done) { console.error('only saw ' + JSON.stringify(seen)); process.exit(1); }
+               process.stdout.write(seen.join(','));
+             }
+           }, 20);`,
+          { env: { RETRIGGER_SILENT: '1' } }
+        ),
+        'chokidar subpath watch cycle'
+      );
+      console.log(`        events: ${out}`);
+    });
+
+    console.log(
+      '\ninstalling rollup and esbuild (pinned to this package\u2019s own devDependency majors)'
+    );
+    npm(
+      [
+        'install',
+        `rollup@${PKG.devDependencies.rollup}`,
+        `esbuild@${PKG.devDependencies.esbuild}`,
+        '--no-audit',
+        '--no-fund',
+      ],
+      consumer
+    );
+
+    check('the ./rollup subpath resolves and drives a real one-shot build per real change', () => {
+      const out = expectClean(
+        runInConsumer(
+          consumer,
+          `const fs = require('fs');
+           const os = require('os');
+           const path = require('path');
+           const { createRetriggerRollupWatcher } = require('@retrigger/core/rollup');
+           if (typeof createRetriggerRollupWatcher !== 'function') throw new Error('./rollup subpath missing its factory');
+           (async () => {
+             const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rt-rollup-pack-')));
+             const entry = path.join(dir, 'index.js');
+             const outFile = path.join(dir, 'bundle.js');
+             fs.writeFileSync(entry, 'export const value = 1;\\n');
+             const w = createRetriggerRollupWatcher({
+               input: { input: entry },
+               output: { file: outFile, format: 'es' },
+               watchPaths: [dir],
+               coalesceMs: 30,
+             });
+             await w.start();
+             if (w.buildCount !== 1) throw new Error('expected exactly one initial build');
+             if (!fs.readFileSync(outFile, 'utf8').includes('value = 1')) throw new Error('initial bundle missing its content');
+             fs.writeFileSync(entry, 'export const value = 2;\\n');
+             const deadline = Date.now() + 10000;
+             while (w.buildCount < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+             if (w.buildCount !== 2) throw new Error('edit did not produce a rebuild');
+             if (!fs.readFileSync(outFile, 'utf8').includes('value = 2')) throw new Error('rebuilt bundle does not reflect the edit');
+             await w.close();
+             fs.rmSync(dir, { recursive: true, force: true });
+             process.stdout.write('ok:' + w.buildCount);
+           })().catch((err) => { console.error(err); process.exit(1); });`,
+          { env: { RETRIGGER_SILENT: '1' } }
+        ),
+        './rollup drive cycle'
+      );
+      console.log(`        ${out}`);
+    });
+
+    check('the ./esbuild subpath resolves and drives a real one-shot build per real change', () => {
+      const out = expectClean(
+        runInConsumer(
+          consumer,
+          `const fs = require('fs');
+           const os = require('os');
+           const path = require('path');
+           const { createRetriggerEsbuildWatcher } = require('@retrigger/core/esbuild');
+           if (typeof createRetriggerEsbuildWatcher !== 'function') throw new Error('./esbuild subpath missing its factory');
+           (async () => {
+             const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'rt-esbuild-pack-')));
+             const entry = path.join(dir, 'index.js');
+             const outFile = path.join(dir, 'bundle.js');
+             fs.writeFileSync(entry, 'export const value = 1;\\n');
+             const w = createRetriggerEsbuildWatcher({
+               entryPoints: [entry],
+               outfile: outFile,
+               bundle: true,
+               format: 'esm',
+               watchPaths: [dir],
+               coalesceMs: 30,
+             });
+             await w.start();
+             if (w.buildCount !== 1) throw new Error('expected exactly one initial build');
+             if (!fs.readFileSync(outFile, 'utf8').includes('value = 1')) throw new Error('initial bundle missing its content');
+             fs.writeFileSync(entry, 'export const value = 2;\\n');
+             const deadline = Date.now() + 10000;
+             while (w.buildCount < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+             if (w.buildCount !== 2) throw new Error('edit did not produce a rebuild');
+             if (!fs.readFileSync(outFile, 'utf8').includes('value = 2')) throw new Error('rebuilt bundle does not reflect the edit');
+             await w.close();
+             fs.rmSync(dir, { recursive: true, force: true });
+             process.stdout.write('ok:' + w.buildCount);
+           })().catch((err) => { console.error(err); process.exit(1); });`,
+          { env: { RETRIGGER_SILENT: '1' } }
+        ),
+        './esbuild drive cycle'
+      );
+      console.log(`        ${out}`);
     });
 
     check('the installed copy actually watches files', () => {

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use retrigger_core::SimdLevel;
 use retrigger_system::{
-    Backend, EventKind, FileEventProcessor, ProcessedEvent, ProcessorStats, WatchError, Watcher,
-    WatcherStats,
+    Backend, EventKind, FileEventProcessor, ProcessedEvent, ProcessorStats, SnapshotEntry,
+    WatchError, Watcher, WatcherStats,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
@@ -231,6 +231,16 @@ impl Daemon {
         self.processor.invalidate_tree(path);
         info!(path = %path.display(), "removed watch");
         Ok(())
+    }
+
+    /// Crawl `path`'s current contents, without registering a watch on it.
+    ///
+    /// # Errors
+    ///
+    /// If `path` cannot be inspected, or its tree exceeds
+    /// [`retrigger_system::Watcher::snapshot`]'s bound.
+    pub fn snapshot(&self, path: &Path) -> Result<Vec<SnapshotEntry>, WatchError> {
+        self.watcher.snapshot(path)
     }
 
     /// Record the address the HTTP server actually bound.

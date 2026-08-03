@@ -1,5 +1,8 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import * as jsHash from '../lib/hash-js.js';
@@ -7,41 +10,136 @@ import { cleanupTempDirs, tempDir, writeFile } from './helpers/tmp.js';
 
 afterAll(cleanupTempDirs);
 
-const HAS_BLAKE2 = crypto.getHashes().includes('blake2b512');
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const PKG_ROOT = path.resolve(HERE, '..');
+const require = createRequire(import.meta.url);
 
 /**
- * Reference vectors for the algorithm the JavaScript engine actually uses.
- * These are the first 8 bytes of the published BLAKE2b-512 digests, not
- * numbers copied from a previous run of this code.
+ * The compiled Rust addon, if one has been built for this host -- the same lookup
+ * `parity-native.test.mjs` uses, duplicated rather than imported so this file has no reason to
+ * load `lib/native.js` (and therefore no reason to touch `RETRIGGER_NATIVE_PATH`, which every
+ * other suite in this process also reads exactly once).
+ * @returns {string|null}
  */
-const BLAKE2B_64_VECTORS = [
-  // BLAKE2b-512("") = 786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419...
-  ['', '786a02f742015903'],
-  // BLAKE2b-512("abc") = ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1...
-  ['abc', 'ba80a53f981c4d0d'],
-  // BLAKE2b-512("hello") = e4cfa39a3d37be31c59609e807970799caa68a19bfaa15135f165085e01d41a6...
-  ['hello', 'e4cfa39a3d37be31'],
-  // BLAKE2b-512("The quick brown fox jumps over the lazy dog")
-  //   = a8add4bdddfd93e4877d2746e62817b116364a1fa7bc148d95090bc7333b3673...
-  ['The quick brown fox jumps over the lazy dog', 'a8add4bdddfd93e4'],
+function findAddon() {
+  const triples = {
+    darwin: ['darwin-arm64', 'darwin-x64'],
+    win32: ['win32-x64-msvc', 'win32-arm64-msvc'],
+    linux: [
+      'linux-x64-gnu',
+      'linux-x64-musl',
+      'linux-arm64-gnu',
+      'linux-arm64-musl',
+      'linux-arm-gnueabihf',
+      'linux-ppc64-gnu',
+      'linux-s390x-gnu',
+    ],
+    freebsd: ['freebsd-x64'],
+  }[process.platform];
+  for (const triple of triples || []) {
+    const candidate = path.join(PKG_ROOT, `retrigger-nodejs-bindings.${triple}.node`);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+const ADDON = findAddon();
+const native = ADDON ? require(ADDON) : null;
+
+/**
+ * The xxHash sanity-check byte generator: an LCG seeded with `PRIME32_1`, taking the high byte
+ * of each 32-bit state. This exact sequence is what `src/core/tests/test_vectors.c` feeds
+ * through the upstream xxHash reference implementation to produce the vectors below -- changing
+ * this generator would make every one of those vectors describe a different input.
+ * @param {number} len
+ * @returns {Buffer}
+ */
+function fillTestBuffer(len) {
+  const buf = Buffer.allocUnsafe(len);
+  let r = 2654435761;
+  for (let i = 0; i < len; i += 1) {
+    r = (Math.imul(r, 2654435761) + 2654435769) >>> 0;
+    buf[i] = (r >>> 24) & 0xff;
+  }
+  return buf;
+}
+
+/**
+ * A sample of `src/core/tests/test_vectors.c`'s table: every length class boundary the algorithm
+ * itself defines (0, the 1-3/4-8/9-16 short paths, 17-128, 129-240, the 240/241 crossover into
+ * the long path, and the 4096-byte secret-block scale), each at all four of that file's seeds.
+ *
+ * PROVENANCE: produced by the upstream xxHash reference implementation (xxHash v0.8.3, `xxhash.h`
+ * SHA-256 `17973c0dc49d9854ca26caa191f0e12f7a424b68858d9a78de3860d959d85e4b`), not by this code --
+ * see `test_vectors.c` for the full table and its cross-checks against `xxhsum` and the Python
+ * `xxhash` module. `0x2d06800538d394c2` for the empty input is the widely published XXH3-64 hash
+ * of `""`.
+ */
+const OFFICIAL_VECTORS = [
+  [0, 0x0000000000000000n, 0x2d06800538d394c2n],
+  [0, 0x0000000000000001n, 0x4dc5b0cc826f6703n],
+  [0, 0x9e3779b185ebca87n, 0x07f70f819703314dn],
+  [0, 0xffffffffffffffffn, 0x4c093276ae47a555n],
+  [1, 0x0000000000000000n, 0xdd02fbe6d2c66464n],
+  [3, 0x9e3779b185ebca87n, 0xb15fee9f3508fbadn],
+  [8, 0x0000000000000000n, 0x9d14848e54f122a8n],
+  [9, 0xffffffffffffffffn, 0xcd09a583ca133a12n],
+  [16, 0x0000000000000000n, 0x65d15380c6cbcc1cn],
+  [17, 0x0000000000000000n, 0x1f523e66cebaf22fn],
+  [127, 0x9e3779b185ebca87n, 0x1fa159212e08da6dn],
+  [128, 0x0000000000000000n, 0xb5d563b38c2810afn],
+  [129, 0xffffffffffffffffn, 0xecd602aa56a3a75fn],
+  [239, 0x0000000000000000n, 0xac68f5437a2e3188n],
+  [240, 0x0000000000000000n, 0x89b3b9e11abe7146n],
+  [241, 0x0000000000000000n, 0x287e3395cd063d80n],
+  [4095, 0x0000000000000000n, 0x5851c8e382e77ee1n],
+  [4096, 0x0000000000000000n, 0xf092d3c13d60b3a3n],
+  [100000, 0x0000000000000000n, 0x6b0a48c2264c8324n],
 ];
+
+/** The longest input any vector or cross-engine check below needs. */
+const REFERENCE_BUFFER = fillTestBuffer(100000);
+
+function hex(big) {
+  return big.toString(16).padStart(16, '0');
+}
 
 describe('JavaScript engine hash', () => {
   it('names the algorithm it actually uses', () => {
-    expect(jsHash.ALGORITHM).toBe(HAS_BLAKE2 ? 'blake2b-64' : 'sha256-64');
-    expect(jsHash.ALGORITHM).not.toBe('xxh3-64');
+    expect(jsHash.ALGORITHM).toBe('xxh3-64');
   });
 
-  it.runIf(HAS_BLAKE2)('matches published BLAKE2b reference vectors', () => {
-    for (const [input, expected] of BLAKE2B_64_VECTORS) {
-      expect(jsHash.hashBytesSync(input)).toBe(expected);
+  it('matches the published XXH3-64 reference vectors', () => {
+    for (const [len, seed, expected] of OFFICIAL_VECTORS) {
+      const input = REFERENCE_BUFFER.subarray(0, len);
+      expect(jsHash.hashBytesSync(input, seed)).toBe(hex(expected));
     }
   });
 
-  it('is the documented truncation of the full Node digest', () => {
-    const data = Buffer.from('truncation check');
-    const full = crypto.createHash(jsHash.NODE_ALGORITHM).update(data).digest('hex');
-    expect(jsHash.hashBytesSync(data)).toBe(full.slice(0, 16));
+  it.skipIf(!ADDON)(
+    'agrees with the compiled native addon on a corpus spanning every chunk and secret-block boundary',
+    () => {
+      // The corpus the plan calls for by name: empty, one byte, the 240/241 long-path crossover,
+      // 4 KiB, ~300 KB, and a size that straddles hash-js's own 1 MiB chunk boundary.
+      const CHUNK = 1 << 20;
+      const sizes = [0, 1, 240, 241, 4096, 300_000, CHUNK - 1, CHUNK, CHUNK + 1];
+      for (const size of sizes) {
+        const bytes = fillTestBuffer(size);
+        for (const seed of [undefined, 0n, 1n, 0x9e3779b185ebca87n]) {
+          const fromNative = native.hashBytesSync(bytes, seed);
+          const fromFallback = jsHash.hashBytesSync(bytes, seed);
+          expect(fromFallback, `size=${size} seed=${seed}`).toBe(fromNative);
+        }
+      }
+    }
+  );
+
+  it.skipIf(!ADDON)('agrees with the compiled native addon on a multi-chunk file', () => {
+    const dir = tempDir();
+    const target = path.join(dir, 'cross-engine.bin');
+    const bytes = fillTestBuffer((1 << 20) * 2 + 12_345);
+    writeFile(target, bytes);
+    expect(jsHash.hashFileSync(target)).toEqual(native.hashFileSync(target));
   });
 
   it('handles empty input', () => {
@@ -67,7 +165,7 @@ describe('JavaScript engine hash', () => {
     expect(() => jsHash.hashBytesSync({})).toThrow(TypeError);
   });
 
-  it('domain-separates a non-zero seed and ignores a zero seed', () => {
+  it('a zero seed and no seed are the same input to XXH3, and any other seed changes the digest', () => {
     const data = Buffer.from('seeded');
     const unseeded = jsHash.hashBytesSync(data);
     expect(jsHash.hashBytesSync(data, 0n)).toBe(unseeded);
@@ -106,6 +204,16 @@ describe('JavaScript engine hash', () => {
   it('rejects a missing file rather than returning a bogus digest', () => {
     expect(() => jsHash.hashFileSync(path.join(tempDir(), 'absent'))).toThrow();
     return expect(jsHash.hashFile(path.join(tempDir(), 'absent'))).rejects.toThrow();
+  });
+
+  it('an open stream is freed on error, not merely on success', async () => {
+    // `openStream()` hands back a wasm-side allocation; a hasher that errors partway through a
+    // read must still release it. This cannot observe the allocation directly, so it observes the
+    // only thing that would go wrong if it leaked: many failed hashes in a row still work.
+    for (let i = 0; i < 50; i += 1) {
+      await expect(jsHash.hashFile(path.join(tempDir(), `absent-${i}`))).rejects.toThrow();
+    }
+    expect(jsHash.hashBytesSync('still alive')).toMatch(/^[0-9a-f]{16}$/);
   });
 
   it('benchmarks with measured, non-fabricated numbers', async () => {
