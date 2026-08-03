@@ -97,7 +97,7 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.8.2",
     "@rspack/core": "^2.1.7",
-    "@types/node": "^20.19.17",
+    "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.1.10",
     "astro": "^7.1.6",
     "chokidar": "^5.0.0",
