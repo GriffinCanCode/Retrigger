@@ -151,10 +151,26 @@ fn directory_creation_and_removal_are_flagged_as_directories() {
     let removed = collect_until(&watcher, DEADLINE, |seen| {
         has_event(seen, &dir, EventKind::Deleted)
     });
+    let deleted = expect_event(&removed, &dir, EventKind::Deleted);
+
+    // The removal is always reported; whether it is known to have been a directory depends on the
+    // backend, because the path is gone by the time anyone could stat it.
+    #[cfg(not(windows))]
     assert!(
-        expect_event(&removed, &dir, EventKind::Deleted).is_directory,
+        deleted.is_directory,
         "a removed directory can no longer be stat'd, so the backend hint must be used"
     );
+    #[cfg(windows)]
+    {
+        // ReadDirectoryChangesW reports FILE_ACTION_REMOVED with no indication of what was
+        // removed, so notify yields RemoveKind::Any and this crate has no hint to carry. Asserted
+        // rather than skipped: the flag must be a truthful `false`, not a guess that happens to
+        // be right on the other platforms.
+        assert!(
+            !deleted.is_directory,
+            "Windows cannot know the type of a removed entry, so it must not claim to"
+        );
+    }
 }
 
 #[test]
@@ -301,13 +317,21 @@ fn awkward_but_legal_filenames_are_reported() {
     let tree = Tree::new();
     let watcher = watcher_for(&tree, true);
 
-    for name in [
+    let mut names = vec![
         "with spaces.txt",
         "we [ird] (name) {here}.txt",
-        "star*name.txt",
         "dash-heavy--name.txt",
         "..dotted..txt",
-    ] {
+    ];
+    // Legal on Unix, unrepresentable on Windows: the Win32 namespace reserves these outright, so
+    // there is no file here to report and the test would be measuring `create` rather than the
+    // watcher. Kept as a Unix case instead of dropped, because a glob-shaped name reaching a
+    // filter unescaped is a real bug on the platforms that allow one.
+    if cfg!(unix) {
+        names.extend(["star*name.txt", "question?name.txt", "pipe|name.txt"]);
+    }
+
+    for name in names {
         let path = tree.write(name, b"x");
         let events = collect_until(&watcher, DEADLINE, |seen| {
             has_event(seen, &path, EventKind::Created)
