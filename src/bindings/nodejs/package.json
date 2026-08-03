@@ -105,7 +105,7 @@
     "prettier": "^3.9.6",
     "rollup": "^4.62.4",
     "typescript": "^7.0.2",
-    "vite": "^6.4.3",
+    "vite": "^8.2.0",
     "vite7": "npm:vite@^7.3.6",
     "vitest": "^4.1.10",
     "webpack": "^5.109.2"
