@@ -72,7 +72,7 @@ const ASTRO_AVAILABLE = await astroCanLoad();
  * @param {string[]} changes paths the suite is collecting `server.watcher` change events into
  * @returns {Promise<string>} the file contents left on disk once an edit was observed
  */
-async function primeUntilDelivered(page, changes, timeout = 15000) {
+async function primeUntilDelivered(page, changes, timeout = 30000) {
   const deadline = Date.now() + timeout;
   let payload = '';
   for (let attempt = 0; Date.now() < deadline; attempt += 1) {
@@ -103,61 +103,76 @@ afterEach(async () => {
 afterAll(() => cleanupTempDirs());
 
 describe.skipIf(!ASTRO_AVAILABLE)('astro dev server', () => {
-  it('watches through Astro\u2019s Vite layer and detects a real edit', async () => {
-    const { dev } = await import('astro');
-    const project = fixture();
-    const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
+  // Booting a full Astro dev server (Vite optimize, plugin graph) and then waiting for its file
+  // watcher to actually arm can take well past the suite's default 30s on a loaded CI runner --
+  // the second such server in this file has the whole first test's contention behind it. These two
+  // watch-driven cases carry their own generous ceiling so `primeUntilDelivered`'s re-arm loop gets
+  // room to run rather than racing the per-test timeout.
+  const WATCH_TEST_TIMEOUT = 60000;
 
-    const server = await dev({
-      root: project.dir,
-      configFile: false,
-      logLevel: 'silent',
-      server: { port: 0, host: '127.0.0.1' },
-      vite: { plugins: [plugin] },
-    });
-    live.add(server);
+  it(
+    'watches through Astro\u2019s Vite layer and detects a real edit',
+    async () => {
+      const { dev } = await import('astro');
+      const project = fixture();
+      const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
 
-    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started under Astro' });
-    // Astro's own config disables its inline chokidar the same way a plain Vite project's does.
-    expect(server.watcher.constructor.name).toBe('NoopWatcher');
+      const server = await dev({
+        root: project.dir,
+        configFile: false,
+        logLevel: 'silent',
+        server: { port: 0, host: '127.0.0.1' },
+        vite: { plugins: [plugin] },
+      });
+      live.add(server);
 
-    const changes = [];
-    server.watcher.on('change', (file) => changes.push(file));
+      await waitFor(() => plugin.api.isWatching(), { message: 'watcher started under Astro' });
+      // Astro's own config disables its inline chokidar the same way a plain Vite project's does.
+      expect(server.watcher.constructor.name).toBe('NoopWatcher');
 
-    await primeUntilDelivered(project.page, changes);
-  });
+      const changes = [];
+      server.watcher.on('change', (file) => changes.push(file));
 
-  it('suppresses a byte-identical rewrite the same way the plain Vite plugin does', async () => {
-    const { dev } = await import('astro');
-    const project = fixture();
-    const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
+      await primeUntilDelivered(project.page, changes);
+    },
+    WATCH_TEST_TIMEOUT
+  );
 
-    const server = await dev({
-      root: project.dir,
-      configFile: false,
-      logLevel: 'silent',
-      server: { port: 0, host: '127.0.0.1' },
-      vite: { plugins: [plugin] },
-    });
-    live.add(server);
-    await waitFor(() => plugin.api.isWatching(), { message: 'watcher started under Astro' });
+  it(
+    'suppresses a byte-identical rewrite the same way the plain Vite plugin does',
+    async () => {
+      const { dev } = await import('astro');
+      const project = fixture();
+      const plugin = createRetriggerVitePlugin({ engine: 'javascript', debounceMs: 0 });
 
-    const changes = [];
-    server.watcher.on('change', (file) => changes.push(file));
+      const server = await dev({
+        root: project.dir,
+        configFile: false,
+        logLevel: 'silent',
+        server: { port: 0, host: '127.0.0.1' },
+        vite: { plugins: [plugin] },
+      });
+      live.add(server);
+      await waitFor(() => plugin.api.isWatching(), { message: 'watcher started under Astro' });
 
-    const contents = await primeUntilDelivered(project.page, changes);
-    const hashed = () => plugin.api.getStats().watcher.content.filesHashed;
-    await waitForQuiet(hashed, { quietMs: 300, timeout: 3000 });
+      const changes = [];
+      server.watcher.on('change', (file) => changes.push(file));
 
-    const before = changes.length;
-    writeFile(project.page, contents);
-    await waitFor(() => plugin.api.getStats().metrics.eventsUnchanged > 0, {
-      timeout: 10000,
-      message: 'the no-op write was observed and classified',
-    });
-    const after = await waitForQuiet(() => changes.length, { quietMs: 300, timeout: 3000 });
-    expect(after, 'an identical-byte rewrite must not reach server.watcher').toBe(before);
-  });
+      const contents = await primeUntilDelivered(project.page, changes);
+      const hashed = () => plugin.api.getStats().watcher.content.filesHashed;
+      await waitForQuiet(hashed, { quietMs: 300, timeout: 3000 });
+
+      const before = changes.length;
+      writeFile(project.page, contents);
+      await waitFor(() => plugin.api.getStats().metrics.eventsUnchanged > 0, {
+        timeout: 10000,
+        message: 'the no-op write was observed and classified',
+      });
+      const after = await waitForQuiet(() => changes.length, { quietMs: 300, timeout: 3000 });
+      expect(after, 'an identical-byte rewrite must not reach server.watcher').toBe(before);
+    },
+    WATCH_TEST_TIMEOUT
+  );
 
   it('tears down cleanly when Astro stops its dev server', async () => {
     const { dev } = await import('astro');
