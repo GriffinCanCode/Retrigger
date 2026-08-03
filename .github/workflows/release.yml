@@ -116,7 +116,11 @@ jobs:
         include:
           - { host: ubuntu-latest,    target: x86_64-unknown-linux-gnu,   native: true }
           - { host: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu,  native: true }
-          - { host: macos-13,         target: x86_64-apple-darwin,        native: true }
+          # macos-15-intel is the last x86_64 macOS image Actions offers; the
+          # macos-13 labels were retired on 2025-12-04 and a job requesting one
+          # queues forever rather than failing, which would hang the release
+          # with nothing anywhere saying why.
+          - { host: macos-15-intel,   target: x86_64-apple-darwin,        native: true }
           - { host: macos-latest,     target: aarch64-apple-darwin,       native: true }
           - { host: windows-latest,   target: x86_64-pc-windows-msvc,     native: true }
           # No aarch64 Windows runner exists yet, so this one is cross-built
@@ -374,7 +378,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
     steps:
       - uses: actions/setup-node@v7
         with: { node-version: 22 }

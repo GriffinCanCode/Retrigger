@@ -55,7 +55,12 @@ jobs:
           - { name: linux-arm64, os: ubuntu-24.04-arm,  node: 22 }
           - { name: macos-arm64, os: macos-latest,      node: 18 }
           - { name: macos-arm64, os: macos-latest,      node: 22 }
-          - { name: macos-x64,   os: macos-13,          node: 22 }
+          # macos-15-intel, not macos-13: GitHub retired the macOS 13 labels on
+          # 2025-12-04, and a job asking for a retired label is not rejected --
+          # it queues for a machine that will never arrive, so this leg sat
+          # pending through every run and took the all-green gate with it.
+          # This is the last x86_64 macOS image Actions will offer.
+          - { name: macos-x64,   os: macos-15-intel,    node: 22 }
           - { name: windows-x64, os: windows-latest,    node: 20 }
           - { name: windows-x64, os: windows-latest,    node: 22 }
 
