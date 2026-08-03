@@ -30,13 +30,17 @@
  *     wait on; a caller that must not miss the very first change should read
  *     the tree once after `start()` rather than trusting the event stream for
  *     that instant.
- *   - `backend`, `pollCompareContents`, and `atomicWriteNormalization` are
- *     accepted and ignored: this engine has exactly one backend (`fs.watch`),
- *     so there is nothing for a backend selection to choose between, and it
- *     never emits `renamedTo` in the first place (see above), so there is
- *     nothing for atomic-write normalization to fold. `awaitWriteFinish` is
- *     the one option here honestly implemented, on the same single-timer
- *     machinery as `debounceMs`'s trailing correction.
+ *   - `backend` and `pollCompareContents` are accepted and ignored: this engine has exactly one
+ *     backend (`fs.watch`), so there is nothing for a backend selection to choose between.
+ *   - `atomicWriteNormalization` is a best-effort *heuristic* here, not the exact fold the native
+ *     engine performs. `fs.watch` never emits a distinct rename pair (see above), so there is no
+ *     announced `RenamedTo` to fold in the first place; instead, an editor's atomic save (write a
+ *     temp file, `rename` it over the target) surfaces as a `deleted` for the target immediately
+ *     followed by a `created` for the same path once the rename lands. When the option is on, a
+ *     `deleted` is held briefly — see {@link JsWatcher#_holdForAtomicWrite} — and folded into a
+ *     single `modified` if a `created` for the same path arrives before the window closes;
+ *     otherwise the `deleted` is delivered unfolded, just later than it would have been with the
+ *     option off. Off by default, matching the native engine and costing nothing when unset.
  */
 
 const fs = require('fs');
@@ -116,6 +120,26 @@ const DEFAULT_STABILIZE_POLL_MS = 100;
 const DEFAULT_STABILIZE_THRESHOLD_MS = 2000;
 
 /**
+ * Ceiling on paths held in {@link JsWatcher#_pendingUnlinks} for
+ * {@link JsWatcher#atomicWriteNormalization}. Matches {@link STABILIZE_LIMIT}'s reasoning: past
+ * this point a `deleted` is delivered immediately rather than held for a possible fold, which
+ * degrades to "as if the option were unset" for the overflow instead of growing without bound.
+ */
+const UNLINK_FOLD_LIMIT = 4096;
+
+/**
+ * How long a `deleted` is held, waiting for a `created` at the same path, before
+ * {@link JsWatcher#atomicWriteNormalization} gives up and delivers it unfolded.
+ *
+ * Generous rather than tight: `fs.watch`'s own delivery latency (FSEvents batches on macOS in
+ * particular) is itself tens of milliseconds before either half of a pair reaches this engine at
+ * all, so a window sized to the write alone would miss real pairs it exists to catch. A genuine
+ * deletion pays this same latency before being reported, the one cost this heuristic imposes when
+ * it guesses wrong — see {@link JsWatcher#_holdForAtomicWrite}.
+ */
+const ATOMIC_FOLD_WINDOW_MS = 300;
+
+/**
  * Delivered slots tolerated at the front of the queue before it is compacted.
  *
  * The queue is drained from a moving cursor rather than with `shift`, which on a full 8192-event
@@ -171,6 +195,12 @@ class JsWatcher {
     this.matcher = new Matcher({ include: options.include, exclude: options.exclude });
     /** @type {{pollIntervalMs: number, stabilityThresholdMs: number}|null} */
     this.awaitWriteFinish = normaliseAwaitWriteFinish(options.awaitWriteFinish);
+    /**
+     * Whether a `deleted` immediately followed by a `created` for the same path is folded into a
+     * single `modified` — see the class doc comment's honest-heuristic caveat and
+     * {@link JsWatcher#_holdForAtomicWrite}. Off by default, matching the native engine.
+     */
+    this.atomicWriteNormalization = options.atomicWriteNormalization === true;
 
     /** @type {Map<string, {recursive: boolean}>} registered roots */
     this._roots = new Map();
@@ -214,6 +244,14 @@ class JsWatcher {
     this._stabilizing = new Map();
     /** The single timer servicing every path in {@link JsWatcher#_stabilizing}. */
     this._stabilizeTimer = null;
+    /**
+     * `deleted` events held for {@link JsWatcher#atomicWriteNormalization}, awaiting a `created`
+     * at the same path within {@link ATOMIC_FOLD_WINDOW_MS}. `null` until first used.
+     * @type {Map<string, {due: number}>}
+     */
+    this._pendingUnlinks = new Map();
+    /** The single timer servicing every path in {@link JsWatcher#_pendingUnlinks}. */
+    this._unlinkFoldTimer = null;
     /** @type {Array<Error>} */
     this._errors = [];
     /** @type {Map<string, number>} consecutive failed watch attempts, keyed by directory */
@@ -280,10 +318,15 @@ class JsWatcher {
       clearTimeout(this._stabilizeTimer);
       this._stabilizeTimer = null;
     }
+    if (this._unlinkFoldTimer) {
+      clearTimeout(this._unlinkFoldTimer);
+      this._unlinkFoldTimer = null;
+    }
     this._pending.clear();
     // Nothing owed here is ever delivered late: a stopped watcher has no consumer to tell, same as
     // the debounce window above.
     this._stabilizing.clear();
+    this._pendingUnlinks.clear();
     // Replaced rather than truncated so a burst-sized queue is not retained across a restart.
     this._queue = [];
     this._head = 0;
@@ -684,6 +727,26 @@ class JsWatcher {
   _emitIfMatched(target, kind, isDirectory, size) {
     if (!isDirectory && !this.matcher.matches(target)) return;
     if (isDirectory && !this.matcher.allowsDirectory(target)) return;
+    if (this.atomicWriteNormalization && !isDirectory) {
+      // A directory's delete+recreate is not the atomic-save shape this heuristic targets, and
+      // folding one would fight `_reportDirectoryGone`'s own bookkeeping -- see the class doc
+      // comment's caveat on how this differs from the native engine's exact `RenamedTo` fold.
+      if (kind === 'deleted') {
+        if (this._holdForAtomicWrite(target)) return;
+      } else if (this._pendingUnlinks.delete(target)) {
+        kind = 'modified';
+      }
+    }
+    this._deliver(target, kind, isDirectory, size);
+  }
+
+  /**
+   * The tail of {@link JsWatcher#_emitIfMatched}: everything after the atomic-write fold decision
+   * has been made. Split out so {@link JsWatcher#_flushUnlinkFolds} can deliver an unfolded
+   * `deleted` once its hold window closes without re-entering (and re-holding against) the fold
+   * check above.
+   */
+  _deliver(target, kind, isDirectory, size) {
     if (this.awaitWriteFinish) {
       if (kind === 'deleted') {
         // Never held behind a write that will not finish under a name that no longer exists.
@@ -695,6 +758,57 @@ class JsWatcher {
     }
     if (this.debounceMs > 0) this._enqueueDebounced(target, kind, isDirectory, size);
     else this._enqueue(this._makeEvent(target, kind, isDirectory, size));
+  }
+
+  /**
+   * Hold a `deleted` for {@link ATOMIC_FOLD_WINDOW_MS}, betting that it is the first half of an
+   * editor's atomic save rather than a genuine removal.
+   *
+   * This is explicitly a heuristic, not a true rename correlation: `fs.watch` never tells this
+   * engine *why* a path vanished, so a `created` that happens to land at the same path within the
+   * window is indistinguishable from an atomic save's rename landing -- a coincidental delete
+   * immediately followed by an unrelated create of the same name would be folded the same way.
+   * Same trade-off `stabilize.rs` documents for its own heuristic: bounded lookalike behaviour,
+   * not certainty.
+   * @param {string} target
+   * @returns {boolean} whether the delete was held (`false` means deliver it normally: the hold
+   *   list is full)
+   */
+  _holdForAtomicWrite(target) {
+    if (this._pendingUnlinks.size >= UNLINK_FOLD_LIMIT) return false;
+    this._pendingUnlinks.set(target, { due: Date.now() + ATOMIC_FOLD_WINDOW_MS });
+    this._scheduleUnlinkFoldSweep();
+    return true;
+  }
+
+  /** Arm the single timer for the earliest unlink-fold deadline, if not already armed. */
+  _scheduleUnlinkFoldSweep() {
+    if (this._unlinkFoldTimer || this._pendingUnlinks.size === 0) return;
+    const first = this._pendingUnlinks.values().next().value;
+    const delay = Math.max(0, first.due - Date.now());
+    this._unlinkFoldTimer = setTimeout(() => {
+      this._unlinkFoldTimer = null;
+      this._flushUnlinkFolds();
+    }, delay);
+    if (typeof this._unlinkFoldTimer.unref === 'function') this._unlinkFoldTimer.unref();
+  }
+
+  /**
+   * Deliver every held `deleted` whose window has closed without a matching `created` ever
+   * arriving, then re-arm for whatever is left.
+   *
+   * Entries are in deadline order for the same reason {@link JsWatcher#_pending} is: the window
+   * is a fixed duration, so insertion order already is deadline order, and one timer can serve
+   * every held path by only ever looking at the front of the map.
+   */
+  _flushUnlinkFolds() {
+    const now = Date.now();
+    for (const [target, entry] of this._pendingUnlinks) {
+      if (entry.due > now) break;
+      this._pendingUnlinks.delete(target);
+      this._deliver(target, 'deleted', false, 0);
+    }
+    this._scheduleUnlinkFoldSweep();
   }
 
   /**
