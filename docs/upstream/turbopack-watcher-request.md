@@ -11,8 +11,12 @@ no seam a third party can attach to, so Retrigger cannot integrate with
 Turbopack from its own tree at any amount of effort. This is a hard external
 dependency, not schedulable engineering work in this repository.
 
-The request below was filed upstream at
-[`vercel/next.js#96520`](https://github.com/vercel/next.js/issues/96520). The
+The request below was filed upstream as
+[`vercel/next.js` discussion #96540](https://github.com/vercel/next.js/discussions/96540),
+in the **Ideas** category. It was first opened as an issue
+([#96520](https://github.com/vercel/next.js/issues/96520)), but the bug-report
+form is auto-closed by the triage bot for lacking a reproduction — an API/feature
+request has no reproduction, so a Discussion is the venue that stays open. The
 draft is retained here as the record of what was asked for; integration stays
 deferred until one of the seams it requests ships and is documented.
 
