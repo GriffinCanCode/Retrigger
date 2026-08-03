@@ -346,7 +346,7 @@ jobs:
           npm run build -- --target "$TARGET"
           test -f "retrigger-nodejs-bindings.${{ matrix.suffix }}.node"
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
       - name: Execute artifact under QEMU
         run: |
@@ -584,7 +584,7 @@ jobs:
           - { platform: linux/arm/v7,  suffix: linux-arm-gnueabihf }
           - { platform: linux/ppc64le, suffix: linux-ppc64-gnu }
     steps:
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
       - name: Wait for registry propagation
         run: sleep 45
