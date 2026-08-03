@@ -248,7 +248,7 @@ class WatchmanWatcher {
 
     /** @type {Map<string, {recursive: boolean, isDirectory: boolean, watchRoot?: string,
      *   relativePath?: string, clock?: string, subscriptionName?: string,
-     *   pollTimer?: NodeJS.Timeout, attached?: boolean}>} */
+     *   pollTimer?: NodeJS.Timeout, attached?: boolean, attaching?: boolean, generation: number}>} */
     this._roots = new Map();
     this._queue = [];
     this._head = 0;
@@ -284,7 +284,11 @@ class WatchmanWatcher {
       error.code = err.code || 'ENOENT';
       throw error;
     }
-    this._roots.set(abs, { recursive: recursive !== false, isDirectory: stat.isDirectory() });
+    this._roots.set(abs, {
+      recursive: recursive !== false,
+      isDirectory: stat.isDirectory(),
+      generation: 0,
+    });
     if (this._running) this._attachRoot(abs);
   }
 
@@ -308,7 +312,7 @@ class WatchmanWatcher {
 
   stop() {
     this._running = false;
-    for (const [abs, info] of this._roots) this._detachRoot(abs, info, { keepRegistration: true });
+    for (const [abs, info] of this._roots) this._detachRoot(abs, info);
     if (this._transport) {
       this._transport.close();
       this._transport = null;
@@ -516,26 +520,48 @@ class WatchmanWatcher {
 
   async _attachRoot(abs) {
     const info = this._roots.get(abs);
-    if (!info || info.attached) return;
+    if (!info || info.attached || info.attaching) return;
+    info.attaching = true;
+    // Snapshotted so a `stop()` (which bumps this on every root, see `_detachRoot`) that lands
+    // mid-await is detected on resumption even though `_running` alone would miss a stop()
+    // immediately followed by a start() -- the exact shape of a repeated stop/start cycle.
+    const generation = info.generation;
     const watchDir = info.isDirectory ? abs : path.dirname(abs);
     try {
-      const transport = this._transport || (this._transport = this._makeTransport());
-      const { root, relativePath } = await this._watchProject(transport, watchDir);
-      if (!this._roots.has(abs) || !this._running) return; // unwatched/stopped while awaiting
+      if (!this._transport) this._transport = this._makeTransport();
+      const { root, relativePath } = await this._watchProject(this._transport, watchDir);
+      if (!this._roots.has(abs) || !this._running || info.generation !== generation) return;
       info.watchRoot = root;
       info.relativePath = relativePath;
-      const clockResp = await transport.command(['clock', root]);
-      if (!this._roots.has(abs) || !this._running) return;
-      info.clock = clockResp.clock;
+      // A root re-attaching after `stop()` already has a clock -- kept alive by every push/poll
+      // response along the way (see `_subscribe`/`_schedulePoll` below) -- and it must be reused
+      // rather than replaced by a freshly-queried one. `clock` answers "what is Watchman's journal
+      // position right now", and asking it again here would silently adopt a position that is
+      // already past anything that changed in the gap between this root's last `stop()` and this
+      // `start()` -- exactly the gap a fast stop/start cycle (or a write landing right after
+      // `start()` returns, before this async chain resumes) falls into. Reusing the old clock as
+      // `since` instead means the first thing this attachment reports is everything that happened
+      // while nothing was attached, not a fresh "everything from now on".
+      if (!info.clock) {
+        const clockResp = await this._transport.command(['clock', root]);
+        if (!this._roots.has(abs) || !this._running || info.generation !== generation) return;
+        info.clock = clockResp.clock;
+      }
       info.attached = true;
-      if (transport.kind === 'fb-watchman') this._subscribe(abs, info, transport);
-      else this._schedulePoll(abs, info, transport);
+      if (this._transport.kind === 'fb-watchman') this._subscribe(abs, info, this._transport);
+      else this._schedulePoll(abs, info, this._transport);
     } catch (err) {
       this._recordError(err);
+    } finally {
+      // A stale chain (its generation superseded by a `stop()` while it awaited) must not clear
+      // the flag a newer, still-in-flight `_attachRoot` call for the same root set for itself.
+      if (info.generation === generation) info.attaching = false;
     }
   }
 
-  _detachRoot(abs, info, { keepRegistration = false } = {}) {
+  _detachRoot(abs, info) {
+    info.generation += 1;
+    info.attaching = false;
     if (info.pollTimer) {
       clearTimeout(info.pollTimer);
       info.pollTimer = undefined;
@@ -551,12 +577,19 @@ class WatchmanWatcher {
       }
       info.subscriptionName = undefined;
     }
-    if (!keepRegistration) info.attached = false;
+    info.attached = false;
   }
 
   _subscribe(abs, info, transport) {
     const name = `retrigger-${this._subCounter++}`;
     info.subscriptionName = name;
+    // Registered before the `subscribe` command is even sent, not in its resolution handler:
+    // Watchman is free to push the subscription's initial (`since`-based) results before the
+    // command's own acknowledgement reaches this client, and that race is won often enough in
+    // practice -- especially on a re-subscribe right after `watch-project`, with no intervening
+    // `clock` round trip to space the two out -- that waiting for the ack first silently drops
+    // exactly the events a fresh subscription exists to catch up on.
+    this._subsByName.set(name, abs);
     const sub = { expression: ['true'], fields: WATCHMAN_FIELDS, since: info.clock };
     if (info.relativePath) sub.relative_root = info.relativePath;
     transport.onSubscription((resp) => {
@@ -567,10 +600,10 @@ class WatchmanWatcher {
       if (resp.clock) rootInfo.clock = resp.clock;
       this._handleFiles(rootAbs, rootInfo, resp.files || []);
     });
-    transport.command(['subscribe', info.watchRoot, name, sub]).then(
-      () => this._subsByName.set(name, abs),
-      (err) => this._recordError(err)
-    );
+    transport.command(['subscribe', info.watchRoot, name, sub]).catch((err) => {
+      this._subsByName.delete(name);
+      this._recordError(err);
+    });
   }
 
   _schedulePoll(abs, info, transport) {
