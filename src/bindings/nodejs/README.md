@@ -587,7 +587,10 @@ aspirational coverage.
 | `powerpc64le-unknown-linux-gnu` | `linux-ppc64-gnu`     | Cross-built, executed under QEMU                             |
 
 Linux gnu/musl: the loader detects libc and tries the other build if it guesses wrong.
-FreeBSD uses kqueue. The JavaScript engine works on every platform Node supports.
+On FreeBSD the native engine re-scans on an interval (`backend()` reports `"polling"`)
+rather than using `kqueue`, whose recursive mode does not reliably observe directories
+created after the watch begins; every other platform uses its native OS backend. The
+JavaScript engine works on every platform Node supports.
 
 ## Who Should Not Be Here
 

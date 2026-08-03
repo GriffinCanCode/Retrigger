@@ -41,10 +41,22 @@ const SYNTH_DEDUPE_WINDOW: Duration = Duration::from_secs(3);
 /// Upper bound on the preallocated broadcast ring, independent of queue capacity.
 const BROADCAST_CAPACITY_LIMIT: usize = 1024;
 
+/// Whether `BackendMode::Auto` resolves to polling rather than the `notify`-recommended native
+/// backend on this platform. True only on FreeBSD: its `kqueue` backend registers a descriptor per
+/// entry at attach time and does not reliably observe directories created afterwards, so a subtree
+/// that appears mid-watch goes unseen. Polling re-scans and always finds it. A compile-time
+/// constant so every other platform is byte-for-byte unchanged.
+const AUTO_PREFERS_POLL: bool = cfg!(target_os = "freebsd");
+
+/// How often `Auto` re-scans where it resolves to polling (see [`AUTO_PREFERS_POLL`]). Fast enough
+/// that a dev-server edit is seen within a frame or two, slow enough that walking a small tree four
+/// times a second is not a CPU concern.
+const AUTO_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Which backend a given [`BackendMode`] resolves to. Fixed given `mode`, so it is knowable
 /// before a watcher starts and cheap enough to ask repeatedly.
 fn effective_backend(mode: &BackendMode) -> Backend {
-    if matches!(mode, BackendMode::Poll { .. }) {
+    if matches!(mode, BackendMode::Poll { .. }) || AUTO_PREFERS_POLL {
         return Backend::Polling;
     }
     match <RecommendedWatcher as NotifyWatcher>::kind() {
@@ -925,6 +937,16 @@ impl Watcher {
             .with_follow_symlinks(self.core.config.follow_symlinks)
             .with_poll_interval(Duration::from_secs(1));
         let mut active = match self.core.config.backend {
+            // `Auto` takes the native backend `notify` recommends, except where the platform's
+            // native recursion is unsound: FreeBSD's `kqueue` misses directories created after the
+            // watch starts (see `AUTO_PREFERS_POLL`), so there it resolves to polling instead. The
+            // branch is a compile-time constant, so no other platform pays for the check.
+            BackendMode::Auto if AUTO_PREFERS_POLL => {
+                let poll_config = notify_config.with_poll_interval(AUTO_POLL_INTERVAL);
+                let watcher = PollWatcher::new(move |res| core.ingest(res), poll_config)
+                    .map_err(WatchError::Backend)?;
+                ActiveBackend::Poll(watcher)
+            }
             BackendMode::Auto => {
                 let watcher = RecommendedWatcher::new(move |res| core.ingest(res), notify_config)
                     .map_err(WatchError::Backend)?;
@@ -1543,7 +1565,15 @@ mod tests {
         assert_eq!(backend, Backend::Inotify);
         #[cfg(target_os = "windows")]
         assert_eq!(backend, Backend::ReadDirectoryChangesW);
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        // FreeBSD's `Auto` resolves to polling, not its native `kqueue` (see `AUTO_PREFERS_POLL`).
+        #[cfg(target_os = "freebsd")]
+        assert_eq!(backend, Backend::Polling);
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "freebsd"
+        )))]
         let _ = backend;
     }
 
