@@ -84,6 +84,14 @@ const PENDING_LIMIT = 4096;
  */
 const QUEUE_COMPACT_THRESHOLD = 1024;
 
+/**
+ * Consecutive failures a single directory's watch may be re-armed through.
+ *
+ * Small on purpose: this exists to ride out transient faults, and a directory that raises an error
+ * every time it is watched is reporting a condition retrying cannot fix.
+ */
+const REARM_LIMIT = 5;
+
 class JsWatcher {
   /**
    * @param {{capacity?: number, debounceMs?: number, include?: string[], exclude?: string[]}} [options]
@@ -133,6 +141,8 @@ class JsWatcher {
     this._sweep = null;
     /** @type {Array<Error>} */
     this._errors = [];
+    /** @type {Map<string, number>} consecutive failed watch attempts, keyed by directory */
+    this._rearms = new Map();
     this._notifier = null;
     this._running = false;
     this._overflowed = false;
@@ -197,6 +207,7 @@ class JsWatcher {
     this._head = 0;
     this._known.clear();
     this._knownDirs.clear();
+    this._rearms.clear();
     this._overflowed = false;
   }
 
@@ -331,9 +342,34 @@ class JsWatcher {
     watcher.on('error', (err) => {
       this._recordError(err);
       this._closeDir(dir);
+      this._rearmAfterError(dir);
     });
     this._dirWatchers.set(dir, watcher);
     this._knownDirs.add(dir);
+  }
+
+  /**
+   * Re-attach a directory whose watch reported an error, and declare the gap.
+   *
+   * Abandoning it is what the code did before, and on Windows that is the difference between a
+   * momentary fault and a watcher that is still running, still reports itself healthy, and never
+   * speaks again: the directory handle raises a one-shot error for conditions that pass — a churn
+   * large enough to overrun the notification buffer, a sharing violation from an indexer — and
+   * every change after it went unseen. Bounded, so a directory that fails every time is not
+   * retried forever.
+   * @param {string} dir
+   */
+  _rearmAfterError(dir) {
+    if (!this._running) return;
+    const attempts = (this._rearms.get(dir) || 0) + 1;
+    if (attempts > REARM_LIMIT) return;
+    this._rearms.set(dir, attempts);
+    if (!fs.existsSync(dir)) return;
+    this._watchDirectory(dir);
+    if (!this._dirWatchers.has(dir)) return;
+    // Whatever happened while the directory was unwatched was not observed, and cannot be
+    // enumerated after the fact, so the gap is declared rather than passed off as quiet.
+    this._enqueue(this._makeEvent('', 'rescanRequired', false, 0));
   }
 
   _closeDir(dir) {
@@ -355,6 +391,9 @@ class JsWatcher {
    */
   _onRawEvent(dir, eventType, filename) {
     if (!this._running) return;
+    // A directory that is delivering again has spent its failures; the ceiling is on consecutive
+    // faults, not on how many a long-lived watch may survive in total.
+    if (this._rearms.size) this._rearms.delete(dir);
     if (!filename) {
       // Some platforms omit the filename; the directory itself changed.
       this._enqueueDebounced(dir, 'modified', true, 0);

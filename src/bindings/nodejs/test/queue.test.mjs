@@ -133,7 +133,13 @@ describe('bounded queue under real filesystem pressure', () => {
         fs.writeFileSync(path.join(dir, `f${i}.js`), String(i));
       }
       await waitFor(() => watcher.stats().eventsDropped > 0, {
-        message: `queue never overflowed (stats=${JSON.stringify(watcher.stats())})`,
+        // Built at failure time and including what the watcher itself saw: a stats block of zeroes
+        // says only that nothing arrived, and cannot distinguish a queue that never filled from a
+        // directory watch that died and took the event stream with it.
+        message: () =>
+          `queue never overflowed (stats=${JSON.stringify(watcher.stats())}, ` +
+          `openDirs=${watcher.openDirectoryCount}, ` +
+          `errors=${JSON.stringify(watcher.drainErrors().map((e) => `${e.code || '?'}: ${e.message}`))})`,
       });
       const stats = watcher.stats();
       expect(stats.eventsDropped).toBeGreaterThan(0);
@@ -142,6 +148,66 @@ describe('bounded queue under real filesystem pressure', () => {
       const kinds = [];
       for (let event = watcher.poll(); event; event = watcher.poll()) kinds.push(event.kind);
       expect(kinds).toContain('rescanRequired');
+    } finally {
+      watcher.stop();
+    }
+  });
+
+  /**
+   * White-box for the same reason the overflow tests above are: the fault being modelled is a
+   * one-shot error raised on a directory handle, which Windows produces under conditions no test
+   * can ask for on demand and the other platforms do not produce at all. Emitting it directly is
+   * the only way to hold every platform to the same answer.
+   */
+  it('re-arms a directory watch that faulted, and declares the gap', async () => {
+    const dir = tempDir();
+    const watcher = new JsWatcher({ capacity: 64 });
+    watcher.watch(dir, true);
+    watcher.start();
+    try {
+      expect(watcher.openDirectoryCount).toBe(1);
+      const faulted = watcher._dirWatchers.get(dir);
+      faulted.emit('error', Object.assign(new Error('handle fell over'), { code: 'EPERM' }));
+
+      expect(watcher.openDirectoryCount, 'the directory must be watched again').toBe(1);
+      const kinds = [];
+      for (let event = watcher.poll(); event; event = watcher.poll()) kinds.push(event.kind);
+      expect(kinds, 'changes during the gap were unobservable, so a rescan is owed').toContain(
+        'rescanRequired'
+      );
+
+      // The point of re-arming: the stream is still live afterwards.
+      fs.writeFileSync(path.join(dir, 'after-the-fault.js'), 'x');
+      await waitFor(
+        () => {
+          for (let event = watcher.poll(); event; event = watcher.poll()) {
+            if (event.path.endsWith('after-the-fault.js')) return true;
+          }
+          return false;
+        },
+        { message: 'nothing was reported after the watch was re-armed' }
+      );
+    } finally {
+      watcher.stop();
+    }
+  });
+
+  it('stops re-arming a directory whose watch fails every time', () => {
+    const dir = tempDir();
+    const watcher = new JsWatcher({ capacity: 64 });
+    watcher.watch(dir, true);
+    watcher.start();
+    try {
+      // One more than the ceiling, so the last attempt is the one that must not happen.
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const current = watcher._dirWatchers.get(dir);
+        if (!current) break;
+        current.emit('error', new Error('fails every time'));
+      }
+      expect(
+        watcher.openDirectoryCount,
+        'a directory that cannot be watched must not be retried forever'
+      ).toBe(0);
     } finally {
       watcher.stop();
     }
