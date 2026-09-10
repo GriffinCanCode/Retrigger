@@ -98,7 +98,7 @@
     "@rspack/core": "^2.1.7",
     "@types/node": "^20.19.17",
     "@vitest/coverage-v8": "^4.1.10",
-    "astro": "^7.1.6",
+    "astro": "^7.2.8",
     "chokidar": "^5.0.0",
     "esbuild": "^0.25.12",
     "fast-check": "^4.9.0",
