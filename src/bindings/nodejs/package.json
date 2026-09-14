@@ -94,21 +94,21 @@
     "version": "napi version"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.8.2",
-    "@rspack/core": "^2.1.7",
+    "@napi-rs/cli": "^3.9.1",
+    "@rspack/core": "^2.2.3",
     "@types/node": "^20.19.17",
     "@vitest/coverage-v8": "^4.1.10",
-    "astro": "^7.1.6",
+    "astro": "^7.3.2",
     "chokidar": "^5.0.0",
-    "esbuild": "^0.25.12",
-    "fast-check": "^4.9.0",
+    "esbuild": "^0.28.2",
+    "fast-check": "^4.10.0",
     "prettier": "^3.9.6",
-    "rollup": "^4.62.4",
+    "rollup": "^4.63.1",
     "typescript": "^7.0.2",
     "vite": "^6.4.3",
     "vite7": "npm:vite@^7.3.6",
     "vitest": "^4.1.10",
-    "webpack": "^5.109.2"
+    "webpack": "^5.110.3"
   },
   "optionalDependencies": {
     "@retrigger/core-darwin-arm64": "2.0.0",
