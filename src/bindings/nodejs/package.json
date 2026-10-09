@@ -91,7 +91,8 @@
     "test:rspack": "node scripts/test-rspack.js",
     "test:pack": "node scripts/verify-package.js",
     "test:all": "npm run test && npm run test:pack",
-    "version": "napi version"
+    "version": "napi version",
+    "test:vite8": "vitest run --config vitest.vite8.config.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.10.4",
@@ -105,10 +106,11 @@
     "prettier": "^3.9.8",
     "rollup": "^4.63.3",
     "typescript": "^7.0.2",
-    "vite": "^8.2.0",
+    "vite": "^6.4.3",
     "vite7": "npm:vite@^7.3.6",
     "vitest": "^4.1.11",
-    "webpack": "^5.111.1"
+    "webpack": "^5.111.1",
+    "vite8": "npm:vite@^8.2.0"
   },
   "optionalDependencies": {
     "@retrigger/core-darwin-arm64": "2.0.0",

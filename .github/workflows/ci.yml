@@ -243,6 +243,9 @@ jobs:
       - name: vite@7
         run: npm run test:vite7
         working-directory: src/bindings/nodejs
+      - name: vite@8
+        run: npm run test:vite8
+        working-directory: src/bindings/nodejs
       - name: Rspack
         run: npm run test:rspack
         working-directory: src/bindings/nodejs
