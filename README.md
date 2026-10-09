@@ -48,8 +48,9 @@ npm install @retrigger/core
 
 Each layer below does one job.
 
-- **`src/core`** — C implementing XXH3-64 with runtime SIMD dispatch across AVX2, SSE2,
-  NEON and scalar.
+- **`src/core`** — C implementing XXH3-64 with runtime SIMD dispatch across AVX-512, AVX2,
+  SSE2, NEON and scalar. The kernel is chosen from `cpuid`/`xgetbv` at first use, and only
+  kernels the architecture can host are compiled in at all.
 - **`src/daemon/retrigger-core`** — Rust wrapping the C engine in FFI, with layout
   assertions on both sides.
 - **`src/daemon/retrigger-system`** — Rust carrying the watcher itself, reaching inotify,
@@ -58,6 +59,8 @@ Each layer below does one job.
   speaks HTTP/JSON and SSE.
 - **`src/bindings/nodejs`** — Rust and JavaScript together, carrying the N-API addon, the
   bundler plugins, and the JavaScript fallback engine.
+- **`src/bindings/nodejs/wasm-xxh3`** — Rust compiled to a prebuilt WebAssembly module, so
+  the JavaScript fallback hashes with the same algorithm rather than a lookalike.
 
 Watching happens in-process by default.
 
@@ -118,6 +121,14 @@ algorithm through a prebuilt WebAssembly module rather than a different one, so 
 engine is comparable to a digest from the other. `getEngineInfo().hashAlgorithm` says which engine
 you have, but both report `"xxh3-64"`.
 
+A file system that misbehaves has controls too, each off until asked for: `backend: { mode:
+'poll' }` for network mounts whose kernel events cannot be trusted, with `compareContents` to
+hash on every poll and catch a same-size, same-mtime rewrite; `awaitWriteFinish` to hold a path
+until its size and modification time stop moving; and `atomicWriteNormalization` to fold an
+editor's write-temp-then-rename into one `change`. For a process that was not running to see the
+events at all, `snapshot()` inventories a tree and `Retrigger.diffSnapshots()` recovers what
+changed between two inventories.
+
 ### Bundler Plugins
 
 webpack takes the plugin as a constructor from the `@retrigger/core/webpack` subpath.
@@ -163,7 +174,7 @@ The failure mode this package works hardest to avoid is an install that throws.
   line, and keeps going.
   `RETRIGGER_SILENT=1` suppresses it, and `getEngineInfo().nativeAttempts` explains what
   was tried and why each candidate was rejected.
-- **No runtime dependencies** — the published tarball is 90.2 KiB across 34 entries and
+- **No runtime dependencies** — the published tarball is 96.5 KiB across 34 entries and
   contains no native binary. The addon arrives through one of eleven platform packages
   listed as `optionalDependencies`, so a platform without one degrades instead of failing.
 - **Both engines are held to one test suite** — the JavaScript fallback, a mock addon, and
@@ -214,10 +225,16 @@ point.
 
 ### Supporting scenarios
 
-Also measured on the same machine class:
+Also measured on the same machine class, in one run of `npm run bench:scenarios`:
 
-- Snapshot crawl of **2,000** files in ~6.3 ms
-- Event storm of **2,000** writes — **0** events dropped
+- Snapshot crawl of a **2,000**-file tree (2,081 entries with directories) in ~7.2 ms, and of
+  a **10,160**-file monorepo (12,321 entries, nested `src/`+`test/` across 80 packages) in
+  ~65 ms
+- Event storm of **2,000** writes with **0** dropped — on the 2,000-file tree, on the
+  10,160-file monorepo, and through the polling backend as well
+- The chokidar-compatible adapter reaches `ready` on that tree in ~21 ms where chokidar itself
+  takes ~125 ms, at ~64 MB peak RSS against ~106 MB — the same 200-write storm delivered
+  completely by both
 - Peak RSS in the webpack rebuild lab ~151 MB
 
 ### Hash throughput (supporting)
@@ -248,7 +265,8 @@ and `linux/x86-64`.
 - **C under ASan/UBSan** — passes on both.
 - **Rust workspace** — passes on both.
 - **Native addon artifact** — passes on both.
-- **JavaScript, 389 tests** — passes on both.
+- **JavaScript, 434 tests** — passes on both; the cases that do not apply to the platform
+  skip rather than being counted as proof.
 - **Packaged install, 15 checks** — passes on both.
 
 The C suite runs a differential test that hashes the same inputs through every SIMD level
@@ -264,6 +282,28 @@ one suite runs against the compiled addon, a mock addon, and the JavaScript engi
 that all three agree on which writes changed a file's bytes, and a separate cross-engine suite
 hashes a shared corpus through both real engines and asserts the digests themselves are equal,
 byte for byte — not merely that each engine agrees with its own earlier digest.
+
+### What every push is held to
+
+CI runs more than the suites above, on every push and every pull request, with no leg
+allowed to be skipped or estimated.
+
+- **Both engines, separately** — one leg deletes the native artifacts and requires the whole
+  suite to pass with no addon present at all; another forces the fallback's alternate
+  one-watch-per-tree strategy, so the degraded path is exercised rather than assumed.
+- **Real bundlers, not mocks** — a leg boots vite@7, Rspack, and an Astro dev server against
+  the plugins.
+- **Real Watchman** — the Linux legs install Watchman and the `fb-watchman` client, so the
+  optional third engine's suite runs against the live service instead of skipping itself.
+- **musl as well as glibc** — a `linux-x64-musl` leg builds and tests on Alpine.
+- **The Rust floor** — a leg reads `rust-version` from the workspace manifest and builds with
+  exactly that toolchain, so 1.88 is enforced rather than aspirational.
+- **Sanitizers, and fuzz targets that still compile** — the C engine under ASan/UBSan on every
+  push, not only during a campaign.
+- **Dependencies** — `cargo audit` and `npm audit`.
+- **Node 18, 20 and 22 across five OS/arch legs, plus FreeBSD** — the version floor is tested
+  rather than declared. Windows runs 20 and 22; see
+  [the package README's limitations](src/bindings/nodejs/README.md#known-limitations).
 
 ### Adversarial suites and campaigns
 
@@ -318,8 +358,10 @@ It speaks HTTP with JSON bodies and streams events over SSE, including
 `retrigger validate` checks a config file before the daemon tries to run it, and
 `retrigger status` reports on a running one.
 
-The npm package ships a launcher that resolves the binary from a platform package, and
-explains how to build from source when none exists rather than failing the install.
+The npm package ships a launcher that resolves the binary from a platform package or from the
+package's own `bin/`, and explains how to build from source when neither exists rather than
+failing the install. Building from source is the path today: no daemon platform package is
+published yet. See [the daemon README](src/daemon/README.md#installation).
 
 ## Building from Source
 

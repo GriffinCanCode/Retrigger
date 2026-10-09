@@ -134,8 +134,10 @@ cd tools/benchmarks && npm install && npm run bench:all
 **Honesty — raw watch latency trails Chokidar** (same-run p50): Chokidar ~0.31 ms vs
 Retrigger ~11.80 ms. A few milliseconds of per-event latency buys skipping entire rebuilds.
 
-Supporting: snapshot crawl of 2,000 files in ~6.3 ms; storm of 2,000 writes with 0 dropped;
-peak RSS in the webpack rebuild lab ~151 MB.
+Supporting, from one `bench:scenarios` run: snapshot crawl of a 2,000-file tree in ~7.2 ms and
+of a 10,160-file monorepo in ~65 ms; storms of 2,000 writes with 0 dropped on both trees and
+through the polling backend; the chokidar adapter ready in ~21 ms where chokidar itself takes
+~125 ms (~64 MB peak RSS against ~106 MB); peak RSS in the webpack rebuild lab ~151 MB.
 
 ## Which Engine Am I Running?
 
@@ -187,7 +189,7 @@ Hashes are canonically comparable across engines: both compute XXH3-64, so the s
 the same seed produce the same 16-character digest whichever engine ran.
 
 The native engine calls the C engine directly; the JavaScript fallback calls the same XXH3-64
-implementation compiled ahead of time to a ~16 KB WebAssembly module (`lib/xxh3.wasm`, built
+implementation compiled ahead of time to a 20 KB WebAssembly module (`lib/xxh3.wasm`, built
 from the `xxhash-rust` crate, matching official reference vectors — see `hash.test.mjs`), rather
 than a hand-written, roughly two-orders-of-magnitude-slower BigInt reimplementation, or a
 plausible-looking near-miss with a different algorithm. `require()` never touches a toolchain:
@@ -250,6 +252,39 @@ Twelve exports make up the API.
 - **`getEngineInfo()`** — a function reporting which engine you got, and why.
 - **`RetriggerWebpackPlugin`** — a class implementing the webpack 5 plugin.
 - **`createRetriggerVitePlugin(options?)`** — a function returning the Vite 5/6/7 plugin.
+
+Three further integrations are reachable only as subpaths, because each pulls in a seam the
+core does not need: `@retrigger/core/rollup`, `@retrigger/core/esbuild`, and
+`@retrigger/core/chokidar`. Each has its own section below. `./webpack` and `./vite` mirror
+the two plugins already listed, for importing one without loading the other.
+
+### Instance Methods
+
+A `Retrigger` carries the watch, the digest cache, and the counters, so everything below
+reads or moves that one state.
+
+- **`start()` / `stop()` / `close()`** — each returns `this`; `stop()` and `close()` are safe
+  to call repeatedly and before `start()`.
+- **`isRunning`** — a getter, not a method.
+- **`add(target, recursive?)`** — registers another root after construction; `watch()` is an
+  alias.
+- **`unwatch(target)`** — drops a root and forgets its cached digests.
+- **`snapshot(target)`** / **`watchWithSnapshot(target, recursive?)`** — see
+  [Snapshots / Change-Since](#snapshots--change-since).
+- **`Retrigger.diffSnapshots(oldEntries, newEntries)`** — static, because comparing two
+  snapshots needs no watcher.
+- **`getStats()`** — the queue counters, `content` (digest-cache totals), `metrics`, and the
+  async-hash gauges in one object.
+- **`hasContentChanged(target, kind?)`** — asks this watcher's digest cache whether a path
+  _another_ watcher reported really changed. This is what makes a second, un-disableable
+  watcher (Vite's own chokidar under `legacyWatcher: true`) idempotent with Retrigger rather
+  than merely redundant: whichever source sees the write first records the digest, and the
+  other is then told `false`. Answers `true` whenever it cannot tell, and `true`
+  unconditionally when `contentHashing` is off, because a redundant rebuild is the cheaper
+  mistake.
+- **`getEngineInfo()`** / **`getSimdLevel()`** — the module-level answers, from the instance.
+- **`changesSince(target, clock)`** — Watchman engine only; see
+  [Watchman Engine](#watchman-engine-optional).
 
 ### Watcher Options
 
@@ -504,6 +539,26 @@ const snap = await watcher.watchWithSnapshot('./src');
 // snap.entries, snap.algorithm ('xxh3-64'), …
 ```
 
+`Retrigger.diffSnapshots(oldEntries, newEntries)` recovers what changed between two of those
+envelopes, in the same event vocabulary `on('all', …)` reports: a path only in the new
+entries is `created`, one only in the old is `deleted`, one in both is `modified` when its
+size or `modifiedNs` differs and silent when they agree. It answers the question a restarted
+process cannot answer from events it was not running to receive.
+
+```javascript
+const before = JSON.parse(await fs.readFile('snapshot.json', 'utf8')); // persisted last run
+const after = await watcher.snapshot('./src');
+for (const event of Retrigger.diffSnapshots(before.entries, after.entries)) {
+  console.log(event.kind, event.path); // 'created' | 'modified' | 'deleted'
+}
+```
+
+It is static because the comparison is pure data — no watcher, no watch, no I/O. When the
+native addon is loaded it calls that addon's own implementation, so there is one
+classification code path and no drift risk between engines; without an addon an equivalent
+pure-JavaScript comparison runs instead. Either way it accepts snapshots from either engine,
+including ones persisted by the other.
+
 The optional daemon exposes the same inventory over `GET /snapshot`. With
 `engine: 'watchman'`, `changesSince(path, clock)` adds Watchman clock-backed deltas (see
 below).
@@ -519,6 +574,13 @@ JavaScript.
 const watcher = createRetrigger({ paths: ['./src'], engine: 'watchman' });
 ```
 
+One contract detail differs under it, because Watchman settles before it speaks: a burst that
+[`debounceMs`](#how-debouncems-behaves) would absorb can be coalesced by Watchman's own settle
+period first, so the leading event already describes the settled file and no correction follows
+it. Nothing is lost either way — whichever event arrives last describes the file as the writes
+left it — but the two-wake-up shape the native and JavaScript engines guarantee is not
+guaranteed here.
+
 If neither the optional [`fb-watchman`](https://www.npmjs.com/package/fb-watchman) client nor
 the `watchman` binary on `PATH` is available, this falls back to the native → JavaScript path
 with one documented warning line (suppressed by `RETRIGGER_SILENT=1`, same as the native
@@ -526,8 +588,8 @@ fallback). `getEngineInfo().watchman` reports `{ available, kind: 'fb-watchman' 
 reason }` unconditionally, whether or not you asked for Watchman.
 
 Beyond the shared engine contract, a Watchman-backed watcher exposes one Watchman-specific
-method for change-since queries backed by Watchman's own clock, complementing Lane 2's
-walk-based `snapshot()`/`diff_snapshots()`:
+method for change-since queries backed by Watchman's own clock, complementing the walk-based
+`snapshot()` / `Retrigger.diffSnapshots()` pair every engine has:
 
 ```javascript
 const first = await watcher.snapshot('./src'); // establishes a Watchman clockspec
@@ -551,19 +613,19 @@ watcher.on('ready', () => console.log('initial scan complete'));
 ```
 
 It supports `add()`/`unwatch()` (both array-accepting), `getWatched()`, the `all`/`ready`/`error`
-events, and the options `ignored`, `ignoreInitial`, `cwd`, `awaitWriteFinish` (mapped to Lane 1's
-stabilizer), `followSymlinks`, and `atomic` (mapped to Lane 1's atomic-write normalization; unlike
-`Retrigger` itself, this adapter defaults `atomic: true` to match real chokidar). It also accepts
-Retrigger's own `contentHashing` for no-op-write suppression, which real chokidar has no
-equivalent for.
+events, and the options `ignored`, `ignoreInitial`, `cwd`, `awaitWriteFinish` (mapped to the
+watcher's own write stabilizer), `followSymlinks`, and `atomic` (mapped to
+`atomicWriteNormalization`; unlike `Retrigger` itself, this adapter defaults `atomic: true` to
+match real chokidar). It also accepts Retrigger's own `contentHashing` for no-op-write
+suppression, which real chokidar has no equivalent for.
 
 Documented divergences from real chokidar:
 
 - No glob support inside `add()` — pass concrete paths or directories, same as `Retrigger`.
 - No `raw` event; nothing here fabricates chokidar's internal `fs.watch` event names.
-- `awaitWriteFinish`'s `pollInterval`/`stabilityThreshold` map onto Lane 1's own stabilizer
-  rather than a re-implementation, so timing characteristics track that stabilizer, not
-  chokidar's.
+- `awaitWriteFinish`'s `pollInterval`/`stabilityThreshold` map onto this package's own
+  stabilizer rather than a re-implementation, so timing characteristics track that stabilizer,
+  not chokidar's.
 
 ## Requirements
 

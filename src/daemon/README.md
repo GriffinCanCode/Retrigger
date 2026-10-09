@@ -6,8 +6,8 @@
 [![license](https://img.shields.io/npm/l/@retrigger/daemon.svg)](https://github.com/GriffinCanCode/Retrigger/blob/main/LICENSE)
 
 One file watcher, shared by several processes, over a small HTTP API — a JSON
-request/response surface, a server-sent event stream of changes, and Prometheus metrics,
-all on one port.
+request/response surface, a server-sent event stream of changes, a point-in-time inventory of
+any tree it can read, and Prometheus metrics, all on one port.
 
 Under the hood it is the same two crates `@retrigger/core` uses: `retrigger-system` for
 watching (inotify on Linux, FSEvents on macOS, `ReadDirectoryChangesW` on Windows) and
@@ -46,9 +46,18 @@ Installing globally puts the `retrigger` command on your path.
 npm install -g @retrigger/daemon   # installs the `retrigger` command
 ```
 
-The binary is downloaded as an optional platform package
-(`@retrigger/daemon-darwin-arm64` and friends). If none matches your platform, nothing
-here works and `@retrigger/core` should be used on its own.
+The launcher looks for the binary in a platform package (`@retrigger/daemon-darwin-arm64`
+and friends, declared as `optionalDependencies`), then in this package's own `bin/`. No
+platform package is published yet — the release workflow builds and publishes
+`@retrigger/core`'s addons, not the daemon's binaries — so today the binary comes from
+source:
+
+```bash
+cargo install --git https://github.com/GriffinCanCode/Retrigger retrigger-daemon
+```
+
+The install itself never fails either way: a missing binary prints what was looked for and
+how to build it, because `@retrigger/core` watches in-process and needs nothing from here.
 
 ## Quick Start
 
@@ -116,16 +125,22 @@ Everything the daemon exposes is on one port (`9090` by default, loopback only).
 - **`GET /status`** — returns everything `retrigger status --json` prints.
 - **`GET /metrics`** — returns the same numbers in Prometheus exposition format.
 - **`GET /events`** — returns a server-sent stream of processed events.
+- **`GET /snapshot?path=/srv/app`** — returns a self-describing inventory of that tree right
+  now: `{"algorithm":"xxh3-64","version":…,"entries":[{"path":…,"is_directory":…,"size":…,
+  "modified_ns":…}, …]}`. The same envelope `@retrigger/core`'s in-process `snapshot()`
+  returns, so one is comparable to the other and both are safe to persist as JSON —
+  `algorithm` and `version` are what let a reader tell whether a stored snapshot still
+  matches. Nothing is registered, so polling it is exactly as safe as calling it once.
 - **`POST /watch`** — takes `{"path": "/srv/app", "recursive": true}` and adds a root at
   runtime.
 - **`POST /unwatch`** — takes `{"path": "/srv/app"}` and removes one, dropping its cached
   fingerprints.
 - **`POST /shutdown`** — shuts down gracefully, and is what `retrigger stop` calls.
 
-A path sent to `/watch` or `/unwatch` must be absolute and must name its target directly: a
-`.` or `..` component earns a 400 rather than being resolved. This is a rule about how a
-request is phrased, not a confinement boundary — any absolute path the daemon's user can read
-is still watchable, so keep the bind address in mind. Roots configured in
+A path sent to `/watch`, `/unwatch` or `/snapshot` must be absolute and must name its target
+directly: a `.` or `..` component earns a 400 rather than being resolved. This is a rule about
+how a request is phrased, not a confinement boundary — any absolute path the daemon's user can
+read is still watchable, so keep the bind address in mind. Roots configured in
 `[[watcher.paths]]` are resolved relative to the working directory as before; the rule applies
 only to what arrives over the network.
 
@@ -181,10 +196,28 @@ debounce_ms = 50             # leading-edge coalescing window; 0 disables it
 follow_symlinks = true
 hash_cache_size = 100000     # hard ceiling on cached content fingerprints
 hash_cache_ttl_secs = 3600
+atomic_write_normalization = false  # fold an editor's write-temp-then-rename into one Modified
+
+# How events are delivered. "poll" is for network and remote file systems whose kernel
+# watch events cannot be trusted (NFS and friends).
+[watcher.backend]
+mode = "auto"                # auto | poll
+poll_interval_ms = 1000      # only read when mode = "poll"
+poll_compare_contents = false # hash on each poll, catching a same-size same-mtime rewrite
+
+# Hold a changed file until its size and mtime stop moving, so a chunked or
+# network-copied write is reported once, complete, instead of mid-flight.
+[watcher.await_write_finish]
+enabled = false
+poll_interval_ms = 100
+stability_threshold_ms = 2000
 
 [patterns]
 include = []                 # empty means "no restriction"
-exclude = ["**/node_modules/**", "**/.git/**", "**/target/**", "**/dist/**"]
+exclude = [                  # build output and editor litter, excluded by default
+  "**/node_modules/**", "**/.git/**", "**/target/**", "**/dist/**", "**/.next/**",
+  "**/*.tmp", "**/*.swp", "**/*~", "**/.DS_Store",
+]
 
 [logging]
 level = "info"               # error | warn | debug | trace; RUST_LOG overrides this
