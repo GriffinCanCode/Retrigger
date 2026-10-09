@@ -9,7 +9,7 @@
 # Build from the repository root so the context contains src/:
 #   docker build -f deploy/docker/Dockerfile -t retrigger .
 
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:26.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -32,7 +32,7 @@ ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 RUN cargo build --release --bin retrigger \
     && ./target/release/retrigger --version
 
-FROM ubuntu:24.04 AS runtime
+FROM ubuntu:26.04 AS runtime
 LABEL maintainer="Retrigger Team"
 LABEL description="Ultra-fast file system watcher with native performance"
 
