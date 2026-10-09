@@ -368,6 +368,10 @@ pub struct SubscriberGuard {
 }
 
 impl Drop for SubscriberGuard {
+    #[allow(
+        deprecated,
+        reason = "fetch_update supports the declared Rust 1.88 floor"
+    )]
     fn drop(&mut self) {
         // Saturating rather than wrapping: an underflow here would report billions of
         // subscribers, which is a worse lie than an undercount.

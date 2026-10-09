@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn identical_snapshots_produce_no_events() {
         let snap = vec![entry("/a", false, 4, 1), entry("/b", true, 0, 2)];
-        assert!(diff_snapshots(&snap, &snap.clone()).is_empty());
+        assert_eq!(diff_snapshots(&snap, &snap.clone()).len(), 0);
     }
 
     #[test]

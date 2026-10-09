@@ -698,7 +698,7 @@ mod tests {
             reconcile(watcher.core_for_test(), &root.join("gone"), 64),
             Outcome::Vanished
         );
-        assert!(paths(&watcher).is_empty());
+        assert_eq!(paths(&watcher).len(), 0);
     }
 
     #[test]

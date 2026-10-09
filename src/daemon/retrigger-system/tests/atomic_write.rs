@@ -57,7 +57,8 @@ fn atomic_write_normalization_folds_a_real_atomic_save_into_one_modified() {
         .filter(|e| e.path == target && e.kind == EventKind::Modified)
         .count();
     assert_eq!(
-        modifications, 1,
+        modifications,
+        1,
         "expected exactly one Modified for a normalized atomic save, saw:\n{}",
         render(&events)
     );

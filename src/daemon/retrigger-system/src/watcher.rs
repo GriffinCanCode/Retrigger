@@ -1421,7 +1421,7 @@ mod tests {
             Nk::Modify(ModifyKind::Name(RenameMode::Both)),
             &["/a/old", "/a/new"],
         );
-        assert!(translate(&event).is_empty());
+        assert_eq!(translate(&event).len(), 0);
     }
 
     #[test]
@@ -1454,7 +1454,7 @@ mod tests {
             Nk::Access(AccessKind::Close(AccessMode::Write)),
             &["/a/b.txt"],
         );
-        assert!(translate(&event).is_empty());
+        assert_eq!(translate(&event).len(), 0);
     }
 
     #[test]
