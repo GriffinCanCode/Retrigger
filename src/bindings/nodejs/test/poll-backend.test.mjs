@@ -93,7 +93,8 @@ describe.skipIf(!ADDON)('backend: { mode: "poll", compareContents: true } (nativ
     fs.renameSync(tmp, target);
 
     const detected = await waitFor(
-      () => events.find((e) => e.path === target && (e.kind === 'modified' || e.kind === 'renamedTo')),
+      () =>
+        events.find((e) => e.path === target && (e.kind === 'modified' || e.kind === 'renamedTo')),
       {
         timeout: 15000,
         interval: POLL_INTERVAL_MS,

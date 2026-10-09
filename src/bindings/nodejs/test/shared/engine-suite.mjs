@@ -274,31 +274,41 @@ export function runEngineSuite(engineName, makeRetrigger) {
       writeFile(target, 'a');
       await new Promise((r) => setTimeout(r, 20));
       writeFile(target, 'ab');
-      // Waiting for the correction rather than for the stream to fall quiet. Quiet is reached
-      // when nothing has arrived for 250ms, which on a loaded macOS runner can happen while the
-      // correction is still inside FSEvents' coalescing latency -- the assertion then ran before
-      // the event it was about. The exact sequence is still asserted, and a correction that never
-      // comes still fails, now by timing out here rather than by reading a half-filled list.
-      await waitFor(() => kindsFor(events, target).length >= 2, {
-        message: 'the write absorbed by the window never arrived as a correction',
-      });
+      // Waiting on the property rather than on an event count, and rather than on quiet: quiet is
+      // reached when nothing has arrived for 250ms, which on a loaded machine can happen while a
+      // correction is still inside a coalescing backend's latency -- the assertion then ran before
+      // the event it was about.
+      //
+      // The property is that the consumer is never left describing a file that is already stale,
+      // which is what "the absorbed write is not swallowed" means to a caller. Two event
+      // sequences satisfy it, and which one a backend produces is not this package's choice:
+      // `created`(1 byte) then a `modified`(2 bytes) correction when the backend reported both
+      // writes, or a single `created` already carrying 2 bytes when it settled across the pair and
+      // reported them once. Watchman does both, run to run, at this spacing. Demanding two events
+      // made a green run depend on which side of the settle period the second write fell on; a
+      // write that is genuinely lost still fails here, by timing out with a stale trailing size.
+      const finalSize = fs.statSync(target).size;
+      const forTarget = () => events.filter((event) => event.path === target);
+      await waitFor(
+        () => {
+          const mine = forTarget();
+          return mine.length > 0 && mine[mine.length - 1].size === finalSize;
+        },
+        { message: 'no event ever described the file as the write left it' }
+      );
       await waitForQuiet(() => events.length, { quietMs: 250 });
 
-      // Asserted as a shape rather than an exact list. How many corrections close the window is a
-      // property of when the backend delivered the second write -- a slow machine can report it
-      // late enough to open a window of its own -- and the bound on coalescing is the burst test's
-      // subject, just above. What belongs to this test is that the leading event kept its own
-      // identity and that the absorbed write was not swallowed.
       const kinds = kindsFor(events, target);
       expect(kinds[0], 'a new file is announced as created, not as a modification').toBe('created');
-      expect(
-        kinds.length,
-        'the write the window absorbed must still reach the consumer'
-      ).toBeGreaterThanOrEqual(2);
       expect(
         kinds.slice(1).every((kind) => kind === 'modified'),
         `everything after the leading event is a correction, got ${kinds}`
       ).toBe(true);
+      const mine = forTarget();
+      expect(
+        mine[mine.length - 1].size,
+        `the last event must describe the file as it now is, got ${JSON.stringify(mine.map((e) => ({ kind: e.kind, size: e.size })))}`
+      ).toBe(finalSize);
     });
 
     // -------------------------------------------------------- content changes

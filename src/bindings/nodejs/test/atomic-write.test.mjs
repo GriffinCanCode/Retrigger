@@ -86,8 +86,16 @@ describe.skipIf(!JS_WATCHER_SUPPORTED)('atomicWriteNormalization (JavaScript eng
     });
     await waitForQuiet(() => events.length);
 
-    const forTarget = events.filter((e) => e.path === target);
-    expect(forTarget.map((e) => e.kind)).toEqual(['change']);
+    // What the fold owes a caller is that the pair never surfaces: a consumer must not see the
+    // target vanish and come back, because that is what makes a bundler drop the module and
+    // re-add it. How many `change` events carry that is the platform's business -- inotify
+    // reports the write into the recreated file separately from the recreation itself, so a
+    // second `change` follows the folded one there, while FSEvents coalesces both inside its
+    // latency window and delivers one. Asserting the kinds rather than their count holds the
+    // contract on either.
+    const kinds = events.filter((e) => e.path === target).map((e) => e.kind);
+    expect(kinds.length).toBeGreaterThan(0);
+    expect([...new Set(kinds)]).toEqual(['change']);
   });
 
   it('still delivers separate unlink and add events when the option is off (default)', async () => {
@@ -108,7 +116,12 @@ describe.skipIf(!JS_WATCHER_SUPPORTED)('atomicWriteNormalization (JavaScript eng
     });
     await waitForQuiet(() => events.length);
 
-    const forTarget = events.filter((e) => e.path === target);
-    expect(forTarget.map((e) => e.kind)).toEqual(['unlink', 'add']);
+    // The default must show the deletion and the recreation for what they were, in that order and
+    // ahead of anything else. What may follow is the same platform difference the folded case
+    // documents -- inotify's separate notification for the write -- which can only ever be a
+    // `change`: a second `unlink` or `add` here would mean the pair was reported twice.
+    const kinds = events.filter((e) => e.path === target).map((e) => e.kind);
+    expect(kinds.slice(0, 2)).toEqual(['unlink', 'add']);
+    expect([...new Set(kinds.slice(2))].filter((kind) => kind !== 'change')).toEqual([]);
   });
 });
