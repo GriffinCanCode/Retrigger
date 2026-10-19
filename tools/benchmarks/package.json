@@ -18,7 +18,7 @@
   "dependencies": {
     "@parcel/watcher": "^2.6.0",
     "chokidar": "^5.0.0",
-    "watchpack": "^2.5.2"
+    "watchpack": "^2.6.1"
   },
   "description": "Reproducible performance laboratory for @retrigger/core \u2014 rebuild-time lab, watch latency, scenario matrix",
   "main": "benchmark.js",
